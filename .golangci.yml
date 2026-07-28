@@ -1,0 +1,77 @@
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  default: standard
+  enable:
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - forcetypeassert
+    - gocheckcompilerdirectives
+    - gocritic
+    - godoclint
+    - goprintffuncname
+    - gosec
+    - makezero
+    - mirror
+    - misspell
+    - modernize
+    - musttag
+    - nilerr
+    - nilnesserr
+    - noctx
+    - nolintlint
+    - nosprintfhostport
+    - perfsprint
+    - predeclared
+    - reassign
+    - recvcheck
+    - revive
+    - testifylint
+    - thelper
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+    - whitespace
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      directives:
+        - name: specify-disable-reason
+          severity: error
+    testifylint:
+      enable-all: true
+  exclusions:
+    generated: strict
+    warn-unused: true
+
+formatters:
+  enable:
+    - gofumpt
+  settings:
+    gofumpt:
+      extra-rules: true
+  exclusions:
+    generated: strict
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
