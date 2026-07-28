@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -19,11 +19,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Test
-        run: make test
-
       - name: Lint
         run: make lint
 
-      - name: Enforce coverage
-        run: make coverage
+      - name: Test with race detection and coverage
+        run: make test
