@@ -1,193 +1,141 @@
 package transport
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestCall(t *testing.T) {
-	proc := startHelper(t, nil, nil)
-	defer func() { _ = proc.Close() }()
+var fixtureBinary string
 
-	got, err := proc.Call(context.Background(), "echo", map[string]any{"value": "hello"})
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "durable-acp-transport-")
 	if err != nil {
-		t.Fatalf("Call: %v", err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-	var result map[string]string
-	if err := json.Unmarshal(got, &result); err != nil {
-		t.Fatalf("decode result: %v", err)
+	fixtureBinary = filepath.Join(dir, "rpcserver")
+	if runtime.GOOS == "windows" {
+		fixtureBinary += ".exe"
 	}
-	if result["value"] != "hello" {
-		t.Fatalf("result value = %q, want hello", result["value"])
+	cmd := exec.Command("go", "build", "-o", fixtureBinary, "./testdata/rpcserver")
+	if output, buildErr := cmd.CombinedOutput(); buildErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "build transport fixture: %v\n%s", buildErr, output)
+		_ = os.RemoveAll(dir)
+		os.Exit(1)
 	}
+	code := m.Run()
+	if err := os.RemoveAll(dir); err != nil && code == 0 {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		code = 1
+	}
+	os.Exit(code)
+}
+
+func TestCall(t *testing.T) {
+	proc := startFixture(t, Spec{})
+
+	result, err := proc.Call(context.Background(), "echo", map[string]any{"value": "hello"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"value":"hello"}`, string(result))
+
+	_, err = proc.Call(context.Background(), "fail", nil)
+	require.EqualError(t, err, "fixture failure")
 }
 
 func TestNotify(t *testing.T) {
 	notified := make(chan Message, 1)
-	proc := startHelper(t, func(msg Message) { notified <- msg }, nil)
-	defer func() { _ = proc.Close() }()
+	proc := startFixture(t, Spec{OnNotify: func(msg Message) { notified <- msg }})
 
-	if err := proc.Notify("ping", map[string]any{"value": "hello"}); err != nil {
-		t.Fatalf("Notify: %v", err)
-	}
+	require.NoError(t, proc.Notify("ping", map[string]any{"value": "hello"}))
 	select {
 	case msg := <-notified:
-		if msg.Method != "observed/ping" || !strings.Contains(string(msg.Params), "hello") {
-			t.Fatalf("notification = %+v", msg)
-		}
+		assert.Equal(t, "observed/ping", msg.Method)
+		assert.JSONEq(t, `{"value":"hello"}`, string(msg.Params))
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for notification")
+		require.FailNow(t, "timed out waiting for notification")
 	}
 }
 
 func TestServerRequest(t *testing.T) {
-	proc := startHelper(t, nil, nil)
+	requests := make(chan Message, 1)
+	proc := startFixture(t, Spec{})
 	proc.SetOnServerRequest(func(msg Message) (any, error) {
-		if msg.Method != "client/answer" || IDString(msg.ID) != "42" {
-			t.Fatalf("server request = %+v", msg)
-		}
+		requests <- msg
 		return map[string]any{"answer": "yes"}, nil
 	})
-	defer func() { _ = proc.Close() }()
 
-	got, err := proc.Call(context.Background(), "request", nil)
-	if err != nil {
-		t.Fatalf("Call: %v", err)
-	}
-	if string(got) != `{"answer":"yes"}` {
-		t.Fatalf("result = %s", got)
-	}
+	result, err := proc.Call(context.Background(), "request", nil)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"answer":"yes"}`, string(result))
+	msg := <-requests
+	assert.Equal(t, "client/answer", msg.Method)
+	assert.Equal(t, "42", IDString(msg.ID))
 }
 
 func TestClose(t *testing.T) {
-	proc := startHelper(t, nil, nil)
-	if err := proc.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	proc := startFixture(t, Spec{})
+	assert.False(t, proc.IsDone())
+
+	require.NoError(t, proc.Close())
+	assert.True(t, proc.IsDone())
+	assert.True(t, proc.Intentional())
 	select {
 	case <-proc.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("process did not close")
+	default:
+		require.FailNow(t, "Done channel remains open after Close")
 	}
-	if !proc.Intentional() {
-		t.Fatal("Intentional = false after Close")
-	}
-	if _, err := proc.Call(context.Background(), "echo", nil); err == nil {
-		t.Fatal("Call after Close error = nil")
-	}
+	_, err := proc.Call(context.Background(), "echo", nil)
+	require.Error(t, err)
 }
 
 func TestChildExit(t *testing.T) {
-	proc := startHelper(t, nil, nil)
+	proc := startFixture(t, Spec{})
 	_, err := proc.Call(context.Background(), "exit", nil)
-	if err == nil {
-		t.Fatal("Call error = nil")
-	}
-	select {
-	case <-proc.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("process did not exit")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for proc.ExitCode() == -1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if proc.ExitCode() != 7 {
-		t.Fatalf("ExitCode = %d, want 7", proc.ExitCode())
-	}
-	if got := proc.StderrTail(time.Second); got != "helper failed\n" {
-		t.Fatalf("StderrTail = %q", got)
-	}
+	require.Error(t, err)
+	require.Eventually(t, func() bool { return proc.ExitCode() == 7 }, 2*time.Second, time.Millisecond)
+	assert.Equal(t, "fixture failed\n", proc.StderrTail(time.Second))
 }
 
 func TestIDString(t *testing.T) {
-	tests := []struct {
-		raw  string
-		want string
-	}{
-		{raw: `42`, want: "42"},
-		{raw: `"perm-1"`, want: "perm-1"},
-		{raw: ` " spaced " `, want: "spaced"},
-		{raw: `true`, want: "true"},
-		{raw: ``, want: ""},
+	tests := map[string]string{
+		`42`:           "42",
+		`"perm-1"`:     "perm-1",
+		` " spaced " `: "spaced",
+		`true`:         "true",
+		``:             "",
 	}
-	for _, tc := range tests {
-		if got := IDString(json.RawMessage(tc.raw)); got != tc.want {
-			t.Errorf("IDString(%q) = %q, want %q", tc.raw, got, tc.want)
-		}
+	for raw, want := range tests {
+		t.Run(raw, func(t *testing.T) {
+			assert.Equal(t, want, IDString(json.RawMessage(raw)))
+		})
 	}
 }
 
-func TestHelperProcess(t *testing.T) {
-	if os.Getenv("DURABLE_ACP_TRANSPORT_HELPER") != "1" {
-		return
-	}
-	reader := bufio.NewReader(os.Stdin)
-	encoder := json.NewEncoder(os.Stdout)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			os.Exit(0)
-		}
-		var msg Message
-		if err := json.Unmarshal(line, &msg); err != nil {
-			continue
-		}
-		switch msg.Method {
-		case "echo":
-			writeHelperResponse(encoder, msg.ID, msg.Params)
-		case "ping":
-			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "observed/ping", "params": msg.Params})
-		case "request":
-			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": 42, "method": "client/answer", "params": map[string]any{"question": "continue?"}})
-			responseLine, readErr := reader.ReadBytes('\n')
-			if readErr != nil {
-				os.Exit(2)
-			}
-			var response Message
-			if err := json.Unmarshal(responseLine, &response); err != nil {
-				os.Exit(3)
-			}
-			if IDString(response.ID) != "42" {
-				os.Exit(6)
-			}
-			writeHelperResponse(encoder, msg.ID, response.Result)
-		case "exit":
-			_, _ = fmt.Fprintln(os.Stderr, "helper failed")
-			os.Exit(7)
-		}
-	}
-}
-
-func startHelper(t *testing.T, notify func(Message), serverRequest func(Message) (any, error)) *Process {
+func startFixture(t *testing.T, spec Spec) *Process {
 	t.Helper()
-	proc, err := Start(context.Background(), Spec{
-		Command:         os.Args[0],
-		Args:            []string{"-test.run=^TestHelperProcess$"},
-		Env:             append(os.Environ(), "DURABLE_ACP_TRANSPORT_HELPER=1"),
-		OnNotify:        notify,
-		OnServerRequest: serverRequest,
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	spec.Command = fixtureBinary
+	proc, err := Start(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, proc.Close()) })
 	return proc
 }
 
-func writeHelperResponse(encoder *json.Encoder, id json.RawMessage, result json.RawMessage) {
-	var idValue any
-	if err := json.Unmarshal(id, &idValue); err != nil {
-		os.Exit(4)
-	}
-	var resultValue any
-	if err := json.Unmarshal(result, &resultValue); err != nil {
-		os.Exit(5)
-	}
-	_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": idValue, "result": resultValue})
+func TestStderrTailIsBounded(t *testing.T) {
+	proc := startFixture(t, Spec{})
+	_, err := proc.Call(context.Background(), "large-stderr", nil)
+	require.Error(t, err)
+	tail := proc.StderrTail(time.Second)
+	assert.Len(t, tail, 8*1024)
+	assert.True(t, strings.HasSuffix(tail, "tail\n"))
 }
