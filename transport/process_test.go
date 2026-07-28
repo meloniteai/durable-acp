@@ -28,7 +28,8 @@ func TestMain(m *testing.M) {
 	if runtime.GOOS == "windows" {
 		fixtureBinary += ".exe"
 	}
-	cmd := exec.Command("go", "build", "-o", fixtureBinary, "./testdata/rpcserver")
+	//nolint:gosec // TestMain compiles the repository-owned fixture.
+	cmd := exec.CommandContext(context.Background(), "go", "build", "-o", fixtureBinary, "./testdata/rpcserver")
 	if output, buildErr := cmd.CombinedOutput(); buildErr != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "build transport fixture: %v\n%s", buildErr, output)
 		_ = os.RemoveAll(dir)
@@ -108,16 +109,19 @@ func TestChildExit(t *testing.T) {
 }
 
 func TestIDString(t *testing.T) {
-	tests := map[string]string{
-		`42`:           "42",
-		`"perm-1"`:     "perm-1",
-		` " spaced " `: "spaced",
-		`true`:         "true",
-		``:             "",
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{raw: `42`, want: "42"},
+		{raw: `"perm-1"`, want: "perm-1"},
+		{raw: ` " spaced " `, want: "spaced"},
+		{raw: `true`, want: "true"},
+		{raw: ``, want: ""},
 	}
-	for raw, want := range tests {
-		t.Run(raw, func(t *testing.T) {
-			assert.Equal(t, want, IDString(json.RawMessage(raw)))
+	for _, test := range tests {
+		t.Run(test.raw, func(t *testing.T) {
+			assert.Equal(t, test.want, IDString(json.RawMessage(test.raw)))
 		})
 	}
 }

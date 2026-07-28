@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +93,7 @@ func Start(ctx context.Context, spec Spec) (*Process, error) {
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	//nolint:gosec // Executing the caller-supplied process is the transport's purpose.
 	cmd := exec.CommandContext(ctx, spec.Command, spec.Args...)
 	if strings.TrimSpace(spec.Dir) != "" {
 		cmd.Dir = spec.Dir
@@ -137,7 +139,7 @@ func Start(ctx context.Context, spec Spec) (*Process, error) {
 }
 
 func (p *Process) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	id := fmt.Sprintf("%d", p.nextID.Add(1))
+	id := strconv.FormatUint(p.nextID.Add(1), 10)
 	rawParams, err := json.Marshal(params)
 	if err != nil {
 		return nil, err
@@ -300,21 +302,20 @@ func (p *Process) readLoop(stdout io.Reader, notify func(Message)) {
 		if len(payload) > 0 {
 			var msg Message
 			if unmarshalErr := json.Unmarshal(payload, &msg); unmarshalErr == nil {
-				if msg.Method != "" {
-					if len(msg.ID) > 0 {
-						var result any
-						reqErr := fmt.Errorf("unsupported server request %q", msg.Method)
-						p.serverRequestMu.RLock()
-						handler := p.serverRequest
-						p.serverRequestMu.RUnlock()
-						if handler != nil {
-							result, reqErr = handler(msg)
-						}
-						_ = p.writeResponse(msg.ID, result, reqErr)
-					} else if notify != nil {
-						notify(msg)
+				switch {
+				case msg.Method != "" && len(msg.ID) > 0:
+					var result any
+					reqErr := fmt.Errorf("unsupported server request %q", msg.Method)
+					p.serverRequestMu.RLock()
+					handler := p.serverRequest
+					p.serverRequestMu.RUnlock()
+					if handler != nil {
+						result, reqErr = handler(msg)
 					}
-				} else if len(msg.ID) > 0 {
+					_ = p.writeResponse(msg.ID, result, reqErr)
+				case msg.Method != "" && notify != nil:
+					notify(msg)
+				case len(msg.ID) > 0:
 					id := strings.Trim(string(msg.ID), `"`)
 					ch := p.removePending(id)
 					if ch != nil {
@@ -324,7 +325,7 @@ func (p *Process) readLoop(stdout io.Reader, notify func(Message)) {
 							ch <- processResponse{result: msg.Result}
 						}
 					}
-				} else if notify != nil {
+				case notify != nil:
 					notify(msg)
 				}
 			}
