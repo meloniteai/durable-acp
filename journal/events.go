@@ -13,6 +13,7 @@ const (
 	EventUserRequestResolved = "user.request_resolved"
 	EventAgentMessage        = "agent.message"
 	EventAgentPermission     = "agent.permission_requested"
+	EventAgentInteraction    = "agent.interaction_requested"
 	EventAgentWorkspace      = "agent.workspace_changed"
 	EventAgentTurnStarted    = "agent.turn_started"
 	EventAgentYielded        = "agent.yielded"
@@ -39,6 +40,12 @@ func Translate(event host.Event) (Record, bool) {
 	maps.Copy(data, event.Data)
 	if event.Message != "" {
 		data["message"] = event.Message
+	}
+	if event.Interaction != nil {
+		data["interaction"] = event.Interaction
+	}
+	if event.InteractionResponse != nil {
+		data["interaction_response"] = event.InteractionResponse
 	}
 	if event.Backend != "" {
 		data["agent"] = map[string]any{
@@ -77,6 +84,13 @@ func translatedEventName(event host.Event) string {
 		}
 	case host.EventPermission:
 		return EventAgentPermission
+	case host.EventInteractionRequested:
+		if event.Interaction != nil && event.Interaction.Kind == host.InteractionPermission {
+			return EventAgentPermission
+		}
+		return EventAgentInteraction
+	case host.EventInteractionResolved:
+		return EventUserRequestResolved
 	case host.EventFileChanged:
 		return EventAgentWorkspace
 	case host.EventTurnStarted:

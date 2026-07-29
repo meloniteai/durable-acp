@@ -64,28 +64,30 @@ type BackendSession struct {
 type EventType string
 
 const (
-	EventMessage           EventType = "message"
-	EventThinking          EventType = "thinking"
-	EventToolStarted       EventType = "tool_started"
-	EventToolOutput        EventType = "tool_output"
-	EventPermission        EventType = "permission_request"
-	EventFileChanged       EventType = "file_changed"
-	EventTurnStarted       EventType = "turn_started"
-	EventTurnComplete      EventType = "turn_completed"
-	EventTurnFailed        EventType = "turn_failed"
-	EventProcessExited     EventType = "process_exited"
-	EventQueueUpdated      EventType = "queue_updated"
-	EventTraceUpdated      EventType = "trace_updated"
-	EventAgentStalled      EventType = "agent_stalled"
-	EventAgentRecovered    EventType = "agent_recovered"
-	EventAgentResumeFailed EventType = "agent_resume_failed"
-	EventPlanUpdate        EventType = "plan_update"
-	EventTodoUpdate        EventType = "todo_update"
-	EventPermissionModes   EventType = "permission_modes"
-	EventModels            EventType = "models"
-	EventReasoningLevels   EventType = "reasoning_levels"
-	EventAvailableCommands EventType = "available_commands"
-	EventConfigCatalog     EventType = "config_catalog"
+	EventMessage              EventType = "message"
+	EventThinking             EventType = "thinking"
+	EventToolStarted          EventType = "tool_started"
+	EventToolOutput           EventType = "tool_output"
+	EventPermission           EventType = "permission_request"
+	EventFileChanged          EventType = "file_changed"
+	EventTurnStarted          EventType = "turn_started"
+	EventTurnComplete         EventType = "turn_completed"
+	EventTurnFailed           EventType = "turn_failed"
+	EventProcessExited        EventType = "process_exited"
+	EventQueueUpdated         EventType = "queue_updated"
+	EventTraceUpdated         EventType = "trace_updated"
+	EventAgentStalled         EventType = "agent_stalled"
+	EventAgentRecovered       EventType = "agent_recovered"
+	EventAgentResumeFailed    EventType = "agent_resume_failed"
+	EventPlanUpdate           EventType = "plan_update"
+	EventTodoUpdate           EventType = "todo_update"
+	EventPermissionModes      EventType = "permission_modes"
+	EventModels               EventType = "models"
+	EventReasoningLevels      EventType = "reasoning_levels"
+	EventAvailableCommands    EventType = "available_commands"
+	EventConfigCatalog        EventType = "config_catalog"
+	EventInteractionRequested EventType = "interaction_requested"
+	EventInteractionResolved  EventType = "interaction_resolved"
 )
 
 type ToolDisplay struct {
@@ -97,21 +99,74 @@ type ToolDisplay struct {
 	Target  string `json:"target,omitempty"`
 }
 
+// InteractionKind describes a request that needs an explicit user response.
+// It intentionally describes UI-neutral concepts so a desktop app, terminal
+// client, or service can render the same provider request in its own way.
+type InteractionKind string
+
+const (
+	InteractionPermission InteractionKind = "permission"
+	InteractionChoice     InteractionKind = "choice"
+	InteractionForm       InteractionKind = "form"
+	InteractionPlan       InteractionKind = "plan"
+)
+
+// InteractionOption is one selectable answer offered by an interaction.
+type InteractionOption struct {
+	ID          string `json:"id"`
+	Label       string `json:"label,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+// InteractionField describes one value in a form interaction.
+type InteractionField struct {
+	ID            string              `json:"id"`
+	Label         string              `json:"label,omitempty"`
+	Description   string              `json:"description,omitempty"`
+	Required      bool                `json:"required,omitempty"`
+	Options       []InteractionOption `json:"options,omitempty"`
+	AllowFreeText bool                `json:"allow_free_text,omitempty"`
+}
+
+// InteractionRequest is emitted when an adapter is blocked on user input.
+type InteractionRequest struct {
+	ID      string              `json:"id"`
+	Kind    InteractionKind     `json:"kind"`
+	Title   string              `json:"title,omitempty"`
+	Message string              `json:"message,omitempty"`
+	Options []InteractionOption `json:"options,omitempty"`
+	Fields  []InteractionField  `json:"fields,omitempty"`
+	Data    map[string]any      `json:"data,omitempty"`
+}
+
+// InteractionResponse resolves an InteractionRequest. Action is one of the
+// adapter-supported response actions (normally approve, deny, submit, or
+// cancel); OptionID and Values carry the selected choice and form content.
+type InteractionResponse struct {
+	RequestID string         `json:"request_id"`
+	Action    string         `json:"action"`
+	OptionID  string         `json:"option_id,omitempty"`
+	Message   string         `json:"message,omitempty"`
+	Values    map[string]any `json:"values,omitempty"`
+}
+
 type Event struct {
-	SourceEventID    string         `json:"source_event_id,omitempty"`
-	SessionID        string         `json:"session_id"`
-	Backend          Backend        `json:"backend,omitempty"`
-	BackendSessionID string         `json:"backend_session_id,omitempty"`
-	BackendThreadID  string         `json:"backend_thread_id,omitempty"`
-	BackendTurnID    string         `json:"backend_turn_id,omitempty"`
-	Seq              int            `json:"seq,omitempty"`
-	Type             EventType      `json:"type"`
-	Role             string         `json:"role,omitempty"`
-	Message          string         `json:"message,omitempty"`
-	Data             map[string]any `json:"data,omitempty"`
-	ToolDisplay      *ToolDisplay   `json:"tool_display,omitempty"`
-	Time             string         `json:"time"`
-	Local            map[string]any `json:"-"`
+	SourceEventID       string               `json:"source_event_id,omitempty"`
+	SessionID           string               `json:"session_id"`
+	Backend             Backend              `json:"backend,omitempty"`
+	BackendSessionID    string               `json:"backend_session_id,omitempty"`
+	BackendThreadID     string               `json:"backend_thread_id,omitempty"`
+	BackendTurnID       string               `json:"backend_turn_id,omitempty"`
+	Seq                 int                  `json:"seq,omitempty"`
+	Type                EventType            `json:"type"`
+	Role                string               `json:"role,omitempty"`
+	Message             string               `json:"message,omitempty"`
+	Data                map[string]any       `json:"data,omitempty"`
+	ToolDisplay         *ToolDisplay         `json:"tool_display,omitempty"`
+	Interaction         *InteractionRequest  `json:"interaction,omitempty"`
+	InteractionResponse *InteractionResponse `json:"interaction_response,omitempty"`
+	Time                string               `json:"time"`
+	Local               map[string]any       `json:"-"`
 }
 
 type EventSink func(Event)
@@ -142,9 +197,10 @@ type SendTurnRequest struct {
 }
 
 type ForkPromptRequest struct {
-	SessionID  string          `json:"session_id"`
-	Prompt     string          `json:"prompt"`
-	MCPServers []ForkMCPServer `json:"mcp_servers,omitempty"`
+	SessionID    string          `json:"session_id"`
+	Prompt       string          `json:"prompt"`
+	Instructions string          `json:"instructions,omitempty"`
+	MCPServers   []ForkMCPServer `json:"mcp_servers,omitempty"`
 }
 
 type ForkPromptResponse struct {
@@ -194,6 +250,12 @@ type AgentRestarter interface {
 
 type PermissionResponder interface {
 	RespondPermission(ctx context.Context, sessionID, requestID string, allow bool, message, permissionMode string) error
+}
+
+// InteractionResponder is implemented by adapters that can resolve general
+// permission, choice, form, or plan interactions.
+type InteractionResponder interface {
+	RespondInteraction(ctx context.Context, sessionID string, response InteractionResponse) error
 }
 
 func AdapterSessionForkSupport(adapter Adapter, sessionID string) (bool, string) {

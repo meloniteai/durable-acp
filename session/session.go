@@ -43,11 +43,13 @@ var allowedTransitions = map[Status]map[Status]struct{}{
 		StatusClosed:  {},
 	},
 	StatusRunning: {
+		StatusActive:       {},
 		StatusWaitingInput: {},
 		StatusFailed:       {},
 		StatusClosed:       {},
 	},
 	StatusWaitingInput: {
+		StatusActive:  {},
 		StatusRunning: {},
 		StatusFailed:  {},
 		StatusClosed:  {},

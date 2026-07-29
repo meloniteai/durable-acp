@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  checks: write
 
 jobs:
   test:
@@ -23,4 +24,14 @@ jobs:
         run: make lint
 
       - name: Test with race detection and coverage
+        env:
+          TEST_RESULTS: test-results/go.json
         run: make test
+
+      - name: Publish Go test report
+        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          name: Go tests
+          path: test-results/go.json
+          reporter: golang-json
