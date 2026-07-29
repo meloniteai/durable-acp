@@ -112,6 +112,7 @@ Unsupported standard requests receive JSON-RPC `Method not found`. Unknown exten
 | `client` | Initialized typed ACP client connections, callbacks, capabilities, and extensions |
 | `transport` | Concurrent bidirectional JSON-RPC process transport |
 | `host` | Optional provider-neutral adapter and event model above the wire protocol |
+| `journal` | Durable append-only JSONL session records and neutral host-event translation |
 | `session` | Optional host-side session identity and validated lifecycle |
 | `conformance` | Assertions that the public method matrix matches the official v1 schema |
 
