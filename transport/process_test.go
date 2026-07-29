@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -52,6 +53,10 @@ func TestCall(t *testing.T) {
 
 	_, err = proc.Call(context.Background(), "fail", nil)
 	require.EqualError(t, err, "fixture failure")
+	var rpcErr *RPCError
+	require.ErrorAs(t, err, &rpcErr)
+	assert.Equal(t, -32000, rpcErr.Code)
+	assert.JSONEq(t, `{"retryable":false}`, string(rpcErr.Data))
 }
 
 func TestNotify(t *testing.T) {
@@ -68,6 +73,39 @@ func TestNotify(t *testing.T) {
 	}
 }
 
+func TestObserverSeesWireOrder(t *testing.T) {
+	var observed []string
+	proc := startFixture(t, Spec{
+		Observe: func(_ context.Context, direction Direction, raw json.RawMessage) error {
+			observed = append(observed, string(direction)+":"+string(raw))
+			return nil
+		},
+	})
+
+	_, err := proc.Call(context.Background(), "echo", map[string]bool{"ok": true})
+	require.NoError(t, err)
+	require.Len(t, observed, 2)
+	assert.Contains(t, observed[0], "outbound:")
+	assert.Contains(t, observed[0], `"method":"echo"`)
+	assert.Contains(t, observed[1], "inbound:")
+	assert.Contains(t, observed[1], `"result":{"ok":true}`)
+}
+
+func TestObserverErrorFailsCall(t *testing.T) {
+	want := errors.New("observer failed")
+	proc := startFixture(t, Spec{
+		Observe: func(_ context.Context, direction Direction, _ json.RawMessage) error {
+			if direction == DirectionOutbound {
+				return want
+			}
+			return nil
+		},
+	})
+
+	_, err := proc.Call(context.Background(), "echo", nil)
+	require.ErrorIs(t, err, want)
+}
+
 func TestServerRequest(t *testing.T) {
 	requests := make(chan Message, 1)
 	proc := startFixture(t, Spec{})
@@ -82,6 +120,33 @@ func TestServerRequest(t *testing.T) {
 	msg := <-requests
 	assert.Equal(t, "client/answer", msg.Method)
 	assert.Equal(t, "42", IDString(msg.ID))
+}
+
+func TestCallCancellationNotifiesPeer(t *testing.T) {
+	proc := startFixture(t, Spec{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := proc.Call(ctx, "wait-cancel", nil)
+	require.ErrorIs(t, err, context.Canceled)
+
+	result, err := proc.Call(context.Background(), "echo", map[string]bool{"usable": true})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"usable":true}`, string(result))
+}
+
+func TestServerRequestCancellation(t *testing.T) {
+	proc := startFixture(t, Spec{
+		OnRequest: func(ctx context.Context, msg Message) (any, error) {
+			assert.Equal(t, "client/wait", msg.Method)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+
+	result, err := proc.Call(context.Background(), "request-cancel", nil)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"cancelled":true}`, string(result))
 }
 
 func TestClose(t *testing.T) {
@@ -124,6 +189,14 @@ func TestIDString(t *testing.T) {
 			assert.Equal(t, test.want, IDString(json.RawMessage(test.raw)))
 		})
 	}
+}
+
+func TestRPCError(t *testing.T) {
+	err := error(&RPCError{Code: CodeInvalidParams, Message: "bad input"})
+	var rpcErr *RPCError
+	require.ErrorAs(t, err, &rpcErr)
+	assert.Equal(t, "bad input", rpcErr.Error())
+	assert.Empty(t, (*RPCError)(nil).Error())
 }
 
 func startFixture(t *testing.T, spec Spec) *Process {
