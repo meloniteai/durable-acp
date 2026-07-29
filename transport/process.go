@@ -22,14 +22,17 @@ type Spec struct {
 	Dir             string
 	Env             []string
 	Stderr          io.Writer
+	Observe         Observer
 	OnNotify        func(Message)
 	OnServerRequest func(Message) (any, error)
+	OnRequest       func(context.Context, Message) (any, error)
 }
 
 type Process struct {
 	cmd             *exec.Cmd
 	stdin           io.WriteCloser
 	pending         map[string]chan processResponse
+	inbound         map[string]context.CancelFunc
 	mu              sync.Mutex
 	writeMu         sync.Mutex
 	nextID          atomic.Uint64
@@ -37,6 +40,8 @@ type Process struct {
 	doneOnce        sync.Once
 	serverRequestMu sync.RWMutex
 	serverRequest   func(Message) (any, error)
+	request         func(context.Context, Message) (any, error)
+	observe         Observer
 	exitCode        atomic.Int64
 	stderrBuf       boundedBuffer
 	stderrDone      chan struct{}
@@ -57,6 +62,32 @@ type RPCError struct {
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
 }
+
+type Direction string
+
+const (
+	DirectionOutbound Direction = "outbound"
+	DirectionInbound  Direction = "inbound"
+)
+
+type Observer func(context.Context, Direction, json.RawMessage) error
+
+func (e *RPCError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+const (
+	CodeParseError       = -32700
+	CodeInvalidRequest   = -32600
+	CodeMethodNotFound   = -32601
+	CodeInvalidParams    = -32602
+	CodeInternalError    = -32603
+	CodeRequestCancelled = -32800
+	MethodCancelRequest  = "$/cancel_request"
+)
 
 type boundedBuffer struct {
 	mu  sync.Mutex
@@ -113,8 +144,11 @@ func Start(ctx context.Context, spec Spec) (*Process, error) {
 		cmd:           cmd,
 		stdin:         stdin,
 		pending:       map[string]chan processResponse{},
+		inbound:       map[string]context.CancelFunc{},
 		done:          make(chan struct{}),
 		serverRequest: spec.OnServerRequest,
+		request:       spec.OnRequest,
+		observe:       spec.Observe,
 		stderrDone:    make(chan struct{}),
 	}
 	p.exitCode.Store(-1)
@@ -123,7 +157,7 @@ func Start(ctx context.Context, spec Spec) (*Process, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	go p.readLoop(stdout, spec.OnNotify)
+	go p.readLoop(ctx, stdout, spec.OnNotify)
 	go func() {
 		err := cmd.Wait()
 		var exitErr *exec.ExitError
@@ -148,16 +182,11 @@ func (p *Process) Call(ctx context.Context, method string, params any) (json.Raw
 	p.mu.Lock()
 	p.pending[id] = resp
 	p.mu.Unlock()
-	req := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  json.RawMessage(rawParams),
-	}
-	raw, err := json.Marshal(req)
-	if err != nil {
-		p.removePending(id)
-		return nil, err
+	req := Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(strconv.Quote(id)),
+		Method:  method,
+		Params:  rawParams,
 	}
 	select {
 	case <-p.done:
@@ -165,10 +194,7 @@ func (p *Process) Call(ctx context.Context, method string, params any) (json.Raw
 		return nil, errors.New("agent process exited")
 	default:
 	}
-	p.writeMu.Lock()
-	_, err = p.stdin.Write(append(raw, '\n'))
-	p.writeMu.Unlock()
-	if err != nil {
+	if err := p.writeMessage(ctx, req); err != nil {
 		p.removePending(id)
 		select {
 		case <-p.done:
@@ -179,7 +205,11 @@ func (p *Process) Call(ctx context.Context, method string, params any) (json.Raw
 	}
 	select {
 	case <-ctx.Done():
-		p.removePending(id)
+		if p.removePending(id) != nil {
+			_ = p.NotifyContext(context.WithoutCancel(ctx), MethodCancelRequest, map[string]json.RawMessage{
+				"requestId": json.RawMessage(strconv.Quote(id)),
+			})
+		}
 		return nil, ctx.Err()
 	case <-p.done:
 		return nil, errors.New("agent process exited")
@@ -189,22 +219,44 @@ func (p *Process) Call(ctx context.Context, method string, params any) (json.Raw
 }
 
 func (p *Process) Notify(method string, params any) error {
+	return p.NotifyContext(context.Background(), method, params)
+}
+
+func (p *Process) NotifyContext(ctx context.Context, method string, params any) error {
 	rawParams, err := json.Marshal(params)
 	if err != nil {
 		return err
 	}
-	req := map[string]any{
-		"jsonrpc": "2.0",
-		"method":  method,
-		"params":  json.RawMessage(rawParams),
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
-	raw, err := json.Marshal(req)
+	return p.writeMessage(ctx, Message{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  rawParams,
+	})
+}
+
+func (p *Process) writeMessage(ctx context.Context, message Message) error {
+	select {
+	case <-p.done:
+		return errors.New("agent process exited")
+	default:
+	}
+	raw, err := json.Marshal(message)
 	if err != nil {
 		return err
 	}
 	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if p.observe != nil {
+		if observeErr := p.observe(ctx, DirectionOutbound, raw); observeErr != nil {
+			return fmt.Errorf("observe outbound message: %w", observeErr)
+		}
+	}
 	_, err = p.stdin.Write(append(raw, '\n'))
-	p.writeMu.Unlock()
 	return err
 }
 
@@ -270,57 +322,70 @@ func (p *Process) SetOnServerRequest(handler func(Message) (any, error)) {
 	p.serverRequestMu.Unlock()
 }
 
-func (p *Process) writeResponse(id json.RawMessage, result any, responseErr error) error {
-	var idValue any
-	if len(id) > 0 {
-		if err := json.Unmarshal(id, &idValue); err != nil {
-			return err
-		}
-	}
-	resp := map[string]any{"jsonrpc": "2.0", "id": idValue}
-	if responseErr != nil {
-		resp["error"] = map[string]any{"code": -32000, "message": responseErr.Error()}
-	} else {
-		resp["result"] = result
-	}
-	raw, err := json.Marshal(resp)
-	if err != nil {
-		return err
-	}
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
-	_, err = p.stdin.Write(append(raw, '\n'))
-	return err
+func (p *Process) SetOnRequest(handler func(context.Context, Message) (any, error)) {
+	p.serverRequestMu.Lock()
+	p.request = handler
+	p.serverRequestMu.Unlock()
 }
 
-func (p *Process) readLoop(stdout io.Reader, notify func(Message)) {
+func (p *Process) writeResponse(
+	ctx context.Context,
+	id json.RawMessage,
+	result any,
+	responseErr error,
+) error {
+	resp := Message{JSONRPC: "2.0", ID: append(json.RawMessage(nil), id...)}
+	if responseErr != nil {
+		var rpcErr *RPCError
+		if errors.Is(responseErr, context.Canceled) ||
+			errors.Is(responseErr, context.DeadlineExceeded) {
+			rpcErr = &RPCError{Code: CodeRequestCancelled, Message: responseErr.Error()}
+		} else if !errors.As(responseErr, &rpcErr) {
+			rpcErr = &RPCError{Code: CodeInternalError, Message: responseErr.Error()}
+		}
+		resp.Error = rpcErr
+	} else {
+		raw, err := json.Marshal(result)
+		if err != nil {
+			return err
+		}
+		resp.Result = raw
+	}
+	return p.writeMessage(ctx, resp)
+}
+
+func (p *Process) readLoop(
+	ctx context.Context,
+	stdout io.Reader,
+	notify func(Message),
+) {
 	reader := bufio.NewReaderSize(stdout, 64*1024)
 	var readErr error
 	for {
 		line, err := reader.ReadBytes('\n')
 		payload := bytes.TrimSpace(line)
 		if len(payload) > 0 {
+			if p.observe != nil {
+				if observeErr := p.observe(ctx, DirectionInbound, payload); observeErr != nil {
+					readErr = fmt.Errorf("observe inbound message: %w", observeErr)
+					break
+				}
+			}
 			var msg Message
 			if unmarshalErr := json.Unmarshal(payload, &msg); unmarshalErr == nil {
 				switch {
 				case msg.Method != "" && len(msg.ID) > 0:
-					var result any
-					reqErr := fmt.Errorf("unsupported server request %q", msg.Method)
-					p.serverRequestMu.RLock()
-					handler := p.serverRequest
-					p.serverRequestMu.RUnlock()
-					if handler != nil {
-						result, reqErr = handler(msg)
-					}
-					_ = p.writeResponse(msg.ID, result, reqErr)
+					p.handleRequest(ctx, msg)
+				case msg.Method == MethodCancelRequest:
+					p.handleCancel(msg.Params)
 				case msg.Method != "" && notify != nil:
 					notify(msg)
 				case len(msg.ID) > 0:
-					id := strings.Trim(string(msg.ID), `"`)
+					id := IDString(msg.ID)
 					ch := p.removePending(id)
 					if ch != nil {
 						if msg.Error != nil {
-							ch <- processResponse{err: errors.New(msg.Error.Message)}
+							ch <- processResponse{err: msg.Error}
 						} else {
 							ch <- processResponse{result: msg.Result}
 						}
@@ -340,6 +405,52 @@ func (p *Process) readLoop(stdout io.Reader, notify func(Message)) {
 	p.closePending(readErr)
 }
 
+func (p *Process) handleRequest(ctx context.Context, msg Message) {
+	id := IDString(msg.ID)
+	requestContext, cancel := context.WithCancel(ctx)
+	p.mu.Lock()
+	p.inbound[id] = cancel
+	p.mu.Unlock()
+	go func() {
+		defer cancel()
+		var result any
+		reqErr := error(&RPCError{
+			Code:    CodeMethodNotFound,
+			Message: fmt.Sprintf("unsupported server request %q", msg.Method),
+		})
+		p.serverRequestMu.RLock()
+		handler := p.request
+		legacy := p.serverRequest
+		p.serverRequestMu.RUnlock()
+		switch {
+		case handler != nil:
+			result, reqErr = handler(requestContext, msg)
+		case legacy != nil:
+			result, reqErr = legacy(msg)
+		}
+		p.mu.Lock()
+		delete(p.inbound, id)
+		p.mu.Unlock()
+		_ = p.writeResponse(context.WithoutCancel(requestContext), msg.ID, result, reqErr)
+	}()
+}
+
+func (p *Process) handleCancel(params json.RawMessage) {
+	var notification struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if json.Unmarshal(params, &notification) != nil {
+		return
+	}
+	id := IDString(notification.RequestID)
+	p.mu.Lock()
+	cancel := p.inbound[id]
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (p *Process) removePending(id string) chan processResponse {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -357,6 +468,10 @@ func (p *Process) closePending(err error) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	for id, cancel := range p.inbound {
+		cancel()
+		delete(p.inbound, id)
+	}
 	for id, ch := range p.pending {
 		ch <- processResponse{err: err}
 		delete(p.pending, id)
