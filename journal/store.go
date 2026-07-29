@@ -343,6 +343,8 @@ func readJournal(path, expectedSchema string, through uint64) ([]Record, error) 
 
 	reader := bufio.NewReader(file)
 	var out []Record
+	var lastSequence uint64
+	hasLastSequence := false
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
@@ -356,9 +358,11 @@ func readJournal(path, expectedSchema string, through uint64) ([]Record, error) 
 			if record.Schema != expectedSchema || record.SchemaVersion != schemaVersion {
 				return nil, fmt.Errorf("journal: unsupported schema at %s line %d", path, len(out)+1)
 			}
-			if len(out) > 0 && record.Sequence <= out[len(out)-1].Sequence {
+			if hasLastSequence && record.Sequence <= lastSequence {
 				return nil, fmt.Errorf("journal: non-monotonic sequence at %s line %d", path, len(out)+1)
 			}
+			lastSequence = record.Sequence
+			hasLastSequence = true
 			if through == 0 || record.Sequence <= through {
 				out = append(out, record)
 			}

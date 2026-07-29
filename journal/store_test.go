@@ -186,7 +186,7 @@ func TestStoreReaderHandlesTornTailAndRejectsEarlierProblems(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "order.jsonl"), append(marshalLine(t, first), marshalLine(t, second)...), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Read("order", 0); err == nil {
+	if _, err := store.Read("order", 1); err == nil {
 		t.Fatal("Read accepted non-monotonic records")
 	}
 }

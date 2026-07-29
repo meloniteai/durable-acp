@@ -16,6 +16,7 @@ const (
 	EventAgentWorkspace      = "agent.workspace_changed"
 	EventAgentTurnStarted    = "agent.turn_started"
 	EventAgentYielded        = "agent.yielded"
+	EventAgentInterrupted    = "agent.interrupted"
 	EventAgentTurnFailed     = "agent.turn_failed"
 	EventAgentProcessExited  = "agent.process_exited"
 	EventAgentStalled        = "agent.stalled"
