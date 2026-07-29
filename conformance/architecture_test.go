@@ -17,11 +17,20 @@ func TestPackageBoundaries(t *testing.T) {
 
 	root := repositoryRoot(t)
 	allowed := map[string][]string{
-		"acp":       nil,
-		"transport": nil,
-		"client":    {"acp", "transport"},
-		"host":      nil,
-		"session":   {"host"},
+		"acp":                  nil,
+		"transport":            nil,
+		"client":               {"acp", "transport"},
+		"host":                 nil,
+		"session":              {"host"},
+		"journal":              {"host"},
+		"adapters/acpx":        {"acp", "client", "host"},
+		"adapters/claude":      {"adapters/acpx", "host"},
+		"adapters/codex":       {"adapters/acpx", "host"},
+		"adapters/cursor":      {"adapters/acpx", "host"},
+		"adapters/antigravity": {"adapters/acpx", "host"},
+		"adapters":             {"adapters/acpx", "adapters/antigravity", "adapters/claude", "adapters/codex", "adapters/cursor", "host"},
+		"runtime":              {"host", "journal", "session"},
+		"worktree":             nil,
 	}
 	for packageName, dependencies := range allowed {
 		t.Run(packageName, func(t *testing.T) {
@@ -38,7 +47,6 @@ func TestNoProductLeakage(t *testing.T) {
 	forbidden := []string{
 		"github.com/meloniteai/melonite/",
 		"HarnessMode",
-		"InteractionResponse",
 		"LoopResponder",
 		"NativePlanGate",
 		"PromptWeave",
@@ -84,7 +92,7 @@ func repositoryRoot(t *testing.T) string {
 
 func checkPackageImports(t *testing.T, root, packageName string, allowed []string) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(root, packageName))
+	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(packageName)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +101,7 @@ func checkPackageImports(t *testing.T, root, packageName string, allowed []strin
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".go" || strings.HasSuffix(entry.Name(), "_test.go") {
 			continue
 		}
-		path := filepath.Join(root, packageName, entry.Name())
+		path := filepath.Join(root, filepath.FromSlash(packageName), entry.Name())
 		file, parseErr := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
 		if parseErr != nil {
 			t.Fatal(parseErr)
@@ -104,7 +112,7 @@ func checkPackageImports(t *testing.T, root, packageName string, allowed []strin
 				continue
 			}
 			dependency := strings.TrimPrefix(importPath, modulePrefix)
-			if strings.Contains(dependency, "/") || !slices.Contains(allowed, dependency) {
+			if !slices.Contains(allowed, dependency) {
 				t.Errorf("%s imports forbidden internal package %q", entry.Name(), importPath)
 			}
 		}

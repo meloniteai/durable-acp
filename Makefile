@@ -1,5 +1,6 @@
 GOLANGCI_LINT_VERSION ?= v2.12.2
 COVERAGE_MIN ?= 85
+TEST_RESULTS ?=
 
 .PHONY: all test lint vet coverage
 
@@ -9,7 +10,16 @@ test:
 	@raw_coverage=$$(mktemp); \
 	coverage_file=$$(mktemp); \
 	trap 'rm -f "$$raw_coverage" "$$coverage_file"' EXIT; \
-	go test -race -covermode=atomic -coverprofile="$$raw_coverage" ./...; \
+	if [ -n "$(TEST_RESULTS)" ]; then \
+		mkdir -p "$$(dirname "$(TEST_RESULTS)")"; \
+		if go test -json -race -covermode=atomic -coverprofile="$$raw_coverage" ./... > "$(TEST_RESULTS)"; then test_status=0; else test_status=$$?; fi; \
+	else \
+		if go test -race -covermode=atomic -coverprofile="$$raw_coverage" ./...; then test_status=0; else test_status=$$?; fi; \
+	fi; \
+	if [ "$$test_status" -ne 0 ]; then \
+		if [ -n "$(TEST_RESULTS)" ]; then cat "$(TEST_RESULTS)"; fi; \
+		exit "$$test_status"; \
+	fi; \
 	awk 'NR == 1 || ($$1 !~ /schema_(constants|helpers|types)_gen\.go:/ && $$1 !~ /\/internal\/cmd\/acpgen\/.*\.go:/)' "$$raw_coverage" > "$$coverage_file"; \
 	go tool cover -func="$$coverage_file"; \
 	total=$$(go tool cover -func="$$coverage_file" | awk '/^total:/ { gsub(/%/, "", $$3); print $$3 }'); \

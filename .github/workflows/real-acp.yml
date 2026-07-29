@@ -1,0 +1,107 @@
+name: real-acp
+
+on:
+  workflow_dispatch:
+    inputs:
+      native_agents:
+        description: 'Optional native agents to run with their own configured credentials (cursor, antigravity, or both)'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - ".github/workflows/real-acp.yml"
+      - "adapters/**"
+      - "client/**"
+      - "conformance/**"
+      - "host/**"
+      - "integration/realacp/**"
+      - "journal/**"
+      - "runtime/**"
+      - "scripts/realacp-openrouter.codex.toml"
+      - "scripts/run-realacp.sh"
+      - "worktree/**"
+      - "engine.go"
+      - "go.mod"
+      - "go.sum"
+
+permissions:
+  contents: read
+  checks: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Actions does not expose repository secrets to forked pull requests.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install Bubblewrap
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+
+      - name: Run real ACP tests through OpenRouter
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          DURABLE_ACP_REAL_MODEL: deepseek/deepseek-v4-flash
+          DURABLE_ACP_REAL_REASONING: low
+          DURABLE_ACP_REAL_JOBS: 4
+          DURABLE_ACP_REAL_TEST_RESULTS_DIR: test-results/real-acp-openrouter
+        run: scripts/run-realacp.sh --provider openrouter --agents codex,claude
+
+      - name: Publish OpenRouter real ACP test report
+        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
+        if: ${{ !cancelled() }}
+        with:
+          name: Real ACP tests (OpenRouter)
+          path: test-results/real-acp-openrouter/*.json
+          reporter: golang-json
+
+  native:
+    # Native providers cannot use the OpenRouter credential. This deliberately
+    # runs only when a maintainer selects agents in a manual dispatch and has
+    # configured the corresponding Actions secrets.
+    if: github.event_name == 'workflow_dispatch' && inputs.native_agents != ''
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run selected native real ACP matrix
+        env:
+          CURSOR_API_KEY: ${{ secrets.DURABLE_ACP_CURSOR_API_KEY }}
+          ANTIGRAVITY_API_KEY: ${{ secrets.DURABLE_ACP_ANTIGRAVITY_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.DURABLE_ACP_GEMINI_API_KEY }}
+          DURABLE_ACP_REAL_JOBS: 4
+          DURABLE_ACP_REAL_TEST_RESULTS_DIR: test-results/real-acp-native
+        run: scripts/run-realacp.sh --provider vanilla --agents "${{ inputs.native_agents }}" --journeys all
+
+      - name: Publish native real ACP test report
+        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
+        if: ${{ !cancelled() }}
+        with:
+          name: Real ACP tests (native)
+          path: test-results/real-acp-native/*.json
+          reporter: golang-json

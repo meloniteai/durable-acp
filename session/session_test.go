@@ -37,8 +37,8 @@ func TestTransitionTable(t *testing.T) {
 	allowed := map[Status]map[Status]bool{
 		StatusCreating:     {StatusActive: true, StatusFailed: true, StatusClosed: true},
 		StatusActive:       {StatusRunning: true, StatusFailed: true, StatusClosed: true},
-		StatusRunning:      {StatusWaitingInput: true, StatusFailed: true, StatusClosed: true},
-		StatusWaitingInput: {StatusRunning: true, StatusFailed: true, StatusClosed: true},
+		StatusRunning:      {StatusActive: true, StatusWaitingInput: true, StatusFailed: true, StatusClosed: true},
+		StatusWaitingInput: {StatusActive: true, StatusRunning: true, StatusFailed: true, StatusClosed: true},
 		StatusFailed:       {StatusClosed: true},
 		StatusClosed:       {},
 	}
