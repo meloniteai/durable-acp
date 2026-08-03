@@ -3,10 +3,13 @@ package durableacp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/meloniteai/durable-acp/host"
 )
@@ -178,6 +181,77 @@ func TestEngineExistingWorkspaceFacadesAndEvents(t *testing.T) {
 	}
 }
 
+func TestEngineQueueControlAndRestartFacades(t *testing.T) {
+	adapter := &queueEngineAdapter{}
+	engine, err := Open(context.Background(), t.TempDir(), WithAdapters(adapter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	created, err := engine.Start(context.Background(), StartRequest{ID: "queue-control", Backend: "queue", WorkspaceMode: WorkspaceExisting, Worktree: engineRepo(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, sendErr := engine.Send(context.Background(), host.SendTurnRequest{SessionID: created.ID, Prompt: "active"}); sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	if blockErr := engine.BlockDispatch(created.ID); blockErr != nil {
+		t.Fatal(blockErr)
+	}
+	queued, err := engine.Send(context.Background(), host.SendTurnRequest{SessionID: created.ID, Prompt: "queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	priority, err := engine.SendNext(context.Background(), host.SendTurnRequest{SessionID: created.ID, Prompt: "priority"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := engine.QueueEntries(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].ID != priority.QueueEntryID || entries[1].ID != queued.QueueEntryID {
+		t.Fatalf("entries = %#v", entries)
+	}
+	replaced, err := engine.ReplaceQueuedTurn(created.ID, priority.QueueEntryID, host.SendTurnRequest{Prompt: "replacement"})
+	if err != nil || replaced.ID != priority.QueueEntryID || replaced.Request.Prompt != "replacement" {
+		t.Fatalf("replacement = %#v, %v", replaced, err)
+	}
+	removed, err := engine.RemoveQueuedTurn(created.ID, queued.QueueEntryID)
+	if err != nil || !removed.Removed || removed.Entry.ID != queued.QueueEntryID {
+		t.Fatalf("removed = %#v, %v", removed, err)
+	}
+	if interruptErr := engine.InterruptActive(context.Background(), created.ID); interruptErr != nil {
+		t.Fatal(interruptErr)
+	}
+	if adapter.interruptCount() != 1 {
+		t.Fatalf("interrupts = %d", adapter.interruptCount())
+	}
+	adapter.emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "turn-1"})
+	state, err := engine.Runtime().State(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.TurnActive || !state.DispatchBlocked || state.QueueDepth != 1 {
+		t.Fatalf("blocked state = %#v", state)
+	}
+	if unblockErr := engine.UnblockDispatch(created.ID); unblockErr != nil {
+		t.Fatal(unblockErr)
+	}
+	deadline := time.Now().Add(time.Second)
+	for adapter.turnCount() != 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if prompts := adapter.prompts(); len(prompts) != 2 || prompts[1] != "replacement" {
+		t.Fatalf("prompts = %#v", prompts)
+	}
+	adapter.emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "turn-2"})
+	restarted, err := engine.Restart(context.Background(), created.ID)
+	if err != nil || restarted.ID != "queue-provider-restarted" || adapter.restartCount() != 1 {
+		t.Fatalf("restart = %#v, %v, calls = %d", restarted, err, adapter.restartCount())
+	}
+}
+
 func TestEngineValidationConfigurationAndHelpers(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -323,8 +397,32 @@ func TestEngineRepairPruneRollbackAndNilGuards(t *testing.T) {
 	if _, err := (*Engine)(nil).Send(context.Background(), host.SendTurnRequest{}); err == nil {
 		t.Fatal("nil Engine sent a turn")
 	}
+	if _, err := (*Engine)(nil).SendNext(context.Background(), host.SendTurnRequest{}); err == nil {
+		t.Fatal("nil Engine prepended a turn")
+	}
+	if _, err := (*Engine)(nil).QueueEntries("s"); err == nil {
+		t.Fatal("nil Engine listed queued turns")
+	}
+	if _, err := (*Engine)(nil).RemoveQueuedTurn("s", "q"); err == nil {
+		t.Fatal("nil Engine removed a queued turn")
+	}
+	if _, err := (*Engine)(nil).ReplaceQueuedTurn("s", "q", host.SendTurnRequest{}); err == nil {
+		t.Fatal("nil Engine replaced a queued turn")
+	}
+	if err := (*Engine)(nil).BlockDispatch("s"); err == nil {
+		t.Fatal("nil Engine blocked dispatch")
+	}
+	if err := (*Engine)(nil).UnblockDispatch("s"); err == nil {
+		t.Fatal("nil Engine unblocked dispatch")
+	}
+	if _, err := (*Engine)(nil).Restart(context.Background(), "s"); err == nil {
+		t.Fatal("nil Engine restarted a session")
+	}
 	if err := (*Engine)(nil).Interrupt(context.Background(), "s"); err == nil {
 		t.Fatal("nil Engine interrupted a session")
+	}
+	if err := (*Engine)(nil).InterruptActive(context.Background(), "s"); err == nil {
+		t.Fatal("nil Engine interrupted an active turn")
 	}
 	if err := (*Engine)(nil).RespondInteraction(context.Background(), "s", host.InteractionResponse{}); err == nil {
 		t.Fatal("nil Engine responded to an interaction")
@@ -432,6 +530,86 @@ type advancedEngineAdapter struct {
 	sink       host.EventSink
 	answer     host.InteractionResponse
 	interrupts int
+}
+
+type queueEngineAdapter struct {
+	mu         sync.Mutex
+	sink       host.EventSink
+	turns      []string
+	interrupts int
+	restarts   int
+}
+
+func (*queueEngineAdapter) Backend() host.Backend { return "queue" }
+
+func (*queueEngineAdapter) Detect(context.Context) host.BackendStatus {
+	return host.BackendStatus{Backend: "queue", Available: true}
+}
+
+func (a *queueEngineAdapter) StartSession(_ context.Context, _ string, _ host.StartSessionRequest, sink host.EventSink) (host.BackendSession, error) {
+	a.mu.Lock()
+	a.sink = sink
+	a.mu.Unlock()
+	return host.BackendSession{ID: "queue-provider"}, nil
+}
+
+func (a *queueEngineAdapter) SendTurn(_ context.Context, _ string, request host.SendTurnRequest, sink host.EventSink) (host.BackendSession, error) {
+	a.mu.Lock()
+	a.sink = sink
+	a.turns = append(a.turns, request.Prompt)
+	turnID := fmt.Sprintf("turn-%d", len(a.turns))
+	a.mu.Unlock()
+	sink(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID})
+	return host.BackendSession{ID: "queue-provider", TurnID: turnID}, nil
+}
+
+func (a *queueEngineAdapter) Interrupt(context.Context, string, host.EventSink) error {
+	a.mu.Lock()
+	a.interrupts++
+	a.mu.Unlock()
+	return nil
+}
+
+func (*queueEngineAdapter) CloseSession(string) error { return nil }
+
+func (a *queueEngineAdapter) RestartSession(context.Context, string, host.EventSink) (host.BackendSession, error) {
+	a.mu.Lock()
+	a.restarts++
+	a.mu.Unlock()
+	return host.BackendSession{ID: "queue-provider-restarted"}, nil
+}
+
+func (a *queueEngineAdapter) emit(event host.Event) {
+	a.mu.Lock()
+	sink := a.sink
+	a.mu.Unlock()
+	if sink != nil {
+		sink(event)
+	}
+}
+
+func (a *queueEngineAdapter) prompts() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.turns...)
+}
+
+func (a *queueEngineAdapter) turnCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.turns)
+}
+
+func (a *queueEngineAdapter) interruptCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.interrupts
+}
+
+func (a *queueEngineAdapter) restartCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.restarts
 }
 
 func (*advancedEngineAdapter) Backend() host.Backend { return "advanced" }
