@@ -624,6 +624,9 @@ func TestRuntimeValidationQueueInterruptAndClose(t *testing.T) {
 	if err != nil || state.QueueDepth != 0 || adapter.interrupts != 1 {
 		t.Fatalf("state after interrupt = %#v, adapter = %#v", state, adapter)
 	}
+	if err := runtime.Forget("s"); err == nil {
+		t.Fatal("Forget accepted active session")
+	}
 	adapter.closeErr = errors.New("close failed")
 	if err := runtime.Close("s"); err == nil {
 		t.Fatal("Close accepted adapter failure")
@@ -636,6 +639,15 @@ func TestRuntimeValidationQueueInterruptAndClose(t *testing.T) {
 		t.Fatal("Send accepted closed session")
 	}
 	if err := runtime.Close("s"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Forget("s"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.State("s"); err == nil {
+		t.Fatal("Forget retained closed session")
+	}
+	if err := runtime.Forget("s"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -816,6 +828,9 @@ func TestRuntimeStartStateAndQueuedFailurePaths(t *testing.T) {
 	}
 	if err := (*Runtime)(nil).Close("s"); err == nil {
 		t.Fatal("nil runtime closed a session")
+	}
+	if err := (*Runtime)(nil).Forget("s"); err == nil {
+		t.Fatal("nil runtime forgot a session")
 	}
 	if (*Runtime)(nil).Sessions() != nil || (*Runtime)(nil).Detect(context.Background()) != nil || (*Runtime)(nil).Catalog(context.Background(), false) != nil {
 		t.Fatal("nil runtime returned state")

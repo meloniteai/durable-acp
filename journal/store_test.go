@@ -113,6 +113,47 @@ func TestStoreSchemaValidation(t *testing.T) {
 	}
 }
 
+func TestStoreLastSequence(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	store, openErr := NewStore(dir)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if _, sequenceErr := store.LastSequence(""); sequenceErr == nil {
+		t.Fatal("LastSequence accepted a missing session")
+	}
+	if _, sequenceErr := store.LastSequence("missing"); !errors.Is(sequenceErr, os.ErrNotExist) {
+		t.Fatalf("missing LastSequence error = %v", sequenceErr)
+	}
+	for range 2 {
+		if _, appendErr := store.Append(Record{SessionID: "one", Event: "agent.message"}); appendErr != nil {
+			t.Fatal(appendErr)
+		}
+	}
+	sequence, err := store.LastSequence("one")
+	if err != nil || sequence != 2 {
+		t.Fatalf("open writer sequence = %d, %v", sequence, err)
+	}
+	if closeErr := store.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	sequence, err = store.LastSequence("one")
+	if err != nil || sequence != 2 {
+		t.Fatalf("persisted sequence = %d, %v", sequence, err)
+	}
+	if writeErr := os.WriteFile(filepath.Join(dir, "empty.jsonl"), nil, 0o600); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	sequence, err = store.LastSequence("empty")
+	if err != nil || sequence != 0 {
+		t.Fatalf("empty sequence = %d, %v", sequence, err)
+	}
+}
+
 func TestStoreReducerReplaysAndNormalizes(t *testing.T) {
 	t.Parallel()
 

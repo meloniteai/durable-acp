@@ -54,12 +54,13 @@ type CreateRequest struct {
 
 // State is the current runtime-owned view of a session.
 type State struct {
-	Session         session.Session `json:"session"`
-	QueueDepth      int             `json:"queue_depth"`
-	QueueEntries    []QueueEntry    `json:"queue_entries,omitempty"`
-	TurnActive      bool            `json:"turn_active"`
-	ActiveTurnID    string          `json:"active_turn_id,omitempty"`
-	DispatchBlocked bool            `json:"dispatch_blocked,omitempty"`
+	Session            session.Session          `json:"session"`
+	QueueDepth         int                      `json:"queue_depth"`
+	QueueEntries       []QueueEntry             `json:"queue_entries,omitempty"`
+	TurnActive         bool                     `json:"turn_active"`
+	ActiveTurnID       string                   `json:"active_turn_id,omitempty"`
+	DispatchBlocked    bool                     `json:"dispatch_blocked,omitempty"`
+	PendingInteraction *host.InteractionRequest `json:"pending_interaction,omitempty"`
 }
 
 type QueueEntry struct {
@@ -130,15 +131,16 @@ type Runtime struct {
 }
 
 type managedSession struct {
-	session         session.Session
-	queue           []QueueEntry
-	dispatching     bool
-	active          bool
-	activeTurnID    string
-	dispatchBlocked bool
-	nextQueueSeq    int
-	nextSeq         int
-	coalescer       *deltaCoalescer
+	session            session.Session
+	queue              []QueueEntry
+	dispatching        bool
+	active             bool
+	activeTurnID       string
+	dispatchBlocked    bool
+	pendingInteraction *host.InteractionRequest
+	nextQueueSeq       int
+	nextSeq            int
+	coalescer          *deltaCoalescer
 }
 
 // New creates a Runtime over the supplied adapters. Duplicate backend names
@@ -666,6 +668,32 @@ func (r *Runtime) Close(sessionID string) error {
 	return nil
 }
 
+// Forget removes a closed session after its durable owner has removed or
+// rolled back the corresponding identity.
+func (r *Runtime) Forget(sessionID string) error {
+	if r == nil {
+		return errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	r.mu.Lock()
+	managed := r.sessions[id]
+	if managed == nil {
+		r.mu.Unlock()
+		return nil
+	}
+	if managed.session.Status != session.StatusClosed {
+		r.mu.Unlock()
+		return fmt.Errorf("runtime: session %q must be closed before it is forgotten", id)
+	}
+	delete(r.sessions, id)
+	coalescer := managed.coalescer
+	r.mu.Unlock()
+	if coalescer != nil {
+		coalescer.Close()
+	}
+	return nil
+}
+
 // Shutdown closes provider processes without changing durable session state.
 // It is intended for an embedding application's own shutdown path: sessions
 // remain resumable when the next Engine opens the same home directory.
@@ -1033,8 +1061,13 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 			}
 		}
 	case host.EventInteractionRequested:
+		managed.pendingInteraction = cloneInteractionRequest(event.Interaction)
 		if managed.session.Status == session.StatusRunning {
 			_ = managed.session.Transition(session.StatusWaitingInput)
+		}
+	case host.EventInteractionResolved:
+		if event.InteractionResponse == nil || managed.pendingInteraction == nil || event.InteractionResponse.RequestID == managed.pendingInteraction.ID {
+			managed.pendingInteraction = nil
 		}
 	case host.EventTurnComplete, host.EventTurnFailed, host.EventProcessExited:
 		terminalMatches := event.Type == host.EventProcessExited || event.BackendTurnID == "" || managed.activeTurnID == "" || event.BackendTurnID == managed.activeTurnID
@@ -1042,6 +1075,7 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 			managed.dispatching = false
 			managed.active = false
 			managed.activeTurnID = ""
+			managed.pendingInteraction = nil
 			if managed.session.Status == session.StatusRunning || managed.session.Status == session.StatusWaitingInput {
 				_ = managed.session.Transition(session.StatusActive)
 			}
@@ -1275,12 +1309,13 @@ func cloneData(data map[string]any) map[string]any {
 
 func stateLocked(managed *managedSession) State {
 	return State{
-		Session:         managed.session,
-		QueueDepth:      len(managed.queue),
-		QueueEntries:    cloneQueueEntries(managed.queue),
-		TurnActive:      managed.active,
-		ActiveTurnID:    managed.activeTurnID,
-		DispatchBlocked: managed.dispatchBlocked,
+		Session:            managed.session,
+		QueueDepth:         len(managed.queue),
+		QueueEntries:       cloneQueueEntries(managed.queue),
+		TurnActive:         managed.active,
+		ActiveTurnID:       managed.activeTurnID,
+		DispatchBlocked:    managed.dispatchBlocked,
+		PendingInteraction: cloneInteractionRequest(managed.pendingInteraction),
 	}
 }
 
@@ -1304,6 +1339,21 @@ func cloneSendTurnRequest(request host.SendTurnRequest) host.SendTurnRequest {
 	request.Ext = append(json.RawMessage(nil), request.Ext...)
 	request.Attachments = append([]host.Attachment(nil), request.Attachments...)
 	return request
+}
+
+func cloneInteractionRequest(request *host.InteractionRequest) *host.InteractionRequest {
+	if request == nil {
+		return nil
+	}
+	cloned := *request
+	cloned.Options = append([]host.InteractionOption(nil), request.Options...)
+	cloned.Fields = make([]host.InteractionField, len(request.Fields))
+	for index, field := range request.Fields {
+		cloned.Fields[index] = field
+		cloned.Fields[index].Options = append([]host.InteractionOption(nil), field.Options...)
+	}
+	cloned.Data = cloneData(request.Data)
+	return &cloned
 }
 
 func newID() (string, error) {
