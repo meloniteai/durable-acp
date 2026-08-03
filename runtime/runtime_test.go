@@ -62,6 +62,130 @@ func TestRuntimeQueuesAndDispatchesTurns(t *testing.T) {
 	}
 }
 
+func TestRuntimeTracksConfigurationWhenTurnsAreSubmitted(t *testing.T) {
+	adapter := &testAdapter{backend: "test"}
+	runtime := New(Config{}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "configured", Backend: "test", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{
+		SessionID: "configured", Model: "model-a", Reasoning: "high", PermissionMode: "ask",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := runtime.State("configured")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration != (Configuration{Model: "model-a", Reasoning: "high", PermissionMode: "ask"}) {
+		t.Fatalf("start configuration = %+v", state.Configuration)
+	}
+	if _, err = runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "configured", Prompt: "active", Model: "model-b"}); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "configured", Prompt: "queued", Reasoning: "low"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = runtime.State("configured")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued.Queued || state.Configuration != (Configuration{Model: "model-b", Reasoning: "high", PermissionMode: "ask"}) {
+		t.Fatalf("configuration before queued dispatch = %+v, queued = %+v", state.Configuration, queued)
+	}
+	adapter.emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "turn-1"})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		state, err = runtime.State("configured")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Configuration.Reasoning == "low" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if state.Configuration != (Configuration{Model: "model-b", Reasoning: "low", PermissionMode: "ask"}) {
+		t.Fatalf("configuration after queued dispatch = %+v", state.Configuration)
+	}
+	if err = runtime.SetConfiguration("configured", Configuration{Model: " override ", PermissionMode: " full "}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = runtime.State("configured")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration != (Configuration{Model: "override", PermissionMode: "full"}) {
+		t.Fatalf("replaced configuration = %+v", state.Configuration)
+	}
+}
+
+func TestRuntimeDoesNotCommitFailedTurnConfiguration(t *testing.T) {
+	adapter := &testAdapter{backend: "test", sendErr: errors.New("provider failed")}
+	runtime := New(Config{}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "failed-config", Backend: "test", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "failed-config", Model: "model-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "failed-config", Prompt: "fail", Model: "model-b"}); err == nil {
+		t.Fatal("failed turn succeeded")
+	}
+	state, err := runtime.State("failed-config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration.Model != "model-a" {
+		t.Fatalf("failed configuration became effective: %+v", state.Configuration)
+	}
+}
+
+func TestRuntimePrefersProviderEffectiveConfigurationEvents(t *testing.T) {
+	adapter := &testAdapter{
+		backend: "test",
+		startEvents: []host.Event{
+			{Type: host.EventModels, Data: map[string]any{"current_model": "model-canonical"}},
+			{Type: host.EventReasoningLevels, Data: map[string]any{"current_reasoning": "high"}},
+			{Type: host.EventPermissionModes, Data: map[string]any{"current_mode": "ask"}},
+		},
+		sendEvents: []host.Event{
+			{Type: host.EventModels, Data: map[string]any{"current_model": "model-next-canonical"}},
+			{Type: host.EventReasoningLevels, Data: map[string]any{"current_reasoning": ""}},
+			{Type: host.EventPermissionModes, Data: map[string]any{"current_mode": "plan"}},
+		},
+	}
+	runtime := New(Config{}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "effective", Backend: "test", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{
+		SessionID: "effective", Model: "model-alias", Reasoning: "high", PermissionMode: "ask",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := runtime.State("effective")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration != (Configuration{Model: "model-canonical", Reasoning: "high", PermissionMode: "ask"}) {
+		t.Fatalf("start configuration = %+v", state.Configuration)
+	}
+	if _, err = runtime.Send(context.Background(), host.SendTurnRequest{
+		SessionID: "effective", Prompt: "next", Model: "model-next-alias", Reasoning: "low", PermissionMode: "full",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = runtime.State("effective")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration != (Configuration{Model: "model-next-canonical", PermissionMode: "plan"}) {
+		t.Fatalf("turn configuration = %+v", state.Configuration)
+	}
+}
+
 func TestRuntimeQueueEntriesRemovalBlockingAndDispatchLifecycle(t *testing.T) {
 	adapter := &testAdapter{backend: "test"}
 	var mu sync.Mutex
@@ -897,6 +1021,8 @@ type testAdapter struct {
 	closes       int
 	catalog      host.BackendCatalog
 	catalogErr   error
+	startEvents  []host.Event
+	sendEvents   []host.Event
 }
 
 type restartTestAdapter struct {
@@ -943,6 +1069,9 @@ func (a *testAdapter) StartSession(_ context.Context, _ string, request host.Sta
 	if a.startErr != nil {
 		return host.BackendSession{}, a.startErr
 	}
+	for _, event := range a.startEvents {
+		emit(event)
+	}
 	if request.Prompt != "" {
 		emit(host.Event{Type: host.EventTurnStarted, BackendTurnID: "initial-turn"})
 		emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "initial-turn"})
@@ -958,6 +1087,9 @@ func (a *testAdapter) SendTurn(_ context.Context, _ string, request host.SendTur
 	a.mu.Unlock()
 	if a.sendErr != nil {
 		return host.BackendSession{}, a.sendErr
+	}
+	for _, event := range a.sendEvents {
+		emit(event)
 	}
 	emit(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID})
 	return host.BackendSession{ID: "provider-session", TurnID: turnID}, nil

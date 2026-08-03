@@ -77,9 +77,7 @@ type managedSession struct {
 	worktree  string
 	emit      host.EventSink
 	conn      *client.Connection
-	model     string
-	reasoning string
-	mode      string
+	config    *SessionConfigurator
 
 	promptMu sync.Mutex
 	turn     atomic.Uint64
@@ -191,9 +189,7 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 		hostID:       sessionID,
 		worktree:     filepath.Clean(request.Worktree),
 		emit:         emit,
-		model:        strings.TrimSpace(request.Model),
-		reasoning:    strings.TrimSpace(request.Reasoning),
-		mode:         strings.TrimSpace(request.PermissionMode),
+		config:       NewSessionConfigurator("", nil),
 		interactions: map[string]chan host.InteractionResponse{},
 		done:         make(chan struct{}),
 	}
@@ -220,7 +216,6 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 	managed.conn = connection
 
 	backendID := strings.TrimSpace(request.ResumeBackendSessionID)
-	var options []acp.SessionConfigOption
 	if backendID == "" {
 		created, createErr := connection.NewSession(ctx, &acp.NewSessionRequest{Cwd: managed.worktree, McpServers: []acp.McpServer{}})
 		if createErr != nil {
@@ -229,8 +224,7 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 		}
 		backendID = string(created.SessionId)
 		managed.backendID = backendID
-		options = created.ConfigOptions
-		managed.emitConfig(created.ConfigOptions, created.Modes)
+		managed.updateConfig(created.ConfigOptions, created.Modes)
 	} else {
 		resumed, resumeErr := connection.ResumeSession(ctx, &acp.ResumeSessionRequest{Cwd: managed.worktree, SessionId: acp.SessionId(backendID)})
 		if resumeErr != nil {
@@ -240,18 +234,15 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 				return nil, host.BackendSession{}, fmt.Errorf("acpx: resume session: %w", errors.Join(resumeErr, loadErr))
 			}
 			managed.backendID = backendID
-			options = loaded.ConfigOptions
-			managed.emitConfig(loaded.ConfigOptions, loaded.Modes)
+			managed.updateConfig(loaded.ConfigOptions, loaded.Modes)
 		} else {
 			managed.backendID = backendID
-			options = resumed.ConfigOptions
-			managed.emitConfig(resumed.ConfigOptions, resumed.Modes)
+			managed.updateConfig(resumed.ConfigOptions, resumed.Modes)
 		}
 	}
-	if err := managed.applySelections(ctx, options, request.Model, request.Reasoning, request.PermissionMode); err != nil {
-		// Config selection is advisory across ACP implementations. The agent
-		// session remains usable if it does not recognize one of the controls.
-		managed.emitEvent(host.Event{Type: host.EventTraceUpdated, Message: err.Error(), Data: map[string]any{"source": "session_config"}})
+	if err = managed.applySelections(ctx, request.Model, request.Reasoning, request.PermissionMode); err != nil {
+		_ = connection.Close()
+		return nil, host.BackendSession{}, err
 	}
 	state := host.BackendSession{ID: backendID, ThreadID: backendID}
 	return managed, state, nil
@@ -270,6 +261,9 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 	}
 	managed.promptMu.Lock()
 	defer managed.promptMu.Unlock()
+	if err = managed.applySelections(ctx, request.Model, request.Reasoning, request.PermissionMode); err != nil {
+		return host.BackendSession{}, err
+	}
 	turnID := fmt.Sprintf("turn-%d", managed.turn.Add(1))
 	managed.setTurnID(turnID)
 	defer managed.setTurnID("")
@@ -304,12 +298,13 @@ func (a *Adapter) RestartSession(ctx context.Context, sessionID string, emit hos
 	defer managed.promptMu.Unlock()
 	managed.stop()
 	_ = managed.conn.Close()
+	model, reasoning, mode := managed.desiredConfiguration()
 	replacement, state, err := a.openSession(ctx, sessionID, host.StartSessionRequest{
 		Worktree:               managed.worktree,
 		ResumeBackendSessionID: managed.backendID,
-		Model:                  managed.model,
-		Reasoning:              managed.reasoning,
-		PermissionMode:         managed.mode,
+		Model:                  model,
+		Reasoning:              reasoning,
+		PermissionMode:         mode,
 	}, emit)
 	if err != nil {
 		return host.BackendSession{}, err
@@ -599,12 +594,26 @@ func (s *managedSession) emitUpdate(update acp.SessionUpdate) {
 		}
 		s.emitEvent(host.Event{Type: host.EventAvailableCommands, Data: map[string]any{"available_commands": commands}})
 	case update.ConfigOptionUpdate != nil:
-		s.emitConfig(update.ConfigOptionUpdate.ConfigOptions, nil)
+		s.updateConfig(update.ConfigOptionUpdate.ConfigOptions, nil)
 	case update.CurrentModeUpdate != nil:
+		s.updateCurrentMode(update.CurrentModeUpdate.CurrentModeId)
 		s.emitEvent(host.Event{Type: host.EventConfigCatalog, Data: map[string]any{"current_mode": update.CurrentModeUpdate.CurrentModeId}})
 	case update.UsageUpdate != nil:
 		s.emitEvent(host.Event{Type: host.EventTraceUpdated, Data: valueMap(*update.UsageUpdate)})
 	}
+}
+
+func (s *managedSession) updateConfig(options []acp.SessionConfigOption, modes *acp.SessionModeState) {
+	if s.config == nil {
+		s.config = NewSessionConfigurator(s.backendID, nil)
+	}
+	s.config.replace(s.backendID, options, modes)
+	storedOptions, storedModes := s.config.state()
+	s.emitConfig(storedOptions, storedModes)
+}
+
+func (s *managedSession) updateCurrentMode(mode acp.SessionModeId) {
+	s.config.SetCurrentMode(string(mode))
 }
 
 func (s *managedSession) emitConfig(options []acp.SessionConfigOption, modes *acp.SessionModeState) {
@@ -622,32 +631,41 @@ func (s *managedSession) emitConfig(options []acp.SessionConfigOption, modes *ac
 	}
 }
 
-func (s *managedSession) applySelections(ctx context.Context, options []acp.SessionConfigOption, model, reasoning, mode string) error {
-	selections := []struct {
-		value string
-		keys  []string
-	}{
-		{value: strings.TrimSpace(model), keys: []string{"model"}},
-		{value: strings.TrimSpace(reasoning), keys: []string{"thought_level", "reasoning", "reasoning_effort", "effort"}},
-		{value: strings.TrimSpace(mode), keys: []string{"mode", "permission_mode"}},
+func (s *managedSession) applySelections(ctx context.Context, model, reasoning, mode string) error {
+	changed, err := s.config.Apply(ctx, connectionConfigurationClient{s.conn}, model, reasoning, mode)
+	if changed {
+		options, modes := s.config.state()
+		s.emitConfig(options, modes)
 	}
-	var joined error
-	for _, selection := range selections {
-		if selection.value == "" {
-			continue
-		}
-		optionID := findOption(options, selection.keys...)
-		if optionID == "" {
-			continue
-		}
-		_, err := s.conn.SetSessionConfigOption(ctx, &acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
-			ConfigId:  acp.SessionConfigId(optionID),
-			SessionId: acp.SessionId(s.backendID),
-			Value:     acp.SessionConfigValueId(selection.value),
-		}})
-		joined = errors.Join(joined, err)
+	return err
+}
+
+func (s *managedSession) desiredConfiguration() (string, string, string) {
+	return s.config.Desired()
+}
+
+type connectionConfigurationClient struct {
+	connection *client.Connection
+}
+
+func (c connectionConfigurationClient) SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error) {
+	response, err := c.connection.SetSessionConfigOption(ctx, &acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+		ConfigId:  acp.SessionConfigId(configID),
+		SessionId: acp.SessionId(sessionID),
+		Value:     acp.SessionConfigValueId(value),
+	}})
+	if err != nil {
+		return nil, err
 	}
-	return joined
+	return json.Marshal(response)
+}
+
+func (c connectionConfigurationClient) SetMode(ctx context.Context, sessionID, mode string) error {
+	_, err := c.connection.SetSessionMode(ctx, &acp.SetSessionModeRequest{
+		SessionId: acp.SessionId(sessionID),
+		ModeId:    acp.SessionModeId(mode),
+	})
+	return err
 }
 
 func promptBlocks(request host.SendTurnRequest) []acp.ContentBlock {

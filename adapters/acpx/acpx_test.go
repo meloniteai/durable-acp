@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -356,6 +358,95 @@ func TestAdapterCatalogConfigurationAndResume(t *testing.T) {
 	}
 }
 
+func TestAdapterAppliesChangedConfigurationBeforePrompt(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "calls.log")
+	adapter := New(Config{
+		Backend: "stub",
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(),
+			"DURABLE_ACP_STUB_CHILD=1",
+			"DURABLE_ACP_STUB_SESSION_MODES=1",
+			"DURABLE_ACP_STUB_NO_PERMISSION=1",
+			"DURABLE_ACP_STUB_LOG="+logPath,
+		),
+	})
+	if _, err := adapter.StartSession(context.Background(), "configured", host.StartSessionRequest{
+		Worktree:       t.TempDir(),
+		Model:          "model-a",
+		Reasoning:      "high",
+		PermissionMode: "ask",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adapter.CloseSession("configured") })
+	request := host.SendTurnRequest{Prompt: "one", Model: "model-b", Reasoning: "low", PermissionMode: "plan"}
+	if _, err := adapter.SendTurn(context.Background(), "configured", request, nil); err != nil {
+		t.Fatal(err)
+	}
+	request.Prompt = "two"
+	if _, err := adapter.SendTurn(context.Background(), "configured", request, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(logPath) //nolint:gosec // Test-owned temporary path.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Fields(string(raw)), []string{"config:model=model-b", "config:reasoning=low", "mode:plan", "prompt:one", "prompt:two"}; !slices.Equal(got, want) {
+		t.Fatalf("calls = %q, want %q", got, want)
+	}
+}
+
+func TestAdapterConfigurationFailureAndUnknownControls(t *testing.T) {
+	failedLog := filepath.Join(t.TempDir(), "failed.log")
+	failed := New(Config{
+		Backend: "stub",
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(),
+			"DURABLE_ACP_STUB_CHILD=1",
+			"DURABLE_ACP_STUB_NO_PERMISSION=1",
+			"DURABLE_ACP_STUB_FAIL_CONFIG=model",
+			"DURABLE_ACP_STUB_LOG="+failedLog,
+		),
+	})
+	if _, err := failed.StartSession(context.Background(), "failed", host.StartSessionRequest{Worktree: t.TempDir()}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failed.SendTurn(context.Background(), "failed", host.SendTurnRequest{Prompt: "blocked", Model: "model-b"}, nil); err == nil || !strings.Contains(err.Error(), "set session config") {
+		t.Fatalf("configuration failure = %v", err)
+	}
+	if err := failed.CloseSession("failed"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(failedLog) //nolint:gosec // Test-owned temporary path.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "prompt:") {
+		t.Fatalf("prompt followed failed configuration: %q", raw)
+	}
+
+	unknown := New(Config{
+		Backend: "stub",
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(),
+			"DURABLE_ACP_STUB_CHILD=1",
+			"DURABLE_ACP_STUB_UNKNOWN_CONTROLS=1",
+			"DURABLE_ACP_STUB_NO_PERMISSION=1",
+		),
+	})
+	if _, err := unknown.StartSession(context.Background(), "unknown", host.StartSessionRequest{
+		Worktree: t.TempDir(), Prompt: "best effort", Model: "model", Reasoning: "high", PermissionMode: "ask",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := unknown.CloseSession("unknown"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func waitForEvent(t *testing.T, events <-chan host.Event, kind host.EventType) host.Event {
 	t.Helper()
 	deadline := time.NewTimer(3 * time.Second)
@@ -378,6 +469,9 @@ func TestACPChild(t *testing.T) {
 	}
 	decoder := json.NewDecoder(bufio.NewReader(os.Stdin))
 	encoder := json.NewEncoder(os.Stdout)
+	model := "model-a"
+	reasoning := "high"
+	mode := "ask"
 	for {
 		var message rpcMessage
 		if err := decoder.Decode(&message); err != nil {
@@ -387,12 +481,61 @@ func TestACPChild(t *testing.T) {
 		case "initialize":
 			writeRPC(t, encoder, message.ID, map[string]any{"protocolVersion": 1})
 		case "session/new":
-			writeRPC(t, encoder, message.ID, map[string]any{"sessionId": "provider-1", "configOptions": childConfigOptions()})
+			response := map[string]any{"sessionId": "provider-1", "configOptions": childConfigOptionsFor(model, reasoning, mode)}
+			addChildSessionModes(response, mode)
+			writeRPC(t, encoder, message.ID, response)
 		case "session/resume", "session/load":
-			writeRPC(t, encoder, message.ID, map[string]any{"configOptions": childConfigOptions()})
+			response := map[string]any{"configOptions": childConfigOptionsFor(model, reasoning, mode)}
+			addChildSessionModes(response, mode)
+			writeRPC(t, encoder, message.ID, response)
 		case "session/set_config_option":
-			writeRPC(t, encoder, message.ID, map[string]any{"configOptions": childConfigOptions()})
+			var params struct {
+				ConfigID string `json:"configId"`
+				Value    string `json:"value"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			childLog(t, "config:"+params.ConfigID+"="+params.Value)
+			if os.Getenv("DURABLE_ACP_STUB_FAIL_CONFIG") == params.ConfigID {
+				writeRPCError(t, encoder, message.ID, "configuration failed")
+				continue
+			}
+			switch params.ConfigID {
+			case "model":
+				model = params.Value
+			case "reasoning":
+				reasoning = params.Value
+			case "permission_mode":
+				mode = params.Value
+			}
+			writeRPC(t, encoder, message.ID, map[string]any{"configOptions": childConfigOptionsFor(model, reasoning, mode)})
+		case "session/set_mode":
+			var params struct {
+				ModeID string `json:"modeId"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			childLog(t, "mode:"+params.ModeID)
+			mode = params.ModeID
+			writeRPC(t, encoder, message.ID, map[string]any{})
 		case "session/prompt":
+			var params struct {
+				Prompt []struct {
+					Text string `json:"text"`
+				} `json:"prompt"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			if len(params.Prompt) > 0 {
+				childLog(t, "prompt:"+params.Prompt[0].Text)
+			}
+			if os.Getenv("DURABLE_ACP_STUB_NO_PERMISSION") == "1" {
+				writeRPC(t, encoder, message.ID, map[string]any{"stopReason": "end_turn"})
+				continue
+			}
 			permissionID := json.RawMessage("71")
 			if err := encoder.Encode(map[string]any{
 				"jsonrpc": "2.0",
@@ -434,17 +577,62 @@ func TestACPChild(t *testing.T) {
 	}
 }
 
-func childConfigOptions() []map[string]any {
-	return []map[string]any{
-		{"type": "select", "id": "model", "name": "Model", "category": "model", "currentValue": "model-a", "options": []map[string]any{{"value": "model-a", "name": "Model A"}}},
-		{"type": "select", "id": "reasoning", "name": "Reasoning", "category": "thought_level", "currentValue": "high", "options": []map[string]any{{"value": "high", "name": "High"}}},
-		{"type": "select", "id": "permission_mode", "name": "Permission", "category": "mode", "currentValue": "ask", "options": []map[string]any{{"value": "ask", "name": "Ask"}}},
+func childConfigOptionsFor(model, reasoning, mode string) []map[string]any {
+	if os.Getenv("DURABLE_ACP_STUB_UNKNOWN_CONTROLS") == "1" {
+		return nil
+	}
+	options := []map[string]any{
+		{"type": "select", "id": "model", "name": "Model", "category": "model", "currentValue": model, "options": []map[string]any{{"value": "model-a", "name": "Model A"}}},
+		{"type": "select", "id": "reasoning", "name": "Reasoning", "category": "thought_level", "currentValue": reasoning, "options": []map[string]any{{"value": "high", "name": "High"}}},
+	}
+	if os.Getenv("DURABLE_ACP_STUB_SESSION_MODES") != "1" {
+		options = append(options, map[string]any{"type": "select", "id": "permission_mode", "name": "Permission", "category": "mode", "currentValue": mode, "options": []map[string]any{{"value": "ask", "name": "Ask"}}})
+	}
+	return options
+}
+
+func addChildSessionModes(response map[string]any, current string) {
+	if os.Getenv("DURABLE_ACP_STUB_SESSION_MODES") == "1" {
+		response["modes"] = map[string]any{
+			"currentModeId": current,
+			"availableModes": []map[string]any{
+				{"id": "ask", "name": "Ask"},
+				{"id": "plan", "name": "Plan"},
+			},
+		}
+	}
+}
+
+func childLog(t *testing.T, line string) {
+	t.Helper()
+	path := os.Getenv("DURABLE_ACP_STUB_LOG")
+	if path == "" {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // Test-owned log path.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintln(file, line); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRPCError(t *testing.T, encoder *json.Encoder, id json.RawMessage, message string) {
+	t.Helper()
+	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": -32000, "message": message}}); err != nil {
+		t.Fatal(err)
 	}
 }
 
 type rpcMessage struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 	Result json.RawMessage `json:"result"`
 }
 

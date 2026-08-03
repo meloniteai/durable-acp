@@ -166,11 +166,7 @@ type StartRequest struct {
 }
 
 // Configuration is the effective provider-neutral session configuration.
-type Configuration struct {
-	Model          string `json:"model,omitempty"`
-	Reasoning      string `json:"reasoning,omitempty"`
-	PermissionMode string `json:"permission_mode,omitempty"`
-}
+type Configuration = runtime.Configuration
 
 // Session is the durable Engine-level record for a runtime session.
 type Session struct {
@@ -475,6 +471,9 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 		return Session{}, err
 	}
 	entry.BackendSession = backendSession
+	if runtimeState, stateErr := e.runtime.State(id); stateErr == nil {
+		entry.Configuration = runtimeState.Configuration
+	}
 	if err := e.saveSession(&entry); err != nil {
 		return Session{}, err
 	}
@@ -528,6 +527,9 @@ func (e *Engine) resumeStart(ctx context.Context, request StartRequest) (Session
 	}
 	entry.BackendSession = state
 	entry.Configuration = configuration
+	if runtimeState, stateErr := e.runtime.State(entry.ID); stateErr == nil {
+		entry.Configuration = runtimeState.Configuration
+	}
 	if len(request.Ext) > 0 {
 		entry.Ext = cloneRawMessage(request.Ext)
 	}
@@ -580,35 +582,24 @@ func (e *Engine) Send(ctx context.Context, request host.SendTurnRequest) (runtim
 	if e == nil || e.runtime == nil {
 		return runtime.SendResult{}, errors.New("durableacp: engine is not open")
 	}
-	result, err := e.runtime.Send(ctx, request)
-	if err != nil {
-		return runtime.SendResult{}, err
-	}
-	if err := e.updateConfigurationFromTurn(request.SessionID, request); err != nil {
-		return runtime.SendResult{}, err
-	}
-	return result, nil
+	return e.runtime.Send(ctx, request)
 }
 
 func (e *Engine) SendNext(ctx context.Context, request host.SendTurnRequest) (runtime.SendResult, error) {
 	if e == nil || e.runtime == nil {
 		return runtime.SendResult{}, errors.New("durableacp: engine is not open")
 	}
-	result, err := e.runtime.SendNext(ctx, request)
-	if err != nil {
-		return runtime.SendResult{}, err
-	}
-	if err := e.updateConfigurationFromTurn(request.SessionID, request); err != nil {
-		return runtime.SendResult{}, err
-	}
-	return result, nil
+	return e.runtime.SendNext(ctx, request)
 }
 
 // SetConfiguration replaces the effective provider-neutral configuration in
 // the session manifest.
 func (e *Engine) SetConfiguration(sessionID string, configuration Configuration) error {
-	if e == nil {
+	if e == nil || e.runtime == nil {
 		return errors.New("durableacp: engine is not open")
+	}
+	if err := e.runtime.SetConfiguration(sessionID, configuration); err != nil {
+		return err
 	}
 	return e.updateSession(sessionID, func(entry *Session) {
 		entry.Configuration = normalizeConfiguration(configuration)
@@ -659,6 +650,7 @@ func (e *Engine) Snapshot(sessionID string) (Snapshot, error) {
 		Ext:                 cloneRawMessage(entry.Ext),
 	}
 	if runtimeErr == nil {
+		snapshot.Configuration = runtimeState.Configuration
 		snapshot.ActiveTurn = ActiveTurnSnapshot{Active: runtimeState.TurnActive, ID: runtimeState.ActiveTurnID}
 		snapshot.Queue = QueueSnapshot{Depth: runtimeState.QueueDepth, Entries: runtimeState.QueueEntries, DispatchBlocked: runtimeState.DispatchBlocked}
 		snapshot.PendingInteraction = runtimeState.PendingInteraction
@@ -874,6 +866,13 @@ func (e *Engine) Close() error {
 }
 
 func (e *Engine) publish(event host.Event) {
+	if engineConfigurationEvent(event.Type) && e.runtime != nil {
+		if state, err := e.runtime.State(event.SessionID); err == nil {
+			_ = e.updateSession(event.SessionID, func(entry *Session) {
+				entry.Configuration = state.Configuration
+			})
+		}
+	}
 	e.mu.Lock()
 	listeners := make([]host.EventSink, 0, len(e.listeners))
 	for _, listener := range e.listeners {
@@ -882,6 +881,16 @@ func (e *Engine) publish(event host.Event) {
 	e.mu.Unlock()
 	for _, listener := range listeners {
 		listener(event)
+	}
+}
+
+func engineConfigurationEvent(eventType host.EventType) bool {
+	//exhaustive:ignore Only generic configuration events are persisted here.
+	switch eventType {
+	case host.EventModels, host.EventReasoningLevels, host.EventPermissionModes:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -963,19 +972,14 @@ func (e *Engine) loadSession(id string) (Session, error) {
 	return entry, nil
 }
 
-func (e *Engine) updateConfigurationFromTurn(sessionID string, request host.SendTurnRequest) error {
-	configuration := Configuration{Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode}
-	if normalizeConfiguration(configuration) == (Configuration{}) {
-		return nil
-	}
-	return e.updateSession(sessionID, func(entry *Session) {
-		mergeConfiguration(&entry.Configuration, configuration)
-	})
-}
-
 func (e *Engine) recordTurnSubmission(submission runtime.TurnSubmission) {
 	_ = e.updateSession(submission.SessionID, func(entry *Session) {
 		entry.BackendSession = submission.Session
+		if runtimeState, err := e.runtime.State(submission.SessionID); err == nil {
+			entry.Configuration = runtimeState.Configuration
+			return
+		}
+		mergeConfiguration(&entry.Configuration, Configuration{Model: submission.Request.Model, Reasoning: submission.Request.Reasoning, PermissionMode: submission.Request.PermissionMode})
 	})
 }
 

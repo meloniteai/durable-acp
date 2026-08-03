@@ -55,12 +55,20 @@ type CreateRequest struct {
 // State is the current runtime-owned view of a session.
 type State struct {
 	Session            session.Session          `json:"session"`
+	Configuration      Configuration            `json:"configuration"`
 	QueueDepth         int                      `json:"queue_depth"`
 	QueueEntries       []QueueEntry             `json:"queue_entries,omitempty"`
 	TurnActive         bool                     `json:"turn_active"`
 	ActiveTurnID       string                   `json:"active_turn_id,omitempty"`
 	DispatchBlocked    bool                     `json:"dispatch_blocked,omitempty"`
 	PendingInteraction *host.InteractionRequest `json:"pending_interaction,omitempty"`
+}
+
+// Configuration is the effective provider-neutral session configuration.
+type Configuration struct {
+	Model          string `json:"model,omitempty"`
+	Reasoning      string `json:"reasoning,omitempty"`
+	PermissionMode string `json:"permission_mode,omitempty"`
 }
 
 type QueueEntry struct {
@@ -132,6 +140,8 @@ type Runtime struct {
 
 type managedSession struct {
 	session            session.Session
+	configuration      Configuration
+	configurationEvent configurationEventRevision
 	queue              []QueueEntry
 	dispatching        bool
 	active             bool
@@ -263,6 +273,7 @@ func (r *Runtime) Start(ctx context.Context, request host.StartSessionRequest) (
 	if initialTurn {
 		managed.dispatching = true
 	}
+	configurationEvent := managed.configurationEvent
 	r.mu.Unlock()
 
 	state, err := adapter.StartSession(ctx, id, request, r.sessionSink(id)) //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
@@ -277,6 +288,7 @@ func (r *Runtime) Start(ctx context.Context, request host.StartSessionRequest) (
 	r.mu.Lock()
 	if current := r.sessions[id]; current != nil {
 		current.session.BackendSession = state
+		mergeUnobservedConfiguration(&current.configuration, current.configurationEvent, configurationEvent, configurationFromStart(request))
 	}
 	r.mu.Unlock()
 	if err := r.appendLifecycle(id, "session.started", map[string]any{
@@ -748,6 +760,21 @@ func (r *Runtime) State(sessionID string) (State, error) {
 	return stateLocked(managed), nil
 }
 
+// SetConfiguration replaces the runtime-owned effective configuration.
+func (r *Runtime) SetConfiguration(sessionID string, configuration Configuration) error {
+	if r == nil {
+		return errors.New("runtime: nil runtime")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	managed := r.sessions[strings.TrimSpace(sessionID)]
+	if managed == nil {
+		return &SessionNotFoundError{SessionID: strings.TrimSpace(sessionID)}
+	}
+	managed.configuration = normalizeConfiguration(configuration)
+	return nil
+}
+
 // Sessions returns stable snapshots ordered by creation time then ID.
 func (r *Runtime) Sessions() []State {
 	if r == nil {
@@ -1049,6 +1076,7 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 		return
 	}
 	dispatchNext := false
+	reconcileConfigurationEvent(&managed.configuration, &managed.configurationEvent, event)
 	//exhaustive:ignore Provider-specific events are forwarded without runtime state changes.
 	switch event.Type {
 	case host.EventTurnStarted:
@@ -1157,6 +1185,10 @@ func (r *Runtime) emitQueue(sessionID string) {
 func (r *Runtime) submitTurn(ctx context.Context, sessionID string, adapter host.Adapter, dispatch TurnDispatch) (host.BackendSession, error) {
 	r.mu.Lock()
 	dispatched := r.turnDispatched
+	configurationEvent := configurationEventRevision{}
+	if current := r.sessions[sessionID]; current != nil {
+		configurationEvent = current.configurationEvent
+	}
 	r.mu.Unlock()
 	if dispatched != nil {
 		if err := dispatched(dispatch); err != nil {
@@ -1172,6 +1204,7 @@ func (r *Runtime) submitTurn(ctx context.Context, sessionID string, adapter host
 	r.mu.Lock()
 	if current := r.sessions[sessionID]; current != nil {
 		current.session.BackendSession = state
+		mergeUnobservedConfiguration(&current.configuration, current.configurationEvent, configurationEvent, configurationFromTurn(dispatch.Request))
 	}
 	submitted := r.turnSubmitted
 	r.mu.Unlock()
@@ -1310,6 +1343,7 @@ func cloneData(data map[string]any) map[string]any {
 func stateLocked(managed *managedSession) State {
 	return State{
 		Session:            managed.session,
+		Configuration:      managed.configuration,
 		QueueDepth:         len(managed.queue),
 		QueueEntries:       cloneQueueEntries(managed.queue),
 		TurnActive:         managed.active,
@@ -1317,6 +1351,70 @@ func stateLocked(managed *managedSession) State {
 		DispatchBlocked:    managed.dispatchBlocked,
 		PendingInteraction: cloneInteractionRequest(managed.pendingInteraction),
 	}
+}
+
+func configurationFromStart(request host.StartSessionRequest) Configuration {
+	return normalizeConfiguration(Configuration{
+		Model:          request.Model,
+		Reasoning:      request.Reasoning,
+		PermissionMode: request.PermissionMode,
+	})
+}
+
+func configurationFromTurn(request host.SendTurnRequest) Configuration {
+	return normalizeConfiguration(Configuration{
+		Model:          request.Model,
+		Reasoning:      request.Reasoning,
+		PermissionMode: request.PermissionMode,
+	})
+}
+
+func normalizeConfiguration(configuration Configuration) Configuration {
+	configuration.Model = strings.TrimSpace(configuration.Model)
+	configuration.Reasoning = strings.TrimSpace(configuration.Reasoning)
+	configuration.PermissionMode = strings.TrimSpace(configuration.PermissionMode)
+	return configuration
+}
+
+type configurationEventRevision struct {
+	model      uint64
+	reasoning  uint64
+	permission uint64
+}
+
+func reconcileConfigurationEvent(configuration *Configuration, revision *configurationEventRevision, event host.Event) {
+	//exhaustive:ignore Only generic configuration events change this state.
+	switch event.Type {
+	case host.EventModels:
+		if value, ok := event.Data["current_model"].(string); ok {
+			configuration.Model = strings.TrimSpace(value)
+			revision.model++
+		}
+	case host.EventReasoningLevels:
+		if value, ok := event.Data["current_reasoning"].(string); ok {
+			configuration.Reasoning = strings.TrimSpace(value)
+			revision.reasoning++
+		}
+	case host.EventPermissionModes:
+		if value, ok := event.Data["current_mode"].(string); ok {
+			configuration.PermissionMode = strings.TrimSpace(value)
+			revision.permission++
+		}
+	}
+}
+
+func mergeUnobservedConfiguration(target *Configuration, current, before configurationEventRevision, update Configuration) {
+	update = normalizeConfiguration(update)
+	if update.Model != "" && current.model == before.model {
+		target.Model = update.Model
+	}
+	if update.Reasoning != "" && current.reasoning == before.reasoning {
+		target.Reasoning = update.Reasoning
+	}
+	if update.PermissionMode != "" && current.permission == before.permission {
+		target.PermissionMode = update.PermissionMode
+	}
+	*target = normalizeConfiguration(*target)
 }
 
 func cloneQueueEntries(entries []QueueEntry) []QueueEntry {

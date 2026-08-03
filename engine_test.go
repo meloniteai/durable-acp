@@ -330,6 +330,14 @@ func TestEngineHostJournalManifestAndSnapshot(t *testing.T) {
 	if created.UpdatedAt.Before(created.CreatedAt) || created.Configuration.Model != "model-a" || string(created.Ext) != string(ext) {
 		t.Fatalf("manifest = %#v", created)
 	}
+	adapter.emit(host.Event{Type: host.EventModels, Data: map[string]any{"current_model": "model-resolved"}})
+	persistedConfiguration, err := engine.loadSession(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persistedConfiguration.Configuration.Model != "model-resolved" {
+		t.Fatalf("persisted effective configuration = %+v", persistedConfiguration.Configuration)
+	}
 	if _, statErr := os.Stat(filepath.Join(home, "journals")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("default journal directory exists: %v", statErr)
 	}
@@ -383,6 +391,49 @@ func TestEngineHostJournalManifestAndSnapshot(t *testing.T) {
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEnginePersistsConfigurationOnQueuedSubmission(t *testing.T) {
+	adapter := &queueEngineAdapter{}
+	engine, err := Open(context.Background(), t.TempDir(), WithAdapters(adapter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	created, err := engine.Start(context.Background(), StartRequest{
+		ID: "queued-configuration", Backend: "queue", WorkspaceMode: WorkspaceExisting, Worktree: engineRepo(t), Model: "model-a", Reasoning: "high",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = engine.Send(context.Background(), host.SendTurnRequest{SessionID: created.ID, Prompt: "active", Model: "model-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = engine.Send(context.Background(), host.SendTurnRequest{SessionID: created.ID, Prompt: "queued", Reasoning: "low"}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := engine.loadSession(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Configuration != (Configuration{Model: "model-b", Reasoning: "high"}) {
+		t.Fatalf("configuration before queued submission = %+v", entry.Configuration)
+	}
+	adapter.emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "turn-1"})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		entry, err = engine.loadSession(created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entry.Configuration.Reasoning == "low" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if entry.Configuration != (Configuration{Model: "model-b", Reasoning: "low"}) {
+		t.Fatalf("configuration after queued submission = %+v", entry.Configuration)
 	}
 }
 
