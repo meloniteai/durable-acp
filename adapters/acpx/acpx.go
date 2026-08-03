@@ -77,9 +77,14 @@ type managedSession struct {
 	worktree  string
 	emit      host.EventSink
 	conn      *client.Connection
+	model     string
+	reasoning string
+	mode      string
 
 	promptMu sync.Mutex
 	turn     atomic.Uint64
+	turnMu   sync.RWMutex
+	turnID   string
 
 	interactionMu sync.Mutex
 	interactions  map[string]chan host.InteractionResponse
@@ -129,24 +134,56 @@ func (a *Adapter) Detect(ctx context.Context) host.BackendStatus {
 // StartSession launches one ACP subprocess and creates or resumes its agent
 // session. Request Ext is intentionally opaque to this generic adapter.
 func (a *Adapter) StartSession(ctx context.Context, sessionID string, request host.StartSessionRequest, emit host.EventSink) (host.BackendSession, error) {
+	managed, state, err := a.openSession(ctx, sessionID, request, emit)
+	if err != nil {
+		return host.BackendSession{}, err
+	}
+	a.mu.Lock()
+	if previous := a.sessions[sessionID]; previous != nil {
+		a.mu.Unlock()
+		managed.stop()
+		_ = managed.conn.Close()
+		return host.BackendSession{}, fmt.Errorf("acpx: session %q already started", sessionID)
+	}
+	a.sessions[sessionID] = managed
+	a.mu.Unlock()
+
+	if strings.TrimSpace(request.Prompt) != "" || len(request.Attachments) > 0 {
+		turn, turnErr := a.SendTurn(ctx, sessionID, host.SendTurnRequest{
+			Prompt:         request.Prompt,
+			Attachments:    request.Attachments,
+			Model:          request.Model,
+			Reasoning:      request.Reasoning,
+			PermissionMode: request.PermissionMode,
+		}, nil)
+		if turnErr != nil {
+			_ = a.CloseSession(sessionID)
+			return host.BackendSession{}, turnErr
+		}
+		state = turn
+	}
+	return state, nil
+}
+
+func (a *Adapter) openSession(ctx context.Context, sessionID string, request host.StartSessionRequest, emit host.EventSink) (*managedSession, host.BackendSession, error) {
 	if a == nil || a.Backend() == "" {
-		return host.BackendSession{}, errors.New("acpx: backend is required")
+		return nil, host.BackendSession{}, errors.New("acpx: backend is required")
 	}
 	if strings.TrimSpace(sessionID) == "" {
-		return host.BackendSession{}, errors.New("acpx: session ID is required")
+		return nil, host.BackendSession{}, errors.New("acpx: session ID is required")
 	}
 	if strings.TrimSpace(request.Worktree) == "" || !filepath.IsAbs(request.Worktree) {
-		return host.BackendSession{}, errors.New("acpx: absolute worktree is required")
+		return nil, host.BackendSession{}, errors.New("acpx: absolute worktree is required")
 	}
 	if info, err := os.Stat(request.Worktree); err != nil || !info.IsDir() {
 		if err == nil {
 			err = errors.New("not a directory")
 		}
-		return host.BackendSession{}, fmt.Errorf("acpx: inspect worktree: %w", err)
+		return nil, host.BackendSession{}, fmt.Errorf("acpx: inspect worktree: %w", err)
 	}
 	resolved, err := Resolve(ctx, a.config.Command)
 	if err != nil {
-		return host.BackendSession{}, fmt.Errorf("acpx: resolve %s: %w", a.Backend(), err)
+		return nil, host.BackendSession{}, fmt.Errorf("acpx: resolve %s: %w", a.Backend(), err)
 	}
 
 	managed := &managedSession{
@@ -154,6 +191,9 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 		hostID:       sessionID,
 		worktree:     filepath.Clean(request.Worktree),
 		emit:         emit,
+		model:        strings.TrimSpace(request.Model),
+		reasoning:    strings.TrimSpace(request.Reasoning),
+		mode:         strings.TrimSpace(request.PermissionMode),
 		interactions: map[string]chan host.InteractionResponse{},
 		done:         make(chan struct{}),
 	}
@@ -175,7 +215,7 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 		},
 	})
 	if err != nil {
-		return host.BackendSession{}, err
+		return nil, host.BackendSession{}, err
 	}
 	managed.conn = connection
 
@@ -185,7 +225,7 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 		created, createErr := connection.NewSession(ctx, &acp.NewSessionRequest{Cwd: managed.worktree, McpServers: []acp.McpServer{}})
 		if createErr != nil {
 			_ = connection.Close()
-			return host.BackendSession{}, createErr
+			return nil, host.BackendSession{}, createErr
 		}
 		backendID = string(created.SessionId)
 		managed.backendID = backendID
@@ -197,7 +237,7 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 			loaded, loadErr := connection.LoadSession(ctx, &acp.LoadSessionRequest{Cwd: managed.worktree, SessionId: acp.SessionId(backendID)})
 			if loadErr != nil {
 				_ = connection.Close()
-				return host.BackendSession{}, fmt.Errorf("acpx: resume session: %w", errors.Join(resumeErr, loadErr))
+				return nil, host.BackendSession{}, fmt.Errorf("acpx: resume session: %w", errors.Join(resumeErr, loadErr))
 			}
 			managed.backendID = backendID
 			options = loaded.ConfigOptions
@@ -213,32 +253,8 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 		// session remains usable if it does not recognize one of the controls.
 		managed.emitEvent(host.Event{Type: host.EventTraceUpdated, Message: err.Error(), Data: map[string]any{"source": "session_config"}})
 	}
-	a.mu.Lock()
-	if previous := a.sessions[sessionID]; previous != nil {
-		a.mu.Unlock()
-		managed.stop()
-		_ = connection.Close()
-		return host.BackendSession{}, fmt.Errorf("acpx: session %q already started", sessionID)
-	}
-	a.sessions[sessionID] = managed
-	a.mu.Unlock()
-
 	state := host.BackendSession{ID: backendID, ThreadID: backendID}
-	if strings.TrimSpace(request.Prompt) != "" || len(request.Attachments) > 0 {
-		turn, turnErr := a.SendTurn(ctx, sessionID, host.SendTurnRequest{
-			Prompt:         request.Prompt,
-			Attachments:    request.Attachments,
-			Model:          request.Model,
-			Reasoning:      request.Reasoning,
-			PermissionMode: request.PermissionMode,
-		}, nil)
-		if turnErr != nil {
-			_ = a.CloseSession(sessionID)
-			return host.BackendSession{}, turnErr
-		}
-		state = turn
-	}
-	return state, nil
+	return managed, state, nil
 }
 
 // SendTurn sends an ACP prompt and emits its lifecycle around the synchronous
@@ -255,6 +271,8 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 	managed.promptMu.Lock()
 	defer managed.promptMu.Unlock()
 	turnID := fmt.Sprintf("turn-%d", managed.turn.Add(1))
+	managed.setTurnID(turnID)
+	defer managed.setTurnID("")
 	managed.emitEvent(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID, Data: map[string]any{"turn_id": turnID}})
 	response, err := managed.conn.Prompt(ctx, &acp.PromptRequest{SessionId: acp.SessionId(managed.backendID), Prompt: blocks})
 	if err != nil {
@@ -274,6 +292,39 @@ func (a *Adapter) Interrupt(ctx context.Context, sessionID string, _ host.EventS
 	}
 	managed.cancelInteractions()
 	return managed.conn.Cancel(ctx, &acp.CancelNotification{SessionId: acp.SessionId(managed.backendID)})
+}
+
+// RestartSession replaces the ACP subprocess and resumes its provider session.
+func (a *Adapter) RestartSession(ctx context.Context, sessionID string, emit host.EventSink) (host.BackendSession, error) {
+	managed, err := a.session(sessionID)
+	if err != nil {
+		return host.BackendSession{}, err
+	}
+	managed.promptMu.Lock()
+	defer managed.promptMu.Unlock()
+	managed.stop()
+	_ = managed.conn.Close()
+	replacement, state, err := a.openSession(ctx, sessionID, host.StartSessionRequest{
+		Worktree:               managed.worktree,
+		ResumeBackendSessionID: managed.backendID,
+		Model:                  managed.model,
+		Reasoning:              managed.reasoning,
+		PermissionMode:         managed.mode,
+	}, emit)
+	if err != nil {
+		return host.BackendSession{}, err
+	}
+	a.mu.Lock()
+	if a.sessions[sessionID] != managed {
+		a.mu.Unlock()
+		replacement.stop()
+		_ = replacement.conn.Close()
+		return host.BackendSession{}, fmt.Errorf("acpx: session %q changed during restart", sessionID)
+	}
+	a.sessions[sessionID] = replacement
+	a.mu.Unlock()
+	replacement.emitEvent(host.Event{Type: host.EventAgentRecovered, Message: "ACP session restarted", Data: map[string]any{"restarted": true}})
+	return state, nil
 }
 
 // CloseSession terminates the ACP subprocess. It does not ask the agent to
@@ -491,6 +542,9 @@ func (s *managedSession) emitEvent(event host.Event) {
 		return
 	}
 	event.Backend = s.adapter.Backend()
+	if event.BackendTurnID == "" {
+		event.BackendTurnID = s.currentTurnID()
+	}
 	if event.BackendSessionID == "" {
 		event.BackendSessionID = s.backendID
 	}
@@ -498,6 +552,18 @@ func (s *managedSession) emitEvent(event host.Event) {
 		event.BackendThreadID = s.backendID
 	}
 	s.emit(event)
+}
+
+func (s *managedSession) setTurnID(turnID string) {
+	s.turnMu.Lock()
+	s.turnID = turnID
+	s.turnMu.Unlock()
+}
+
+func (s *managedSession) currentTurnID() string {
+	s.turnMu.RLock()
+	defer s.turnMu.RUnlock()
+	return s.turnID
 }
 
 func (s *managedSession) emitUpdate(update acp.SessionUpdate) {

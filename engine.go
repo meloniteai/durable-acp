@@ -414,12 +414,80 @@ func (e *Engine) Send(ctx context.Context, request host.SendTurnRequest) (runtim
 	return e.runtime.Send(ctx, request)
 }
 
+func (e *Engine) SendNext(ctx context.Context, request host.SendTurnRequest) (runtime.SendResult, error) {
+	if e == nil || e.runtime == nil {
+		return runtime.SendResult{}, errors.New("durableacp: engine is not open")
+	}
+	return e.runtime.SendNext(ctx, request)
+}
+
+func (e *Engine) QueueEntries(sessionID string) ([]runtime.QueueEntry, error) {
+	if e == nil || e.runtime == nil {
+		return nil, errors.New("durableacp: engine is not open")
+	}
+	return e.runtime.QueueEntries(sessionID)
+}
+
+func (e *Engine) RemoveQueuedTurn(sessionID, entryID string) (runtime.RemoveQueuedTurnResult, error) {
+	if e == nil || e.runtime == nil {
+		return runtime.RemoveQueuedTurnResult{}, errors.New("durableacp: engine is not open")
+	}
+	return e.runtime.RemoveQueuedTurn(sessionID, entryID)
+}
+
+func (e *Engine) ReplaceQueuedTurn(sessionID, entryID string, request host.SendTurnRequest) (runtime.QueueEntry, error) {
+	if e == nil || e.runtime == nil {
+		return runtime.QueueEntry{}, errors.New("durableacp: engine is not open")
+	}
+	return e.runtime.ReplaceQueuedTurn(sessionID, entryID, request)
+}
+
+func (e *Engine) BlockDispatch(sessionID string) error {
+	if e == nil || e.runtime == nil {
+		return errors.New("durableacp: engine is not open")
+	}
+	return e.runtime.BlockDispatch(sessionID)
+}
+
+func (e *Engine) UnblockDispatch(sessionID string) error {
+	if e == nil || e.runtime == nil {
+		return errors.New("durableacp: engine is not open")
+	}
+	return e.runtime.UnblockDispatch(sessionID)
+}
+
+func (e *Engine) Restart(ctx context.Context, sessionID string) (host.BackendSession, error) {
+	if e == nil || e.runtime == nil {
+		return host.BackendSession{}, errors.New("durableacp: engine is not open")
+	}
+	entry, err := e.loadSession(sessionID)
+	if err != nil {
+		return host.BackendSession{}, err
+	}
+	state, err := e.runtime.Restart(ctx, sessionID)
+	if err != nil {
+		return host.BackendSession{}, err
+	}
+	entry.BackendSession = state
+	if err := e.saveSession(entry); err != nil {
+		return host.BackendSession{}, err
+	}
+	return state, nil
+}
+
 // Interrupt cancels the active turn and clears queued turns.
 func (e *Engine) Interrupt(ctx context.Context, sessionID string) error {
 	if e == nil || e.runtime == nil {
 		return errors.New("durableacp: engine is not open")
 	}
 	return e.runtime.Interrupt(ctx, sessionID)
+}
+
+func (e *Engine) InterruptActive(ctx context.Context, sessionID string) error {
+	if e == nil || e.runtime == nil {
+		return errors.New("durableacp: engine is not open")
+	}
+	return e.runtime.InterruptActive(ctx, sessionID)
 }
 
 // RespondInteraction resolves a pending adapter request.
@@ -468,7 +536,7 @@ func (e *Engine) Remove(ctx context.Context, sessionID string, force bool) error
 				return restoreErr
 			}
 		}
-		if err := e.CloseSession(entry.ID); err != nil { //nolint:contextcheck // CloseSession owns provider shutdown without a context.
+		if err := e.CloseSession(entry.ID); err != nil {
 			return err
 		}
 		entry, err = e.loadSession(entry.ID)
@@ -571,7 +639,7 @@ func (e *Engine) publish(event host.Event) {
 }
 
 func (e *Engine) rollbackStart(ctx context.Context, entry Session) {
-	_ = e.runtime.Close(entry.ID) //nolint:contextcheck // Rollback must also run after startup context cancellation.
+	_ = e.runtime.Close(entry.ID)
 	_ = os.Remove(e.sessionPath(entry.ID))
 	if entry.WorkspaceMode == WorkspaceManaged {
 		_ = e.worktrees.Remove(ctx, entry.Worktree, worktree.RemoveOptions{Force: true})

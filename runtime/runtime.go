@@ -33,13 +33,16 @@ const (
 // the package to be used as an in-memory multiplexer in tests or short-lived
 // applications.
 type Config struct {
-	Journal          *journal.Store
-	EventSink        host.EventSink
-	MaxQueuedTurns   int
-	CatalogCacheDir  string
-	CatalogTimeout   time.Duration
-	CatalogUpdated   func(host.Backend, host.BackendCatalog)
-	CoalesceInterval time.Duration
+	Journal           *journal.Store
+	EventSink         host.EventSink
+	TurnDispatched    func(TurnDispatch) error
+	TurnSubmitted     func(TurnSubmission)
+	MaxQueuedTurns    int
+	CatalogCacheDir   string
+	CatalogTimeout    time.Duration
+	CatalogUpdated    func(host.Backend, host.BackendCatalog)
+	CoalesceInterval  time.Duration
+	DisableCoalescing bool
 }
 
 // CreateRequest creates a session before its provider process is started.
@@ -51,18 +54,45 @@ type CreateRequest struct {
 
 // State is the current runtime-owned view of a session.
 type State struct {
-	Session    session.Session `json:"session"`
-	QueueDepth int             `json:"queue_depth"`
-	TurnActive bool            `json:"turn_active"`
+	Session         session.Session `json:"session"`
+	QueueDepth      int             `json:"queue_depth"`
+	QueueEntries    []QueueEntry    `json:"queue_entries,omitempty"`
+	TurnActive      bool            `json:"turn_active"`
+	ActiveTurnID    string          `json:"active_turn_id,omitempty"`
+	DispatchBlocked bool            `json:"dispatch_blocked,omitempty"`
+}
+
+type QueueEntry struct {
+	ID      string               `json:"id"`
+	Request host.SendTurnRequest `json:"request"`
+}
+
+type RemoveQueuedTurnResult struct {
+	Removed    bool       `json:"removed"`
+	Entry      QueueEntry `json:"entry,omitzero"`
+	QueueDepth int        `json:"queue_depth"`
+}
+
+type TurnDispatch struct {
+	SessionID    string               `json:"session_id"`
+	QueueEntryID string               `json:"queue_entry_id,omitempty"`
+	Request      host.SendTurnRequest `json:"request"`
+	Queued       bool                 `json:"queued"`
+}
+
+type TurnSubmission struct {
+	TurnDispatch
+	Session host.BackendSession `json:"session"`
 }
 
 // SendResult reports whether a turn was started or placed behind the current
 // provider turn.
 type SendResult struct {
-	Session    host.BackendSession `json:"session"`
-	Accepted   bool                `json:"accepted"`
-	Queued     bool                `json:"queued,omitempty"`
-	QueueDepth int                 `json:"queue_depth,omitempty"`
+	Session      host.BackendSession `json:"session"`
+	Accepted     bool                `json:"accepted"`
+	Queued       bool                `json:"queued,omitempty"`
+	QueueEntryID string              `json:"queue_entry_id,omitempty"`
+	QueueDepth   int                 `json:"queue_depth,omitempty"`
 }
 
 // CatalogProvider is optional adapter capability used for startup model
@@ -87,8 +117,11 @@ type Runtime struct {
 	sessions         map[string]*managedSession
 	journal          *journal.Store
 	emit             host.EventSink
+	turnDispatched   func(TurnDispatch) error
+	turnSubmitted    func(TurnSubmission)
 	maxQueuedTurns   int
 	coalesceInterval time.Duration
+	coalesceEvents   bool
 	catalogCacheDir  string
 	catalogTimeout   time.Duration
 	catalogUpdated   func(host.Backend, host.BackendCatalog)
@@ -97,11 +130,15 @@ type Runtime struct {
 }
 
 type managedSession struct {
-	session   session.Session
-	queue     []host.SendTurnRequest
-	active    bool
-	nextSeq   int
-	coalescer *deltaCoalescer
+	session         session.Session
+	queue           []QueueEntry
+	dispatching     bool
+	active          bool
+	activeTurnID    string
+	dispatchBlocked bool
+	nextQueueSeq    int
+	nextSeq         int
+	coalescer       *deltaCoalescer
 }
 
 // New creates a Runtime over the supplied adapters. Duplicate backend names
@@ -124,8 +161,11 @@ func New(config Config, adapters ...host.Adapter) *Runtime {
 		sessions:         map[string]*managedSession{},
 		journal:          config.Journal,
 		emit:             config.EventSink,
+		turnDispatched:   config.TurnDispatched,
+		turnSubmitted:    config.TurnSubmitted,
 		maxQueuedTurns:   limit,
 		coalesceInterval: interval,
+		coalesceEvents:   !config.DisableCoalescing,
 		catalogCacheDir:  strings.TrimSpace(config.CatalogCacheDir),
 		catalogTimeout:   catalogTimeout,
 		catalogUpdated:   config.CatalogUpdated,
@@ -173,7 +213,7 @@ func (r *Runtime) Create(_ context.Context, request CreateRequest) (State, error
 	}
 	if _, exists := r.sessions[id]; exists {
 		r.mu.Unlock()
-		return State{}, fmt.Errorf("runtime: session %q already exists", id)
+		return State{}, &SessionExistsError{SessionID: id}
 	}
 	created := session.New(id, backend, worktree)
 	if err := created.Transition(session.StatusActive); err != nil {
@@ -212,15 +252,24 @@ func (r *Runtime) Start(ctx context.Context, request host.StartSessionRequest) (
 	}
 	if managed.session.Status == session.StatusClosed {
 		r.mu.Unlock()
-		return host.BackendSession{}, fmt.Errorf("runtime: session %q is closed", id)
+		return host.BackendSession{}, &SessionClosedError{SessionID: id}
 	}
 	request.SessionID = id
 	request.Backend = managed.session.Backend
 	request.Worktree = managed.session.Worktree
+	initialTurn := strings.TrimSpace(request.Prompt) != "" || len(request.Attachments) > 0
+	if initialTurn {
+		managed.dispatching = true
+	}
 	r.mu.Unlock()
 
-	state, err := adapter.StartSession(ctx, id, request, r.sessionSink(id))
+	state, err := adapter.StartSession(ctx, id, request, r.sessionSink(id)) //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
 	if err != nil {
+		r.mu.Lock()
+		if current := r.sessions[id]; current != nil {
+			current.dispatching = false
+		}
+		r.mu.Unlock()
 		return host.BackendSession{}, err
 	}
 	r.mu.Lock()
@@ -240,6 +289,14 @@ func (r *Runtime) Start(ctx context.Context, request host.StartSessionRequest) (
 // Send starts a turn immediately when idle, otherwise queues it behind the
 // current provider turn.
 func (r *Runtime) Send(ctx context.Context, request host.SendTurnRequest) (SendResult, error) {
+	return r.send(ctx, request, false)
+}
+
+func (r *Runtime) SendNext(ctx context.Context, request host.SendTurnRequest) (SendResult, error) {
+	return r.send(ctx, request, true)
+}
+
+func (r *Runtime) send(ctx context.Context, request host.SendTurnRequest, next bool) (SendResult, error) {
 	if r == nil {
 		return SendResult{}, errors.New("runtime: nil runtime")
 	}
@@ -258,45 +315,39 @@ func (r *Runtime) Send(ctx context.Context, request host.SendTurnRequest) (SendR
 	}
 	if managed.session.Status == session.StatusClosed {
 		r.mu.Unlock()
-		return SendResult{}, fmt.Errorf("runtime: session %q is closed", id)
+		return SendResult{}, &SessionClosedError{SessionID: id}
 	}
 	request.SessionID = id
-	if managed.active {
+	request = cloneSendTurnRequest(request)
+	if managed.active || managed.dispatching || managed.dispatchBlocked {
 		if len(managed.queue) >= r.maxQueuedTurns {
+			depth := len(managed.queue)
 			r.mu.Unlock()
-			return SendResult{}, fmt.Errorf("runtime: session %q turn queue full", id)
+			return SendResult{}, &QueueFullError{SessionID: id, Depth: depth, Limit: r.maxQueuedTurns}
 		}
-		managed.queue = append(managed.queue, request)
+		managed.nextQueueSeq++
+		entry := QueueEntry{ID: fmt.Sprintf("%s:q:%d", id, managed.nextQueueSeq), Request: request}
+		if next {
+			managed.queue = append([]QueueEntry{entry}, managed.queue...)
+		} else {
+			managed.queue = append(managed.queue, entry)
+		}
 		depth := len(managed.queue)
 		r.mu.Unlock()
-		r.emitQueue(id) //nolint:contextcheck // Event sinks are intentionally context-free callbacks.
-		return SendResult{Accepted: true, Queued: true, QueueDepth: depth}, nil
+		r.emitQueue(id)
+		return SendResult{Accepted: true, Queued: true, QueueEntryID: entry.ID, QueueDepth: depth}, nil
 	}
-	managed.active = true
-	if managed.session.Status == session.StatusWaitingInput || managed.session.Status == session.StatusActive {
-		_ = managed.session.Transition(session.StatusRunning)
-	}
+	managed.dispatching = true
+	managed.active = false
+	managed.activeTurnID = ""
 	r.mu.Unlock()
 
-	state, err := adapter.SendTurn(ctx, id, request, r.sessionSink(id))
+	dispatch := TurnDispatch{SessionID: id, Request: request}
+	state, err := r.submitTurn(ctx, id, adapter, dispatch)
 	if err != nil {
-		r.mu.Lock()
-		if current := r.sessions[id]; current != nil {
-			current.active = false
-			if current.session.Status == session.StatusRunning {
-				_ = current.session.Transition(session.StatusActive)
-			}
-		}
-		r.mu.Unlock()
-		r.emitFailure(id, err)
 		return SendResult{}, err
 	}
-	r.mu.Lock()
-	if current := r.sessions[id]; current != nil {
-		current.session.BackendSession = state
-	}
-	r.mu.Unlock()
-	r.emitQueue(id) //nolint:contextcheck // Event sinks are intentionally context-free callbacks.
+	r.emitQueue(id)
 	return SendResult{Session: state, Accepted: true}, nil
 }
 
@@ -316,11 +367,48 @@ func (r *Runtime) Interrupt(ctx context.Context, sessionID string) error {
 	managed.queue = nil
 	r.mu.Unlock()
 	if active {
-		if err := adapter.Interrupt(ctx, id, r.sessionSink(id)); err != nil {
+		if err := r.interruptActive(ctx, id, adapter); err != nil {
 			return err
 		}
 	}
-	r.emitQueue(id) //nolint:contextcheck // Event sinks are intentionally context-free callbacks.
+	r.emitQueue(id)
+	return nil
+}
+
+func (r *Runtime) InterruptActive(ctx context.Context, sessionID string) error {
+	if r == nil {
+		return errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	r.mu.Lock()
+	managed, adapter, err := r.adapterLocked(id)
+	if err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	active := managed.active
+	r.mu.Unlock()
+	if !active {
+		return nil
+	}
+	return r.interruptActive(ctx, id, adapter)
+}
+
+func (r *Runtime) ReconcileTurn(sessionID string, event host.Event) error {
+	if r == nil {
+		return errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	if event.Type != host.EventTurnComplete && event.Type != host.EventTurnFailed && event.Type != host.EventProcessExited {
+		return errors.New("runtime: terminal turn event is required")
+	}
+	r.mu.Lock()
+	managed := r.sessions[id]
+	r.mu.Unlock()
+	if managed == nil {
+		return &SessionNotFoundError{SessionID: id}
+	}
+	r.deliver(id, event)
 	return nil
 }
 
@@ -381,6 +469,163 @@ func (r *Runtime) ForkPrompt(ctx context.Context, request host.ForkPromptRequest
 	return forker.ForkPrompt(ctx, request)
 }
 
+func (r *Runtime) QueueEntries(sessionID string) ([]QueueEntry, error) {
+	if r == nil {
+		return nil, errors.New("runtime: nil runtime")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	managed := r.sessions[strings.TrimSpace(sessionID)]
+	if managed == nil {
+		return nil, &SessionNotFoundError{SessionID: strings.TrimSpace(sessionID)}
+	}
+	return cloneQueueEntries(managed.queue), nil
+}
+
+func (r *Runtime) RemoveQueuedTurn(sessionID, entryID string) (RemoveQueuedTurnResult, error) {
+	if r == nil {
+		return RemoveQueuedTurnResult{}, errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	queuedID := strings.TrimSpace(entryID)
+	r.mu.Lock()
+	managed := r.sessions[id]
+	if managed == nil {
+		r.mu.Unlock()
+		return RemoveQueuedTurnResult{}, &SessionNotFoundError{SessionID: id}
+	}
+	index := -1
+	for i := range managed.queue {
+		if managed.queue[i].ID == queuedID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		depth := len(managed.queue)
+		r.mu.Unlock()
+		return RemoveQueuedTurnResult{QueueDepth: depth}, nil
+	}
+	entry := cloneQueueEntry(managed.queue[index])
+	managed.queue = append(append([]QueueEntry(nil), managed.queue[:index]...), managed.queue[index+1:]...)
+	depth := len(managed.queue)
+	r.mu.Unlock()
+	r.emitQueue(id)
+	return RemoveQueuedTurnResult{Removed: true, Entry: entry, QueueDepth: depth}, nil
+}
+
+func (r *Runtime) ReplaceQueuedTurn(sessionID, entryID string, request host.SendTurnRequest) (QueueEntry, error) {
+	if r == nil {
+		return QueueEntry{}, errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	queuedID := strings.TrimSpace(entryID)
+	if strings.TrimSpace(request.Prompt) == "" && len(request.Attachments) == 0 {
+		return QueueEntry{}, errors.New("runtime: prompt or attachment is required")
+	}
+	r.mu.Lock()
+	managed := r.sessions[id]
+	if managed == nil {
+		r.mu.Unlock()
+		return QueueEntry{}, &SessionNotFoundError{SessionID: id}
+	}
+	for i := range managed.queue {
+		if managed.queue[i].ID != queuedID {
+			continue
+		}
+		request.SessionID = id
+		managed.queue[i].Request = cloneSendTurnRequest(request)
+		entry := cloneQueueEntry(managed.queue[i])
+		r.mu.Unlock()
+		r.emitQueue(id)
+		return entry, nil
+	}
+	r.mu.Unlock()
+	return QueueEntry{}, &QueueEntryNotFoundError{SessionID: id, EntryID: queuedID}
+}
+
+func (r *Runtime) BlockDispatch(sessionID string) error {
+	if r == nil {
+		return errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	r.mu.Lock()
+	managed := r.sessions[id]
+	if managed == nil {
+		r.mu.Unlock()
+		return &SessionNotFoundError{SessionID: id}
+	}
+	managed.dispatchBlocked = true
+	r.mu.Unlock()
+	r.emitQueue(id)
+	return nil
+}
+
+func (r *Runtime) UnblockDispatch(sessionID string) error {
+	if r == nil {
+		return errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	r.mu.Lock()
+	managed := r.sessions[id]
+	if managed == nil {
+		r.mu.Unlock()
+		return &SessionNotFoundError{SessionID: id}
+	}
+	managed.dispatchBlocked = false
+	dispatch := !managed.active && !managed.dispatching && len(managed.queue) > 0 && managed.session.Status != session.StatusClosed
+	r.mu.Unlock()
+	r.emitQueue(id)
+	if dispatch {
+		go r.dispatchQueued(id)
+	}
+	return nil
+}
+
+func (r *Runtime) Restart(ctx context.Context, sessionID string) (host.BackendSession, error) {
+	if r == nil {
+		return host.BackendSession{}, errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	r.mu.Lock()
+	managed, adapter, err := r.adapterLocked(id)
+	if err != nil {
+		r.mu.Unlock()
+		return host.BackendSession{}, err
+	}
+	if managed.session.Status == session.StatusClosed {
+		r.mu.Unlock()
+		return host.BackendSession{}, &SessionClosedError{SessionID: id}
+	}
+	if managed.active || managed.dispatching {
+		turnID := managed.activeTurnID
+		r.mu.Unlock()
+		return host.BackendSession{}, &TurnActiveError{SessionID: id, TurnID: turnID}
+	}
+	restarter, ok := adapter.(host.AgentRestarter)
+	if !ok {
+		backend := string(adapter.Backend())
+		r.mu.Unlock()
+		return host.BackendSession{}, &RestartUnsupportedError{Backend: backend}
+	}
+	r.mu.Unlock()
+	state, err := restarter.RestartSession(ctx, id, r.sessionSink(id)) //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
+	if err != nil {
+		return host.BackendSession{}, err
+	}
+	r.mu.Lock()
+	if current := r.sessions[id]; current != nil {
+		current.session.BackendSession = state
+		current.dispatching = false
+		current.activeTurnID = ""
+	}
+	r.mu.Unlock()
+	if err := r.appendLifecycle(id, "session.restarted", map[string]any{"backend_session": state}); err != nil {
+		return host.BackendSession{}, err
+	}
+	return state, nil
+}
+
 // Close closes the provider session while retaining its durable records.
 func (r *Runtime) Close(sessionID string) error {
 	if r == nil {
@@ -408,7 +653,9 @@ func (r *Runtime) Close(sessionID string) error {
 	r.mu.Lock()
 	if current := r.sessions[id]; current != nil && current.session.Status != session.StatusClosed {
 		_ = current.session.Transition(session.StatusClosed)
+		current.dispatching = false
 		current.active = false
+		current.activeTurnID = ""
 		current.queue = nil
 	}
 	r.mu.Unlock()
@@ -468,9 +715,9 @@ func (r *Runtime) State(sessionID string) (State, error) {
 	defer r.mu.Unlock()
 	managed := r.sessions[strings.TrimSpace(sessionID)]
 	if managed == nil {
-		return State{}, fmt.Errorf("runtime: session %q not found", sessionID)
+		return State{}, &SessionNotFoundError{SessionID: strings.TrimSpace(sessionID)}
 	}
-	return State{Session: managed.session, QueueDepth: len(managed.queue), TurnActive: managed.active}, nil
+	return stateLocked(managed), nil
 }
 
 // Sessions returns stable snapshots ordered by creation time then ID.
@@ -481,7 +728,7 @@ func (r *Runtime) Sessions() []State {
 	r.mu.Lock()
 	states := make([]State, 0, len(r.sessions))
 	for _, managed := range r.sessions {
-		states = append(states, State{Session: managed.session, QueueDepth: len(managed.queue), TurnActive: managed.active})
+		states = append(states, stateLocked(managed))
 	}
 	r.mu.Unlock()
 	sort.Slice(states, func(i, j int) bool {
@@ -546,7 +793,7 @@ func (r *Runtime) Restore(sessionID string) (State, error) {
 		r.sessions[id] = restored
 	}
 	r.mu.Unlock()
-	return State{Session: restored.session, QueueDepth: len(restored.queue), TurnActive: restored.active}, nil
+	return stateLocked(restored), nil
 }
 
 // Detect returns every registered backend in deterministic order.
@@ -695,7 +942,7 @@ func emptyCatalog(catalog host.BackendCatalog) bool {
 func (r *Runtime) adapterLocked(id string) (*managedSession, host.Adapter, error) {
 	managed := r.sessions[id]
 	if managed == nil {
-		return nil, nil, fmt.Errorf("runtime: session %q not found", id)
+		return nil, nil, &SessionNotFoundError{SessionID: id}
 	}
 	adapter := r.adapters[managed.session.Backend]
 	if adapter == nil {
@@ -729,8 +976,12 @@ func (r *Runtime) deliver(sessionID string, event host.Event) {
 	if event.BackendThreadID == "" {
 		event.BackendThreadID = managed.session.BackendSession.ThreadID
 	}
-	if event.BackendTurnID == "" {
-		event.BackendTurnID = managed.session.BackendSession.TurnID
+	if event.BackendTurnID == "" && event.Type != host.EventTurnStarted {
+		if managed.activeTurnID != "" {
+			event.BackendTurnID = managed.activeTurnID
+		} else if !managed.active && !managed.dispatching {
+			event.BackendTurnID = managed.session.BackendSession.TurnID
+		}
 	}
 	if event.Time == "" {
 		event.Time = time.Now().UTC().Format(time.RFC3339Nano)
@@ -741,6 +992,11 @@ func (r *Runtime) deliver(sessionID string, event host.Event) {
 	}
 	if event.SourceEventID == "" {
 		event.SourceEventID = fmt.Sprintf("%s:%d", event.SessionID, event.Seq)
+	}
+	if !r.coalesceEvents {
+		r.mu.Unlock()
+		r.deliverNow(sessionID, event)
+		return
 	}
 	if managed.coalescer == nil {
 		managed.coalescer = newDeltaCoalescer(r.coalesceInterval, func(coalesced host.Event) {
@@ -768,20 +1024,29 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 	//exhaustive:ignore Provider-specific events are forwarded without runtime state changes.
 	switch event.Type {
 	case host.EventTurnStarted:
-		managed.active = true
-		if managed.session.Status == session.StatusActive {
-			_ = managed.session.Transition(session.StatusRunning)
+		if event.BackendTurnID != "" {
+			managed.dispatching = false
+			managed.active = true
+			managed.activeTurnID = event.BackendTurnID
+			if managed.session.Status == session.StatusActive {
+				_ = managed.session.Transition(session.StatusRunning)
+			}
 		}
 	case host.EventInteractionRequested:
 		if managed.session.Status == session.StatusRunning {
 			_ = managed.session.Transition(session.StatusWaitingInput)
 		}
 	case host.EventTurnComplete, host.EventTurnFailed, host.EventProcessExited:
-		managed.active = false
-		if managed.session.Status == session.StatusRunning || managed.session.Status == session.StatusWaitingInput {
-			_ = managed.session.Transition(session.StatusActive)
+		terminalMatches := event.Type == host.EventProcessExited || event.BackendTurnID == "" || managed.activeTurnID == "" || event.BackendTurnID == managed.activeTurnID
+		if terminalMatches {
+			managed.dispatching = false
+			managed.active = false
+			managed.activeTurnID = ""
+			if managed.session.Status == session.StatusRunning || managed.session.Status == session.StatusWaitingInput {
+				_ = managed.session.Transition(session.StatusActive)
+			}
+			dispatchNext = len(managed.queue) > 0 && !managed.dispatchBlocked
 		}
-		dispatchNext = len(managed.queue) > 0
 	default:
 	}
 	emit := r.emit
@@ -813,34 +1078,23 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 func (r *Runtime) dispatchQueued(sessionID string) {
 	r.mu.Lock()
 	managed, adapter, err := r.adapterLocked(sessionID)
-	if err != nil || managed.active || len(managed.queue) == 0 || managed.session.Status == session.StatusClosed {
+	if err != nil || managed.active || managed.dispatching || managed.dispatchBlocked || len(managed.queue) == 0 || managed.session.Status == session.StatusClosed {
 		r.mu.Unlock()
 		return
 	}
-	next := managed.queue[0]
-	managed.queue = append([]host.SendTurnRequest(nil), managed.queue[1:]...)
-	managed.active = true
-	_ = managed.session.Transition(session.StatusRunning)
+	next := cloneQueueEntry(managed.queue[0])
+	managed.queue = append([]QueueEntry(nil), managed.queue[1:]...)
+	managed.dispatching = true
+	managed.active = false
+	managed.activeTurnID = ""
 	r.mu.Unlock()
-	state, callErr := adapter.SendTurn(context.Background(), sessionID, next, r.sessionSink(sessionID))
+	r.emitQueue(sessionID)
+	dispatch := TurnDispatch{SessionID: sessionID, QueueEntryID: next.ID, Request: next.Request, Queued: true}
+	_, callErr := r.submitTurn(context.Background(), sessionID, adapter, dispatch)
 	if callErr != nil {
-		r.mu.Lock()
-		if current := r.sessions[sessionID]; current != nil {
-			current.active = false
-			if current.session.Status == session.StatusRunning {
-				_ = current.session.Transition(session.StatusActive)
-			}
-		}
-		r.mu.Unlock()
-		r.emitFailure(sessionID, callErr)
 		r.dispatchQueued(sessionID)
 		return
 	}
-	r.mu.Lock()
-	if current := r.sessions[sessionID]; current != nil {
-		current.session.BackendSession = state
-	}
-	r.mu.Unlock()
 }
 
 func (r *Runtime) emitQueue(sessionID string) {
@@ -855,17 +1109,67 @@ func (r *Runtime) emitQueue(sessionID string) {
 		Backend:   managed.session.Backend,
 		Type:      host.EventQueueUpdated,
 		Data: map[string]any{
-			"queue_depth": len(managed.queue),
-			"active":      managed.active,
-			"max_depth":   r.maxQueuedTurns,
+			"queue_depth":      len(managed.queue),
+			"active":           managed.active,
+			"active_turn_id":   managed.activeTurnID,
+			"dispatch_blocked": managed.dispatchBlocked,
+			"max_depth":        r.maxQueuedTurns,
 		},
 	}
 	r.mu.Unlock()
 	r.deliver(sessionID, event)
 }
 
-func (r *Runtime) emitFailure(sessionID string, err error) {
-	r.deliver(sessionID, host.Event{Type: host.EventTurnFailed, Message: err.Error()})
+func (r *Runtime) submitTurn(ctx context.Context, sessionID string, adapter host.Adapter, dispatch TurnDispatch) (host.BackendSession, error) {
+	r.mu.Lock()
+	dispatched := r.turnDispatched
+	r.mu.Unlock()
+	if dispatched != nil {
+		if err := dispatched(dispatch); err != nil {
+			r.failSubmission(sessionID, dispatch.QueueEntryID, err) //nolint:contextcheck // Failure delivery may dispatch the next queued turn.
+			return host.BackendSession{}, err
+		}
+	}
+	state, err := adapter.SendTurn(ctx, sessionID, dispatch.Request, r.sessionSink(sessionID)) //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
+	if err != nil {
+		r.failSubmission(sessionID, dispatch.QueueEntryID, err) //nolint:contextcheck // Failure delivery may dispatch the next queued turn.
+		return host.BackendSession{}, err
+	}
+	r.mu.Lock()
+	if current := r.sessions[sessionID]; current != nil {
+		current.session.BackendSession = state
+	}
+	submitted := r.turnSubmitted
+	r.mu.Unlock()
+	if submitted != nil {
+		submitted(TurnSubmission{TurnDispatch: dispatch, Session: state})
+	}
+	return state, nil
+}
+
+func (r *Runtime) failSubmission(sessionID, queueEntryID string, err error) {
+	r.mu.Lock()
+	if current := r.sessions[sessionID]; current != nil {
+		current.dispatching = false
+		current.active = false
+		current.activeTurnID = ""
+		if current.session.Status == session.StatusRunning {
+			_ = current.session.Transition(session.StatusActive)
+		}
+	}
+	r.mu.Unlock()
+	r.deliver(sessionID, host.Event{
+		Type:    host.EventTurnFailed,
+		Message: err.Error(),
+		Data: map[string]any{
+			"queue_entry_id":    queueEntryID,
+			"submission_failed": true,
+		},
+	})
+}
+
+func (r *Runtime) interruptActive(ctx context.Context, sessionID string, adapter host.Adapter) error {
+	return adapter.Interrupt(ctx, sessionID, r.sessionSink(sessionID)) //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
 }
 
 func (r *Runtime) appendLifecycle(sessionID, name string, data map[string]any) error {
@@ -967,6 +1271,39 @@ func cloneData(data map[string]any) map[string]any {
 	result := make(map[string]any, len(data)+1)
 	maps.Copy(result, data)
 	return result
+}
+
+func stateLocked(managed *managedSession) State {
+	return State{
+		Session:         managed.session,
+		QueueDepth:      len(managed.queue),
+		QueueEntries:    cloneQueueEntries(managed.queue),
+		TurnActive:      managed.active,
+		ActiveTurnID:    managed.activeTurnID,
+		DispatchBlocked: managed.dispatchBlocked,
+	}
+}
+
+func cloneQueueEntries(entries []QueueEntry) []QueueEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	cloned := make([]QueueEntry, len(entries))
+	for i := range entries {
+		cloned[i] = cloneQueueEntry(entries[i])
+	}
+	return cloned
+}
+
+func cloneQueueEntry(entry QueueEntry) QueueEntry {
+	entry.Request = cloneSendTurnRequest(entry.Request)
+	return entry
+}
+
+func cloneSendTurnRequest(request host.SendTurnRequest) host.SendTurnRequest {
+	request.Ext = append(json.RawMessage(nil), request.Ext...)
+	request.Attachments = append([]host.Attachment(nil), request.Attachments...)
+	return request
 }
 
 func newID() (string, error) {

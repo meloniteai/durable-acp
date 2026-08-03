@@ -147,10 +147,14 @@ func RunAdapter(t TestingT, adapter host.Adapter, config AdapterConfig) {
 	}
 	t.Cleanup(func() { _ = adapter.CloseSession(config.SessionID) })
 
-	turnResult := make(chan error, 1)
+	type turnOutcome struct {
+		state host.BackendSession
+		err   error
+	}
+	turnResult := make(chan turnOutcome, 1)
 	go func() {
-		_, sendErr := adapter.SendTurn(context.Background(), config.SessionID, config.Turn, func(event host.Event) { events <- event })
-		turnResult <- sendErr
+		state, sendErr := adapter.SendTurn(context.Background(), config.SessionID, config.Turn, func(event host.Event) { events <- event })
+		turnResult <- turnOutcome{state: state, err: sendErr}
 	}()
 
 	deadline := time.NewTimer(config.Timeout)
@@ -158,14 +162,26 @@ func RunAdapter(t TestingT, adapter host.Adapter, config AdapterConfig) {
 	sawStart := false
 	sawTerminal := false
 	sawInteraction := false
+	turnID := ""
+	var completed *turnOutcome
 	for !sawTerminal {
 		select {
 		case event := <-events:
 			//exhaustive:ignore Provider-specific events intentionally need no generic assertion.
 			switch event.Type {
 			case host.EventTurnStarted:
+				if event.BackendTurnID == "" {
+					t.Fatalf("adapter %q emitted turn_started without an identity", adapter.Backend())
+				}
+				if turnID != "" {
+					t.Fatalf("adapter %q started overlapping turns %q and %q", adapter.Backend(), turnID, event.BackendTurnID)
+				}
 				sawStart = true
+				turnID = event.BackendTurnID
 			case host.EventInteractionRequested:
+				if turnID == "" || event.BackendTurnID != turnID {
+					t.Fatalf("adapter %q interaction identity = %q, want %q", adapter.Backend(), event.BackendTurnID, turnID)
+				}
 				sawInteraction = true
 				if config.RequireInteraction {
 					responder, ok := adapter.(host.InteractionResponder)
@@ -176,13 +192,21 @@ func RunAdapter(t TestingT, adapter host.Adapter, config AdapterConfig) {
 						t.Fatalf("respond interaction: %v", respondErr)
 					}
 				}
+			case host.EventMessage, host.EventThinking, host.EventToolStarted, host.EventToolOutput, host.EventPermission, host.EventFileChanged, host.EventPlanUpdate, host.EventTodoUpdate, host.EventInteractionResolved:
+				if turnID == "" || event.BackendTurnID != turnID {
+					t.Fatalf("adapter %q event %q identity = %q, want %q", adapter.Backend(), event.Type, event.BackendTurnID, turnID)
+				}
 			case host.EventTurnComplete, host.EventTurnFailed:
+				if turnID == "" || event.BackendTurnID != turnID {
+					t.Fatalf("adapter %q terminal identity = %q, want %q", adapter.Backend(), event.BackendTurnID, turnID)
+				}
 				sawTerminal = true
 			default:
 			}
-		case sendErr := <-turnResult:
-			if sendErr != nil {
-				t.Fatalf("send turn: %v", sendErr)
+		case outcome := <-turnResult:
+			completed = &outcome
+			if outcome.err != nil {
+				t.Fatalf("send turn: %v", outcome.err)
 			}
 		case <-deadline.C:
 			t.Fatalf("adapter %q did not complete a turn within %s", adapter.Backend(), config.Timeout)
@@ -194,12 +218,19 @@ func RunAdapter(t TestingT, adapter host.Adapter, config AdapterConfig) {
 	if config.RequireInteraction && !sawInteraction {
 		t.Fatalf("adapter %q did not emit the required interaction", adapter.Backend())
 	}
-	select {
-	case sendErr := <-turnResult:
-		if sendErr != nil {
-			t.Fatalf("send turn: %v", sendErr)
+	if completed == nil {
+		select {
+		case outcome := <-turnResult:
+			completed = &outcome
+		case <-time.After(config.Timeout):
+			t.Fatalf("adapter %q did not return after terminal state", adapter.Backend())
 		}
-	default:
+	}
+	if completed.err != nil {
+		t.Fatalf("send turn: %v", completed.err)
+	}
+	if completed.state.TurnID != turnID {
+		t.Fatalf("adapter %q returned turn identity = %q, want %q", adapter.Backend(), completed.state.TurnID, turnID)
 	}
 	if err := adapter.Interrupt(context.Background(), config.SessionID, func(event host.Event) { events <- event }); err != nil {
 		t.Fatalf("interrupt: %v", err)

@@ -340,8 +340,16 @@ func TestAdapterCatalogConfigurationAndResume(t *testing.T) {
 	if err != nil || state.ID != "provider-1" {
 		t.Fatalf("resume = %#v, %v", state, err)
 	}
-	if _, err := adapter.StartSession(context.Background(), "resume", host.StartSessionRequest{Worktree: t.TempDir()}, nil); err == nil {
+	if _, duplicateErr := adapter.StartSession(context.Background(), "resume", host.StartSessionRequest{Worktree: t.TempDir()}, nil); duplicateErr == nil {
 		t.Fatal("StartSession accepted a duplicate host session")
+	}
+	events := make(chan host.Event, 16)
+	restarted, err := adapter.RestartSession(context.Background(), "resume", func(event host.Event) { events <- event })
+	if err != nil || restarted.ID != state.ID {
+		t.Fatalf("restart = %#v, %v", restarted, err)
+	}
+	if recovered := waitForEvent(t, events, host.EventAgentRecovered); recovered.BackendSessionID != state.ID {
+		t.Fatalf("recovered event = %#v", recovered)
 	}
 	if err := adapter.CloseSession("resume"); err != nil {
 		t.Fatal(err)

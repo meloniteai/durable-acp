@@ -29,7 +29,6 @@ func (a *adapterFixture) StartSession(
 	emit host.EventSink,
 ) (host.BackendSession, error) {
 	a.started = sessionID != "" && req.Backend == "fixture"
-	emit(host.Event{Type: host.EventTurnStarted})
 	return host.BackendSession{ID: "backend-session"}, nil
 }
 
@@ -40,11 +39,12 @@ func (a *adapterFixture) SendTurn(
 	emit host.EventSink,
 ) (host.BackendSession, error) {
 	a.turned = sessionID != "" && req.SessionID == sessionID
+	emit(host.Event{Type: host.EventTurnStarted, BackendTurnID: "turn-1"})
 	if a.interaction {
-		emit(host.Event{Type: host.EventInteractionRequested, Interaction: &host.InteractionRequest{ID: "interaction", Kind: host.InteractionPermission}})
+		emit(host.Event{Type: host.EventInteractionRequested, BackendTurnID: "turn-1", Interaction: &host.InteractionRequest{ID: "interaction", Kind: host.InteractionPermission}})
 		<-a.responded
 	}
-	emit(host.Event{Type: host.EventTurnComplete})
+	emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "turn-1"})
 	return host.BackendSession{ID: "backend-session", TurnID: "turn-1"}, nil
 }
 
