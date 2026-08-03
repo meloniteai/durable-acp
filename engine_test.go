@@ -148,7 +148,7 @@ func TestEngineExistingWorkspaceFacadesAndEvents(t *testing.T) {
 	if _, err := engine.Send(context.Background(), host.SendTurnRequest{SessionID: created.ID, Prompt: "turn"}); err != nil {
 		t.Fatal(err)
 	}
-	adapter.emit(host.Event{Type: host.EventInteractionRequested, Interaction: &host.InteractionRequest{ID: "choice", Kind: host.InteractionChoice}})
+	adapter.emit(host.Event{Type: host.EventInteractionRequested, BackendTurnID: "turn", Interaction: &host.InteractionRequest{ID: "choice", Kind: host.InteractionChoice}})
 	if err := engine.RespondInteraction(context.Background(), created.ID, host.InteractionResponse{RequestID: "choice", Action: "submit"}); err != nil {
 		t.Fatal(err)
 	}
@@ -622,9 +622,15 @@ func (*advancedEngineAdapter) Detect(context.Context) host.BackendStatus {
 	return host.BackendStatus{Backend: "advanced", Available: true}
 }
 
-func (a *advancedEngineAdapter) StartSession(_ context.Context, _ string, _ host.StartSessionRequest, sink host.EventSink) (host.BackendSession, error) {
+func (a *advancedEngineAdapter) StartSession(_ context.Context, _ string, request host.StartSessionRequest, sink host.EventSink) (host.BackendSession, error) {
 	a.sink = sink
-	return host.BackendSession{ID: "advanced-provider"}, nil
+	state := host.BackendSession{ID: "advanced-provider"}
+	if request.Prompt != "" || len(request.Attachments) > 0 {
+		state.TurnID = "initial-turn"
+		sink(host.Event{Type: host.EventTurnStarted, BackendTurnID: state.TurnID})
+		sink(host.Event{Type: host.EventTurnComplete, BackendTurnID: state.TurnID})
+	}
+	return state, nil
 }
 
 func (a *advancedEngineAdapter) SendTurn(_ context.Context, _ string, _ host.SendTurnRequest, sink host.EventSink) (host.BackendSession, error) {

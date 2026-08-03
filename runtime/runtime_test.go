@@ -217,7 +217,7 @@ func TestRuntimeRestartKeepsLogicalSessionLive(t *testing.T) {
 	}
 }
 
-func TestRuntimeStartActivationPolicy(t *testing.T) {
+func TestRuntimeStartRequiresTurnIdentity(t *testing.T) {
 	runtime := New(Config{}, &plainAdapter{backend: "plain"})
 	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "session-1", Backend: "plain", Worktree: t.TempDir()}); err != nil {
 		t.Fatal(err)
@@ -230,7 +230,7 @@ func TestRuntimeStartActivationPolicy(t *testing.T) {
 			t.Fatalf("duplicate error = %T %v", err, err)
 		}
 	}
-	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "session-1", Prompt: "initial"}); err != nil {
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "session-1"}); err != nil {
 		t.Fatal(err)
 	}
 	state, err := runtime.State("session-1")
@@ -240,40 +240,85 @@ func TestRuntimeStartActivationPolicy(t *testing.T) {
 	if state.TurnActive || state.ActiveTurnID != "" {
 		t.Fatalf("prompt start state = %#v", state)
 	}
-	lifecycle := New(Config{}, &lifecycleStartAdapter{plainAdapter: plainAdapter{backend: "lifecycle"}})
-	if _, createErr := lifecycle.Create(context.Background(), CreateRequest{ID: "idle", Backend: "lifecycle", Worktree: t.TempDir()}); createErr != nil {
+	anonymous := New(Config{}, &lifecycleStartAdapter{plainAdapter: plainAdapter{backend: "anonymous"}})
+	if _, createErr := anonymous.Create(context.Background(), CreateRequest{ID: "anonymous", Backend: "anonymous", Worktree: t.TempDir()}); createErr != nil {
 		t.Fatal(createErr)
 	}
-	if _, startErr := lifecycle.Start(context.Background(), host.StartSessionRequest{SessionID: "idle"}); startErr != nil {
+	if _, startErr := anonymous.Start(context.Background(), host.StartSessionRequest{SessionID: "anonymous"}); startErr != nil {
 		t.Fatal(startErr)
 	}
-	idle, err := lifecycle.State("idle")
+	anonymousState, err := anonymous.State("anonymous")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !idle.TurnActive || idle.Session.Status != session.StatusRunning {
-		t.Fatalf("default start state = %#v", idle)
+	if anonymousState.TurnActive || anonymousState.ActiveTurnID != "" || anonymousState.Session.Status != session.StatusActive {
+		t.Fatalf("anonymous start state = %#v", anonymousState)
 	}
-	strict := New(Config{RequireTurnID: true}, &lifecycleStartAdapter{plainAdapter: plainAdapter{backend: "strict"}})
-	if _, createErr := strict.Create(context.Background(), CreateRequest{ID: "strict", Backend: "strict", Worktree: t.TempDir()}); createErr != nil {
+	identified := New(Config{}, &lifecycleStartAdapter{plainAdapter: plainAdapter{backend: "identified"}, turnID: "initial-turn"})
+	if _, createErr := identified.Create(context.Background(), CreateRequest{ID: "identified", Backend: "identified", Worktree: t.TempDir()}); createErr != nil {
 		t.Fatal(createErr)
 	}
-	if _, startErr := strict.Start(context.Background(), host.StartSessionRequest{SessionID: "strict"}); startErr != nil {
+	if _, startErr := identified.Start(context.Background(), host.StartSessionRequest{SessionID: "identified"}); startErr != nil {
 		t.Fatal(startErr)
 	}
-	strictState, err := strict.State("strict")
+	identifiedState, err := identified.State("identified")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strictState.TurnActive || strictState.Session.Status != session.StatusActive {
-		t.Fatalf("ID-gated start state = %#v", strictState)
+	if !identifiedState.TurnActive || identifiedState.ActiveTurnID != "initial-turn" || identifiedState.Session.Status != session.StatusRunning {
+		t.Fatalf("identified start state = %#v", identifiedState)
 	}
 }
 
-func TestRuntimeRequireTurnIDDoesNotReuseLastTurnID(t *testing.T) {
+func TestRuntimeReservesDispatchBeforeIdentifiedStart(t *testing.T) {
+	adapter := &testAdapter{backend: "test"}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	runtime := New(Config{TurnDispatched: func(TurnDispatch) error {
+		close(entered)
+		<-release
+		return nil
+	}}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "session-1", Backend: "test", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "session-1"}); err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "session-1", Prompt: "first"})
+		firstDone <- err
+	}()
+	<-entered
+	state, err := runtime.State("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.TurnActive || state.ActiveTurnID != "" {
+		t.Fatalf("pre-start state = %#v", state)
+	}
+	queued, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "session-1", Prompt: "second"})
+	if err != nil || !queued.Queued || queued.QueueDepth != 1 {
+		t.Fatalf("reserved dispatch queue result = %#v, %v", queued, err)
+	}
+	close(release)
+	if sendErr := <-firstDone; sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	state, err = runtime.State("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.TurnActive || state.ActiveTurnID != "turn-1" || state.QueueDepth != 1 {
+		t.Fatalf("identified state = %#v", state)
+	}
+}
+
+func TestRuntimeDoesNotReuseLastTurnIDForAnonymousStart(t *testing.T) {
 	adapter := &testAdapter{backend: "strict"}
 	var events []host.Event
-	runtime := New(Config{DisableCoalescing: true, RequireTurnID: true, EventSink: func(event host.Event) {
+	runtime := New(Config{DisableCoalescing: true, EventSink: func(event host.Event) {
 		events = append(events, event)
 	}}, adapter)
 	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "strict", Backend: "strict", Worktree: t.TempDir()}); err != nil {
@@ -723,7 +768,7 @@ func TestRuntimeInteractionFallbackAndRestoreFailures(t *testing.T) {
 	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "s"}); err != nil {
 		t.Fatal(err)
 	}
-	permission.emit(host.Event{Type: host.EventTurnStarted})
+	permission.emit(host.Event{Type: host.EventTurnStarted, BackendTurnID: "turn-1"})
 	permission.emit(host.Event{Type: host.EventInteractionRequested, Interaction: &host.InteractionRequest{ID: "ask", Kind: host.InteractionPermission}})
 	if err := runtime.RespondInteraction(context.Background(), "s", host.InteractionResponse{RequestID: "ask", Action: "allow", Message: "yes"}); err != nil {
 		t.Fatal(err)
@@ -987,10 +1032,11 @@ func (a *identityStreamAdapter) CloseSession(string) error { return nil }
 
 type lifecycleStartAdapter struct {
 	plainAdapter
+	turnID string
 }
 
 func (a *lifecycleStartAdapter) StartSession(ctx context.Context, id string, request host.StartSessionRequest, emit host.EventSink) (host.BackendSession, error) {
-	emit(host.Event{Type: host.EventTurnStarted})
+	emit(host.Event{Type: host.EventTurnStarted, BackendTurnID: a.turnID})
 	return a.plainAdapter.StartSession(ctx, id, request, emit)
 }
 

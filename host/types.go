@@ -227,6 +227,9 @@ type ForkMCPHTTPHeader struct {
 	Value string `json:"value"`
 }
 
+// Adapter emits an identified turn_started before turn-scoped, turn_completed,
+// or turn_failed events. All events for that turn use the same non-empty
+// BackendTurnID, which also matches the returned BackendSession.TurnID.
 type Adapter interface {
 	Backend() Backend
 	Detect(ctx context.Context) BackendStatus

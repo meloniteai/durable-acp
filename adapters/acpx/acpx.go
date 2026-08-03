@@ -83,6 +83,8 @@ type managedSession struct {
 
 	promptMu sync.Mutex
 	turn     atomic.Uint64
+	turnMu   sync.RWMutex
+	turnID   string
 
 	interactionMu sync.Mutex
 	interactions  map[string]chan host.InteractionResponse
@@ -269,6 +271,8 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 	managed.promptMu.Lock()
 	defer managed.promptMu.Unlock()
 	turnID := fmt.Sprintf("turn-%d", managed.turn.Add(1))
+	managed.setTurnID(turnID)
+	defer managed.setTurnID("")
 	managed.emitEvent(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID, Data: map[string]any{"turn_id": turnID}})
 	response, err := managed.conn.Prompt(ctx, &acp.PromptRequest{SessionId: acp.SessionId(managed.backendID), Prompt: blocks})
 	if err != nil {
@@ -538,6 +542,9 @@ func (s *managedSession) emitEvent(event host.Event) {
 		return
 	}
 	event.Backend = s.adapter.Backend()
+	if event.BackendTurnID == "" {
+		event.BackendTurnID = s.currentTurnID()
+	}
 	if event.BackendSessionID == "" {
 		event.BackendSessionID = s.backendID
 	}
@@ -545,6 +552,18 @@ func (s *managedSession) emitEvent(event host.Event) {
 		event.BackendThreadID = s.backendID
 	}
 	s.emit(event)
+}
+
+func (s *managedSession) setTurnID(turnID string) {
+	s.turnMu.Lock()
+	s.turnID = turnID
+	s.turnMu.Unlock()
+}
+
+func (s *managedSession) currentTurnID() string {
+	s.turnMu.RLock()
+	defer s.turnMu.RUnlock()
+	return s.turnID
 }
 
 func (s *managedSession) emitUpdate(update acp.SessionUpdate) {

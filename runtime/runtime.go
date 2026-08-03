@@ -43,7 +43,6 @@ type Config struct {
 	CatalogUpdated    func(host.Backend, host.BackendCatalog)
 	CoalesceInterval  time.Duration
 	DisableCoalescing bool
-	RequireTurnID     bool
 }
 
 // CreateRequest creates a session before its provider process is started.
@@ -123,7 +122,6 @@ type Runtime struct {
 	maxQueuedTurns   int
 	coalesceInterval time.Duration
 	coalesceEvents   bool
-	requireTurnID    bool
 	catalogCacheDir  string
 	catalogTimeout   time.Duration
 	catalogUpdated   func(host.Backend, host.BackendCatalog)
@@ -134,6 +132,7 @@ type Runtime struct {
 type managedSession struct {
 	session         session.Session
 	queue           []QueueEntry
+	dispatching     bool
 	active          bool
 	activeTurnID    string
 	dispatchBlocked bool
@@ -167,7 +166,6 @@ func New(config Config, adapters ...host.Adapter) *Runtime {
 		maxQueuedTurns:   limit,
 		coalesceInterval: interval,
 		coalesceEvents:   !config.DisableCoalescing,
-		requireTurnID:    config.RequireTurnID,
 		catalogCacheDir:  strings.TrimSpace(config.CatalogCacheDir),
 		catalogTimeout:   catalogTimeout,
 		catalogUpdated:   config.CatalogUpdated,
@@ -259,10 +257,19 @@ func (r *Runtime) Start(ctx context.Context, request host.StartSessionRequest) (
 	request.SessionID = id
 	request.Backend = managed.session.Backend
 	request.Worktree = managed.session.Worktree
+	initialTurn := strings.TrimSpace(request.Prompt) != "" || len(request.Attachments) > 0
+	if initialTurn {
+		managed.dispatching = true
+	}
 	r.mu.Unlock()
 
 	state, err := adapter.StartSession(ctx, id, request, r.sessionSink(id)) //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
 	if err != nil {
+		r.mu.Lock()
+		if current := r.sessions[id]; current != nil {
+			current.dispatching = false
+		}
+		r.mu.Unlock()
 		return host.BackendSession{}, err
 	}
 	r.mu.Lock()
@@ -312,7 +319,7 @@ func (r *Runtime) send(ctx context.Context, request host.SendTurnRequest, next b
 	}
 	request.SessionID = id
 	request = cloneSendTurnRequest(request)
-	if managed.active || managed.dispatchBlocked {
+	if managed.active || managed.dispatching || managed.dispatchBlocked {
 		if len(managed.queue) >= r.maxQueuedTurns {
 			depth := len(managed.queue)
 			r.mu.Unlock()
@@ -330,11 +337,9 @@ func (r *Runtime) send(ctx context.Context, request host.SendTurnRequest, next b
 		r.emitQueue(id)
 		return SendResult{Accepted: true, Queued: true, QueueEntryID: entry.ID, QueueDepth: depth}, nil
 	}
-	managed.active = true
+	managed.dispatching = true
+	managed.active = false
 	managed.activeTurnID = ""
-	if managed.session.Status == session.StatusWaitingInput || managed.session.Status == session.StatusActive {
-		_ = managed.session.Transition(session.StatusRunning)
-	}
 	r.mu.Unlock()
 
 	dispatch := TurnDispatch{SessionID: id, Request: request}
@@ -568,7 +573,7 @@ func (r *Runtime) UnblockDispatch(sessionID string) error {
 		return &SessionNotFoundError{SessionID: id}
 	}
 	managed.dispatchBlocked = false
-	dispatch := !managed.active && len(managed.queue) > 0 && managed.session.Status != session.StatusClosed
+	dispatch := !managed.active && !managed.dispatching && len(managed.queue) > 0 && managed.session.Status != session.StatusClosed
 	r.mu.Unlock()
 	r.emitQueue(id)
 	if dispatch {
@@ -592,7 +597,7 @@ func (r *Runtime) Restart(ctx context.Context, sessionID string) (host.BackendSe
 		r.mu.Unlock()
 		return host.BackendSession{}, &SessionClosedError{SessionID: id}
 	}
-	if managed.active {
+	if managed.active || managed.dispatching {
 		turnID := managed.activeTurnID
 		r.mu.Unlock()
 		return host.BackendSession{}, &TurnActiveError{SessionID: id, TurnID: turnID}
@@ -611,6 +616,7 @@ func (r *Runtime) Restart(ctx context.Context, sessionID string) (host.BackendSe
 	r.mu.Lock()
 	if current := r.sessions[id]; current != nil {
 		current.session.BackendSession = state
+		current.dispatching = false
 		current.activeTurnID = ""
 	}
 	r.mu.Unlock()
@@ -647,6 +653,7 @@ func (r *Runtime) Close(sessionID string) error {
 	r.mu.Lock()
 	if current := r.sessions[id]; current != nil && current.session.Status != session.StatusClosed {
 		_ = current.session.Transition(session.StatusClosed)
+		current.dispatching = false
 		current.active = false
 		current.activeTurnID = ""
 		current.queue = nil
@@ -972,7 +979,7 @@ func (r *Runtime) deliver(sessionID string, event host.Event) {
 	if event.BackendTurnID == "" && event.Type != host.EventTurnStarted {
 		if managed.activeTurnID != "" {
 			event.BackendTurnID = managed.activeTurnID
-		} else if !managed.active {
+		} else if !managed.active && !managed.dispatching {
 			event.BackendTurnID = managed.session.BackendSession.TurnID
 		}
 	}
@@ -1017,11 +1024,10 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 	//exhaustive:ignore Provider-specific events are forwarded without runtime state changes.
 	switch event.Type {
 	case host.EventTurnStarted:
-		if !r.requireTurnID || event.BackendTurnID != "" || managed.active {
+		if event.BackendTurnID != "" {
+			managed.dispatching = false
 			managed.active = true
-			if event.BackendTurnID != "" {
-				managed.activeTurnID = event.BackendTurnID
-			}
+			managed.activeTurnID = event.BackendTurnID
 			if managed.session.Status == session.StatusActive {
 				_ = managed.session.Transition(session.StatusRunning)
 			}
@@ -1033,6 +1039,7 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 	case host.EventTurnComplete, host.EventTurnFailed, host.EventProcessExited:
 		terminalMatches := event.Type == host.EventProcessExited || event.BackendTurnID == "" || managed.activeTurnID == "" || event.BackendTurnID == managed.activeTurnID
 		if terminalMatches {
+			managed.dispatching = false
 			managed.active = false
 			managed.activeTurnID = ""
 			if managed.session.Status == session.StatusRunning || managed.session.Status == session.StatusWaitingInput {
@@ -1071,15 +1078,15 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 func (r *Runtime) dispatchQueued(sessionID string) {
 	r.mu.Lock()
 	managed, adapter, err := r.adapterLocked(sessionID)
-	if err != nil || managed.active || managed.dispatchBlocked || len(managed.queue) == 0 || managed.session.Status == session.StatusClosed {
+	if err != nil || managed.active || managed.dispatching || managed.dispatchBlocked || len(managed.queue) == 0 || managed.session.Status == session.StatusClosed {
 		r.mu.Unlock()
 		return
 	}
 	next := cloneQueueEntry(managed.queue[0])
 	managed.queue = append([]QueueEntry(nil), managed.queue[1:]...)
-	managed.active = true
+	managed.dispatching = true
+	managed.active = false
 	managed.activeTurnID = ""
-	_ = managed.session.Transition(session.StatusRunning)
 	r.mu.Unlock()
 	r.emitQueue(sessionID)
 	dispatch := TurnDispatch{SessionID: sessionID, QueueEntryID: next.ID, Request: next.Request, Queued: true}
@@ -1131,9 +1138,6 @@ func (r *Runtime) submitTurn(ctx context.Context, sessionID string, adapter host
 	r.mu.Lock()
 	if current := r.sessions[sessionID]; current != nil {
 		current.session.BackendSession = state
-		if current.active && state.TurnID != "" {
-			current.activeTurnID = state.TurnID
-		}
 	}
 	submitted := r.turnSubmitted
 	r.mu.Unlock()
@@ -1146,6 +1150,7 @@ func (r *Runtime) submitTurn(ctx context.Context, sessionID string, adapter host
 func (r *Runtime) failSubmission(sessionID, queueEntryID string, err error) {
 	r.mu.Lock()
 	if current := r.sessions[sessionID]; current != nil {
+		current.dispatching = false
 		current.active = false
 		current.activeTurnID = ""
 		if current.session.Status == session.StatusRunning {
