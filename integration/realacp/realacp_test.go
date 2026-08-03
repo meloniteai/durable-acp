@@ -126,8 +126,36 @@ func runManagedLifecycle(t *testing.T, backend host.Backend) {
 	assertTurnSucceeded(t, ctx, live.events, before)
 	stream := live.events.after(before)
 	assertLiveEditingStream(t, stream)
+	assertTurnIdentities(t, stream, 1)
 	t.Logf("live %s managed stream: %s", backend, eventSummary(stream))
 	assertFileText(t, filepath.Join(session.Worktree.Path, "durable-acp-managed.txt"), proof)
+	engine := live.engineValue(t)
+	restarted, err := engine.Restart(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("restart live provider session: %v", err)
+	}
+	if restarted.ID == "" || restarted.ID != session.BackendSession.ID {
+		t.Fatalf("restarted backend identity = %+v, want original %+v", restarted, session.BackendSession)
+	}
+	runtimeState, err := engine.Runtime().State(session.ID)
+	if err != nil {
+		t.Fatalf("read restarted runtime state: %v", err)
+	}
+	if runtimeState.TurnActive || runtimeState.Session.Status == "closed" {
+		t.Fatalf("restarted runtime state = %+v", runtimeState)
+	}
+	restartProof := "durable-acp-restarted-" + string(backend)
+	before = live.events.len()
+	if _, err := live.send(ctx, host.SendTurnRequest{
+		SessionID: session.ID,
+		Prompt: "Use a tool to create durable-acp-restarted.txt containing exactly " + restartProof +
+			" and nothing else. Do not modify another file. Reply exactly done.",
+	}); err != nil {
+		t.Fatalf("send turn after live restart: %v", err)
+	}
+	assertTurnSucceeded(t, ctx, live.events, before)
+	assertTurnIdentities(t, live.events.after(before), 1)
+	assertFileText(t, filepath.Join(session.Worktree.Path, "durable-acp-restarted.txt"), restartProof)
 
 	presentation := &journal.Presentation{Label: "Live verification"}
 	if _, err := live.engineValue(t).Append(session.ID, "example.live_verified", map[string]any{
@@ -171,9 +199,10 @@ func runManagedLifecycle(t *testing.T, backend host.Backend) {
 		t.Fatalf("send resumed turn: %v", err)
 	}
 	assertTurnSucceeded(t, ctx, live.events, before)
+	assertTurnIdentities(t, live.events.after(before), 1)
 	assertFileText(t, filepath.Join(session.Worktree.Path, "durable-acp-resumed.txt"), resumeProof)
 
-	engine := live.engineValue(t)
+	engine = live.engineValue(t)
 	if err := engine.CloseSession(session.ID); err != nil {
 		t.Fatalf("close session: %v", err)
 	}
@@ -232,6 +261,7 @@ func runExistingWorkspaceAttachment(t *testing.T, backend host.Backend) {
 	}
 	assertSameDirectory(t, session.Worktree.Path, source)
 	assertTurnSucceeded(t, ctx, live.events, before)
+	assertTurnIdentities(t, live.events.after(before), 1)
 	assertFileText(t, filepath.Join(source, "durable-acp-attachment.txt"), proof)
 
 	engine := live.engineValue(t)
@@ -283,6 +313,17 @@ func runQueuedTurns(t *testing.T, backend host.Backend) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	engine := live.engineValue(t)
+	state, err := engine.Runtime().State(session.ID)
+	if err != nil {
+		t.Fatalf("read active runtime state: %v", err)
+	}
+	if !state.TurnActive || state.ActiveTurnID == "" {
+		t.Fatalf("active runtime state = %+v", state)
+	}
+	if err := engine.BlockDispatch(session.ID); err != nil {
+		t.Fatalf("block queued dispatch: %v", err)
+	}
 
 	secondProof := "durable-acp-second-" + string(backend)
 	queued, err := live.send(ctx, host.SendTurnRequest{
@@ -296,9 +337,46 @@ func runQueuedTurns(t *testing.T, backend host.Backend) {
 	if !queued.Accepted || !queued.Queued || queued.QueueDepth != 1 {
 		t.Fatalf("queued turn = %+v, want accepted queue depth one", queued)
 	}
+	removed, err := live.send(ctx, host.SendTurnRequest{
+		SessionID: session.ID,
+		Prompt:    "Create durable-acp-removed.txt containing should-not-run. Reply exactly done.",
+	})
+	if err != nil {
+		t.Fatalf("queue removable turn: %v", err)
+	}
+	if !removed.Queued || removed.QueueDepth != 2 || removed.QueueEntryID == "" || removed.QueueEntryID == queued.QueueEntryID {
+		t.Fatalf("removable queued turn = %+v", removed)
+	}
+	entries, err := engine.QueueEntries(session.ID)
+	if err != nil {
+		t.Fatalf("list queued turns: %v", err)
+	}
+	if len(entries) != 2 || entries[0].ID != queued.QueueEntryID || entries[1].ID != removed.QueueEntryID {
+		t.Fatalf("queued entries = %+v", entries)
+	}
+	removedResult, err := engine.RemoveQueuedTurn(session.ID, removed.QueueEntryID)
+	if err != nil {
+		t.Fatalf("remove queued turn: %v", err)
+	}
+	if !removedResult.Removed || removedResult.Entry.ID != removed.QueueEntryID || removedResult.QueueDepth != 1 {
+		t.Fatalf("removed queued turn = %+v", removedResult)
+	}
 	first := <-firstDone
 	if first.err != nil || !first.result.Accepted || first.result.Queued {
 		t.Fatalf("first turn = %+v, %v", first.result, first.err)
+	}
+	state, err = engine.Runtime().State(session.ID)
+	if err != nil {
+		t.Fatalf("read blocked runtime state: %v", err)
+	}
+	if state.TurnActive || !state.DispatchBlocked || state.QueueDepth != 1 || len(state.QueueEntries) != 1 || state.QueueEntries[0].ID != queued.QueueEntryID {
+		t.Fatalf("blocked runtime state = %+v", state)
+	}
+	if live.events.count(host.EventTurnStarted) != firstStarted+1 {
+		t.Fatalf("queued turn dispatched through barrier: %s", eventSummary(live.events.snapshot()))
+	}
+	if err := engine.UnblockDispatch(session.ID); err != nil {
+		t.Fatalf("unblock queued dispatch: %v", err)
 	}
 	if err := live.events.wait(ctx, "both queued turns to complete", func(events []host.Event) bool {
 		return countEvents(events, host.EventTurnComplete) >= 2
@@ -308,7 +386,11 @@ func runQueuedTurns(t *testing.T, backend host.Backend) {
 	assertNoTurnFailure(t, live.events.snapshot())
 	assertFileText(t, filepath.Join(session.Worktree.Path, "durable-acp-first.txt"), firstProof)
 	assertFileText(t, filepath.Join(session.Worktree.Path, "durable-acp-second.txt"), secondProof)
-	assertQueueTransition(t, live.events.snapshot(), 1, 0)
+	if _, err := os.Stat(filepath.Join(session.Worktree.Path, "durable-acp-removed.txt")); !os.IsNotExist(err) {
+		t.Fatalf("removed queued turn ran: stat error = %v", err)
+	}
+	assertTurnIdentities(t, live.events.snapshot(), 2)
+	assertQueueTransition(t, live.events.snapshot(), 1, 2, 0)
 	closeAndRemove(t, ctx, live.engineValue(t), session)
 }
 
@@ -330,6 +412,7 @@ func runInterruptAndRecovery(t *testing.T, backend host.Backend) {
 		PermissionMode: writablePermissionModeFor(backend),
 	})
 
+	firstBefore := live.events.len()
 	turnsBefore := live.events.count(host.EventTurnStarted)
 	toolsBefore := live.events.count(host.EventToolStarted)
 	firstDone := make(chan sendOutcome, 1)
@@ -380,6 +463,7 @@ func runInterruptAndRecovery(t *testing.T, backend host.Backend) {
 	if _, err := os.Stat(filepath.Join(session.Worktree.Path, "should-not-exist.txt")); !os.IsNotExist(err) {
 		t.Fatalf("interrupted queued turn ran: stat error = %v", err)
 	}
+	assertTurnIdentities(t, live.events.after(firstBefore), 1)
 
 	proof := "durable-acp-recovered-" + string(backend)
 	before := live.events.len()
@@ -391,6 +475,7 @@ func runInterruptAndRecovery(t *testing.T, backend host.Backend) {
 		t.Fatalf("send recovery turn: %v", err)
 	}
 	assertTurnSucceeded(t, ctx, live.events, before)
+	assertTurnIdentities(t, live.events.after(before), 1)
 	assertFileText(t, filepath.Join(session.Worktree.Path, "durable-acp-recovered.txt"), proof)
 	closeAndRemove(t, ctx, live.engineValue(t), session)
 }
@@ -418,6 +503,7 @@ func runPermissionRoundTrip(t *testing.T, backend host.Backend) {
 	})
 	assertTurnSucceeded(t, ctx, live.events, before)
 	after := live.events.after(before)
+	assertTurnIdentities(t, after, 1)
 	if !hasPermissionInteraction(after) {
 		t.Fatalf("%s completed guarded edit without a standard ACP permission interaction; events: %s", backend, eventSummary(after))
 	}
@@ -449,6 +535,7 @@ func runNativePlanMode(t *testing.T, backend host.Backend) {
 			"Do not modify any other file. Reply with a short plan explaining why this cannot be edited in plan mode.",
 	})
 	assertTurnSucceeded(t, ctx, live.events, before)
+	assertTurnIdentities(t, live.events.after(before), 1)
 	if _, err := os.Stat(filepath.Join(session.Worktree.Path, "durable-acp-plan-mode-forbidden.txt")); !os.IsNotExist(err) {
 		t.Fatalf("%s plan mode modified a file: stat error = %v", backend, err)
 	}
@@ -851,6 +938,35 @@ func assertNoTurnFailure(t *testing.T, events []host.Event) {
 		if event.Type == host.EventTurnFailed {
 			t.Fatalf("live turn failed: %s", event.Message)
 		}
+	}
+}
+
+func assertTurnIdentities(t *testing.T, events []host.Event, expected int) {
+	t.Helper()
+	active := ""
+	started := 0
+	for _, event := range events {
+		switch event.Type {
+		case host.EventTurnStarted:
+			if event.BackendTurnID == "" {
+				t.Fatalf("turn_started omitted identity: %s", eventSummary(events))
+			}
+			active = event.BackendTurnID
+			started++
+		case host.EventMessage, host.EventThinking, host.EventToolStarted, host.EventToolOutput, host.EventPlanUpdate, host.EventInteractionRequested:
+			if active != "" && event.BackendTurnID != active {
+				t.Fatalf("turn event %q identity = %q, want %q: %s", event.Type, event.BackendTurnID, active, eventSummary(events))
+			}
+		case host.EventTurnComplete, host.EventTurnFailed:
+			if active != "" && event.BackendTurnID != active {
+				t.Fatalf("terminal identity = %q, want %q: %s", event.BackendTurnID, active, eventSummary(events))
+			}
+			active = ""
+		default:
+		}
+	}
+	if started != expected {
+		t.Fatalf("turn starts = %d, want %d: %s", started, expected, eventSummary(events))
 	}
 }
 

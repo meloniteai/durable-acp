@@ -270,6 +270,59 @@ func TestRuntimeStartActivationPolicy(t *testing.T) {
 	}
 }
 
+func TestRuntimeRequireTurnIDDoesNotReuseLastTurnID(t *testing.T) {
+	adapter := &testAdapter{backend: "strict"}
+	var events []host.Event
+	runtime := New(Config{DisableCoalescing: true, RequireTurnID: true, EventSink: func(event host.Event) {
+		events = append(events, event)
+	}}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "strict", Backend: "strict", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "strict"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "strict", Prompt: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "turn-1"})
+	adapter.emit(host.Event{Type: host.EventTurnStarted})
+	state, err := runtime.State("strict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.TurnActive || state.ActiveTurnID != "" {
+		t.Fatalf("anonymous start reused prior turn identity: %#v", state)
+	}
+	if event := events[len(events)-2]; event.Type != host.EventTurnStarted || event.BackendTurnID != "" {
+		t.Fatalf("anonymous start = %#v", event)
+	}
+}
+
+func TestRuntimeUsesActiveTurnIDForAdapterStream(t *testing.T) {
+	adapter := &identityStreamAdapter{backend: "stream"}
+	var messages []host.Event
+	runtime := New(Config{DisableCoalescing: true, EventSink: func(event host.Event) {
+		if event.Type == host.EventMessage {
+			messages = append(messages, event)
+		}
+	}}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "stream", Backend: "stream", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "stream"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, prompt := range []string{"first", "second"} {
+		if _, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "stream", Prompt: prompt}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(messages) != 2 || messages[0].BackendTurnID != "turn-1" || messages[1].BackendTurnID != "turn-2" {
+		t.Fatalf("stream messages = %#v", messages)
+	}
+}
+
 func TestRuntimeInterruptActiveAndReconcileTurn(t *testing.T) {
 	adapter := &testAdapter{backend: "test"}
 	runtime := New(Config{}, adapter)
@@ -901,6 +954,36 @@ func (a *testAdapter) response() host.InteractionResponse {
 }
 
 type plainAdapter struct{ backend host.Backend }
+
+type identityStreamAdapter struct {
+	backend host.Backend
+	turns   int
+}
+
+func (a *identityStreamAdapter) Backend() host.Backend { return a.backend }
+
+func (a *identityStreamAdapter) Detect(context.Context) host.BackendStatus {
+	return host.BackendStatus{Backend: a.backend, Available: true}
+}
+
+func (a *identityStreamAdapter) StartSession(context.Context, string, host.StartSessionRequest, host.EventSink) (host.BackendSession, error) {
+	return host.BackendSession{ID: "provider"}, nil
+}
+
+func (a *identityStreamAdapter) SendTurn(_ context.Context, _ string, _ host.SendTurnRequest, emit host.EventSink) (host.BackendSession, error) {
+	a.turns++
+	turnID := fmt.Sprintf("turn-%d", a.turns)
+	emit(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID})
+	emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: turnID})
+	emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: turnID})
+	return host.BackendSession{ID: "provider", TurnID: turnID}, nil
+}
+
+func (a *identityStreamAdapter) Interrupt(context.Context, string, host.EventSink) error {
+	return nil
+}
+
+func (a *identityStreamAdapter) CloseSession(string) error { return nil }
 
 type lifecycleStartAdapter struct {
 	plainAdapter

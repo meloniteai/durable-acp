@@ -460,7 +460,19 @@ func (e *Engine) Restart(ctx context.Context, sessionID string) (host.BackendSes
 	if e == nil || e.runtime == nil {
 		return host.BackendSession{}, errors.New("durableacp: engine is not open")
 	}
-	return e.runtime.Restart(ctx, sessionID)
+	entry, err := e.loadSession(sessionID)
+	if err != nil {
+		return host.BackendSession{}, err
+	}
+	state, err := e.runtime.Restart(ctx, sessionID)
+	if err != nil {
+		return host.BackendSession{}, err
+	}
+	entry.BackendSession = state
+	if err := e.saveSession(entry); err != nil {
+		return host.BackendSession{}, err
+	}
+	return state, nil
 }
 
 // Interrupt cancels the active turn and clears queued turns.

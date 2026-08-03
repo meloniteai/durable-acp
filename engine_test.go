@@ -250,6 +250,10 @@ func TestEngineQueueControlAndRestartFacades(t *testing.T) {
 	if err != nil || restarted.ID != "queue-provider-restarted" || adapter.restartCount() != 1 {
 		t.Fatalf("restart = %#v, %v, calls = %d", restarted, err, adapter.restartCount())
 	}
+	persisted, err := engine.loadSession(created.ID)
+	if err != nil || persisted.BackendSession.ID != restarted.ID {
+		t.Fatalf("persisted restart = %#v, %v", persisted.BackendSession, err)
+	}
 }
 
 func TestEngineValidationConfigurationAndHelpers(t *testing.T) {

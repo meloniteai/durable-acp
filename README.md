@@ -163,7 +163,7 @@ mocked protocol test. Each selected agent runs these isolated journeys:
 
 | Journey | What it proves |
 | --- | --- |
-| `managed` | Detection, catalog caching, managed Git worktree/branch creation, live model edit, normalized stream events, neutral + opaque journals, repair/prune, Engine restart/provider resume, close, and owned cleanup. |
+| `managed` | Detection, catalog caching, managed Git worktree/branch creation, live model edit, normalized stream events, live provider restart, neutral + opaque journals, repair/prune, Engine restart/provider resume, close, and owned cleanup. |
 | `existing` | A caller-owned Git checkout survives `Repair` and `Remove`, while an initial `Start` turn receives an ACP text-resource attachment and uses it in a live edit. |
 | `queued` | A second real model turn is queued while the first is active, then executes serially with the first turn's filesystem output available. |
 | `interrupt` | A real shell tool call is cancelled, its queued follow-up is cleared, and the same provider session successfully completes a recovery turn. |

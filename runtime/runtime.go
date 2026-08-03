@@ -969,8 +969,12 @@ func (r *Runtime) deliver(sessionID string, event host.Event) {
 	if event.BackendThreadID == "" {
 		event.BackendThreadID = managed.session.BackendSession.ThreadID
 	}
-	if event.BackendTurnID == "" {
-		event.BackendTurnID = managed.session.BackendSession.TurnID
+	if event.BackendTurnID == "" && event.Type != host.EventTurnStarted {
+		if managed.activeTurnID != "" {
+			event.BackendTurnID = managed.activeTurnID
+		} else if !managed.active {
+			event.BackendTurnID = managed.session.BackendSession.TurnID
+		}
 	}
 	if event.Time == "" {
 		event.Time = time.Now().UTC().Format(time.RFC3339Nano)
