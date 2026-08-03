@@ -262,6 +262,33 @@ func (s *Store) Read(sessionID string, through uint64) ([]Record, error) {
 	return readJournal(s.path(sessionID), s.schemaID, through)
 }
 
+// LastSequence returns the final durable sequence for a session.
+func (s *Store) LastSequence(sessionID string) (uint64, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return 0, errors.New("journal: session_id is required")
+	}
+	s.mu.Lock()
+	if writer := s.writers[sessionID]; writer != nil {
+		if err := writer.file.Sync(); err != nil {
+			s.mu.Unlock()
+			return 0, fmt.Errorf("journal: sync %s: %w", sessionID, err)
+		}
+		sequence := writer.seq
+		s.mu.Unlock()
+		return sequence, nil
+	}
+	s.mu.Unlock()
+	records, err := readJournal(s.path(sessionID), s.schemaID, 0)
+	if err != nil {
+		return 0, err
+	}
+	if len(records) == 0 {
+		return 0, nil
+	}
+	return records[len(records)-1].Sequence, nil
+}
+
 // Sessions returns the safe filename stems for every journal in the store.
 func (s *Store) Sessions() ([]string, error) {
 	entries, err := os.ReadDir(s.dir)

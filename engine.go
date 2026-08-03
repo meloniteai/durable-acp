@@ -21,6 +21,7 @@ import (
 	"github.com/meloniteai/durable-acp/host"
 	"github.com/meloniteai/durable-acp/journal"
 	"github.com/meloniteai/durable-acp/runtime"
+	"github.com/meloniteai/durable-acp/session"
 	"github.com/meloniteai/durable-acp/worktree"
 )
 
@@ -53,9 +54,22 @@ func DefaultSettings() Settings {
 type Option func(*openOptions)
 
 type openOptions struct {
-	adapters     []host.Adapter
-	listeners    []host.EventSink
-	branchPrefix string
+	adapters         []host.Adapter
+	listeners        []host.EventSink
+	branchPrefix     string
+	journal          JournalConfiguration
+	runtime          runtime.Config
+	hasRuntimeConfig bool
+}
+
+// JournalConfiguration selects the Engine journal without introducing a
+// persistence-provider abstraction. Store remains owned by the caller;
+// Directory stores are opened and closed by the Engine.
+type JournalConfiguration struct {
+	Store                 *journal.Store
+	Directory             string
+	Options               []journal.Option
+	DisableRuntimeJournal bool
 }
 
 // WithAdapters adds adapters or replaces a built-in adapter with the same
@@ -83,20 +97,47 @@ func WithBranchPrefix(prefix string) Option {
 	}
 }
 
+// WithJournalStore uses a caller-owned journal store.
+func WithJournalStore(store *journal.Store) Option {
+	return func(options *openOptions) {
+		options.journal.Store = store
+	}
+}
+
+// WithJournalConfiguration uses a caller-owned store or an Engine-owned
+// directory with journal options.
+func WithJournalConfiguration(configuration JournalConfiguration) Option {
+	return func(options *openOptions) {
+		configuration.Options = append([]journal.Option(nil), configuration.Options...)
+		options.journal = configuration
+	}
+}
+
+// WithRuntimeConfiguration supplies provider-neutral runtime behavior. The
+// Engine always supplies its selected journal and event publisher.
+func WithRuntimeConfiguration(configuration runtime.Config) Option {
+	return func(options *openOptions) {
+		options.runtime = configuration
+		options.hasRuntimeConfig = true
+	}
+}
+
 // Engine owns one supplied home directory and all durable agent state below it.
 type Engine struct {
-	home      string
-	settings  Settings
-	journal   *journal.Store
-	runtime   *runtime.Runtime
-	worktrees *worktree.Manager
+	home         string
+	settings     Settings
+	journal      *journal.Store
+	journalOwned bool
+	runtime      *runtime.Runtime
+	worktrees    *worktree.Manager
 
-	mu        sync.Mutex
-	listeners map[uint64]host.EventSink
-	nextSub   uint64
-	closers   []io.Closer
-	closeOnce sync.Once
-	closeErr  error
+	mu         sync.Mutex
+	listeners  map[uint64]host.EventSink
+	nextSub    uint64
+	closers    []io.Closer
+	closeOnce  sync.Once
+	closeErr   error
+	manifestMu sync.Mutex
 }
 
 // WorkspaceMode selects whether Start creates a managed worktree or uses a
@@ -110,16 +151,25 @@ const (
 
 // StartRequest creates and starts a session in one operation.
 type StartRequest struct {
-	ID             string
-	Backend        host.Backend
-	WorkspaceMode  WorkspaceMode
-	Source         string
-	Worktree       string
-	Prompt         string
-	Attachments    []host.Attachment
-	Model          string
-	Reasoning      string
-	PermissionMode string
+	ID                     string
+	Backend                host.Backend
+	WorkspaceMode          WorkspaceMode
+	Source                 string
+	Worktree               string
+	Prompt                 string
+	Attachments            []host.Attachment
+	Model                  string
+	Reasoning              string
+	PermissionMode         string
+	ResumeBackendSessionID string
+	Ext                    json.RawMessage
+}
+
+// Configuration is the effective provider-neutral session configuration.
+type Configuration struct {
+	Model          string `json:"model,omitempty"`
+	Reasoning      string `json:"reasoning,omitempty"`
+	PermissionMode string `json:"permission_mode,omitempty"`
 }
 
 // Session is the durable Engine-level record for a runtime session.
@@ -129,8 +179,58 @@ type Session struct {
 	WorkspaceMode  WorkspaceMode       `json:"workspace_mode"`
 	Worktree       worktree.Session    `json:"worktree"`
 	BackendSession host.BackendSession `json:"backend_session,omitzero"`
+	Configuration  Configuration       `json:"configuration"`
+	Ext            json.RawMessage     `json:"ext,omitempty"`
 	CreatedAt      time.Time           `json:"created_at"`
+	UpdatedAt      time.Time           `json:"updated_at"`
 	ClosedAt       *time.Time          `json:"closed_at,omitempty"`
+}
+
+// LifecycleSnapshot is the lifecycle portion of an Engine snapshot.
+type LifecycleSnapshot struct {
+	Status    session.Status `json:"status"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	ClosedAt  *time.Time     `json:"closed_at,omitempty"`
+}
+
+// WorkspaceSnapshot is the workspace portion of an Engine snapshot.
+type WorkspaceSnapshot struct {
+	Mode      WorkspaceMode    `json:"mode"`
+	Workspace worktree.Session `json:"workspace"`
+}
+
+// BackendSnapshot contains stable provider references.
+type BackendSnapshot struct {
+	Backend host.Backend        `json:"backend"`
+	Session host.BackendSession `json:"session,omitzero"`
+}
+
+// ActiveTurnSnapshot contains the current turn identity.
+type ActiveTurnSnapshot struct {
+	Active bool   `json:"active"`
+	ID     string `json:"id,omitempty"`
+}
+
+// QueueSnapshot contains the current ordered turn queue.
+type QueueSnapshot struct {
+	Depth           int                  `json:"depth"`
+	Entries         []runtime.QueueEntry `json:"entries,omitempty"`
+	DispatchBlocked bool                 `json:"dispatch_blocked,omitempty"`
+}
+
+// Snapshot is the complete provider-neutral Engine view of one session.
+type Snapshot struct {
+	SessionID           string                   `json:"session_id"`
+	Lifecycle           LifecycleSnapshot        `json:"lifecycle"`
+	Workspace           WorkspaceSnapshot        `json:"workspace"`
+	Backend             BackendSnapshot          `json:"backend"`
+	ActiveTurn          ActiveTurnSnapshot       `json:"active_turn"`
+	Queue               QueueSnapshot            `json:"queue"`
+	PendingInteraction  *host.InteractionRequest `json:"pending_interaction,omitempty"`
+	Configuration       Configuration            `json:"configuration"`
+	LastJournalSequence uint64                   `json:"last_journal_sequence"`
+	Ext                 json.RawMessage          `json:"ext,omitempty"`
 }
 
 // Open prepares the supplied absolute home directory and loads its settings.
@@ -149,10 +249,26 @@ func Open(ctx context.Context, home string, options ...Option) (*Engine, error) 
 		return nil, errors.New("durableacp: home directory must be absolute")
 	}
 	home = filepath.Clean(home)
+	resolved := openOptions{}
+	for _, option := range options {
+		if option != nil {
+			option(&resolved)
+		}
+	}
+	if resolved.journal.Store != nil && strings.TrimSpace(resolved.journal.Directory) != "" {
+		return nil, errors.New("durableacp: journal store and directory are mutually exclusive")
+	}
+	if directory := strings.TrimSpace(resolved.journal.Directory); directory != "" && !filepath.IsAbs(directory) {
+		return nil, errors.New("durableacp: journal directory must be absolute")
+	}
 	if err := secureDir(home); err != nil {
 		return nil, fmt.Errorf("durableacp: prepare home: %w", err)
 	}
-	for _, child := range []string{"sessions", "journals", "logs/providers", "logs/sessions", "worktrees", "cache"} {
+	children := []string{"sessions", "logs/providers", "logs/sessions", "worktrees", "cache"}
+	if resolved.journal.Store == nil && strings.TrimSpace(resolved.journal.Directory) == "" {
+		children = append(children, "journals")
+	}
+	for _, child := range children {
 		if err := secureDir(filepath.Join(home, child)); err != nil {
 			return nil, fmt.Errorf("durableacp: prepare %s: %w", child, err)
 		}
@@ -160,12 +276,6 @@ func Open(ctx context.Context, home string, options ...Option) (*Engine, error) 
 	settings, err := loadSettings(home)
 	if err != nil {
 		return nil, err
-	}
-	resolved := openOptions{}
-	for _, option := range options {
-		if option != nil {
-			option(&resolved)
-		}
 	}
 	if resolved.branchPrefix != "" {
 		settings.Worktrees.BranchPrefix = resolved.branchPrefix
@@ -177,30 +287,44 @@ func Open(ctx context.Context, home string, options ...Option) (*Engine, error) 
 		return nil, err
 	}
 
-	store, err := journal.NewStore(filepath.Join(home, "journals"))
-	if err != nil {
-		return nil, err
+	store := resolved.journal.Store
+	journalOwned := false
+	if store == nil {
+		directory := strings.TrimSpace(resolved.journal.Directory)
+		if directory == "" {
+			directory = filepath.Join(home, "journals")
+		}
+		store, err = journal.NewStore(filepath.Clean(directory), resolved.journal.Options...)
+		if err != nil {
+			return nil, err
+		}
+		journalOwned = true
 	}
 	manager, err := worktree.NewManager(worktree.Config{
 		Root:         filepath.Join(home, "worktrees"),
 		BranchPrefix: settings.Worktrees.BranchPrefix,
 	})
 	if err != nil {
-		_ = store.Close()
+		if journalOwned {
+			_ = store.Close()
+		}
 		return nil, err
 	}
 	providerLogs, closers, err := openProviderLogs(home)
 	if err != nil {
-		_ = store.Close()
+		if journalOwned {
+			_ = store.Close()
+		}
 		return nil, err
 	}
 	engine := &Engine{
-		home:      home,
-		settings:  settings,
-		journal:   store,
-		worktrees: manager,
-		listeners: map[uint64]host.EventSink{},
-		closers:   closers,
+		home:         home,
+		settings:     settings,
+		journal:      store,
+		journalOwned: journalOwned,
+		worktrees:    manager,
+		listeners:    map[uint64]host.EventSink{},
+		closers:      closers,
 	}
 	for _, listener := range resolved.listeners {
 		engine.Subscribe(listener)
@@ -208,11 +332,27 @@ func Open(ctx context.Context, home string, options ...Option) (*Engine, error) 
 	configuredAdapters := append(adapters.Default(adapters.WithStderrFor(func(backend host.Backend) io.Writer {
 		return providerLogs[backend]
 	})), resolved.adapters...)
-	engine.runtime = runtime.New(runtime.Config{
-		Journal:         store,
-		EventSink:       engine.publish,
-		CatalogCacheDir: catalogDir(home, settings),
-	}, mergeAdapters(configuredAdapters)...)
+	runtimeConfig := resolved.runtime
+	if !resolved.hasRuntimeConfig {
+		runtimeConfig = runtime.Config{}
+	}
+	if resolved.journal.DisableRuntimeJournal {
+		runtimeConfig.Journal = nil
+	} else {
+		runtimeConfig.Journal = store
+	}
+	runtimeConfig.EventSink = engine.publish
+	hostTurnSubmitted := runtimeConfig.TurnSubmitted
+	runtimeConfig.TurnSubmitted = func(submission runtime.TurnSubmission) {
+		engine.recordTurnSubmission(submission)
+		if hostTurnSubmitted != nil {
+			hostTurnSubmitted(submission)
+		}
+	}
+	if strings.TrimSpace(runtimeConfig.CatalogCacheDir) == "" {
+		runtimeConfig.CatalogCacheDir = catalogDir(home, settings)
+	}
+	engine.runtime = runtime.New(runtimeConfig, mergeAdapters(configuredAdapters)...)
 	return engine, nil
 }
 
@@ -279,7 +419,10 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 		return Session{}, fmt.Errorf("durableacp: invalid session ID %q", id)
 	}
 	if _, err := os.Stat(e.sessionPath(id)); err == nil {
-		return Session{}, fmt.Errorf("durableacp: session %q already exists", id)
+		if strings.TrimSpace(request.ResumeBackendSessionID) == "" {
+			return Session{}, fmt.Errorf("durableacp: session %q already exists", id)
+		}
+		return e.resumeStart(ctx, request)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Session{}, fmt.Errorf("durableacp: inspect session manifest: %w", err)
 	}
@@ -287,7 +430,12 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 	if mode == "" {
 		mode = WorkspaceManaged
 	}
-	entry := Session{ID: id, Backend: request.Backend, WorkspaceMode: mode, CreatedAt: time.Now().UTC()}
+	now := time.Now().UTC()
+	entry := Session{
+		ID: id, Backend: request.Backend, WorkspaceMode: mode,
+		Configuration: configurationFromStart(request), Ext: cloneRawMessage(request.Ext),
+		CreatedAt: now, UpdatedAt: now,
+	}
 	switch mode {
 	case WorkspaceManaged:
 		managed, err := e.worktrees.Create(ctx, worktree.CreateRequest{ID: id, Source: request.Source})
@@ -296,13 +444,11 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 		}
 		entry.Worktree = managed
 	case WorkspaceExisting:
-		inspected, err := e.worktrees.Inspect(ctx, request.Worktree)
+		inspected, err := e.inspectExistingWorkspace(ctx, id, request.Worktree)
 		if err != nil {
 			return Session{}, err
 		}
 		entry.Worktree = inspected
-		entry.Worktree.ID = id
-		entry.Worktree.Source = inspected.Path
 	default:
 		return Session{}, fmt.Errorf("durableacp: unsupported workspace mode %q", mode)
 	}
@@ -310,24 +456,26 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 		e.rollbackStart(ctx, entry)
 		return Session{}, err
 	}
-	if err := e.saveSession(entry); err != nil {
+	if err := e.saveSession(&entry); err != nil {
 		e.rollbackStart(ctx, entry)
 		return Session{}, err
 	}
 	backendSession, err := e.runtime.Start(ctx, host.StartSessionRequest{
-		SessionID:      id,
-		Prompt:         request.Prompt,
-		Attachments:    request.Attachments,
-		Model:          request.Model,
-		Reasoning:      request.Reasoning,
-		PermissionMode: request.PermissionMode,
+		SessionID:              id,
+		Prompt:                 request.Prompt,
+		Attachments:            request.Attachments,
+		Model:                  request.Model,
+		Reasoning:              request.Reasoning,
+		PermissionMode:         request.PermissionMode,
+		ResumeBackendSessionID: request.ResumeBackendSessionID,
+		Ext:                    cloneRawMessage(request.Ext),
 	})
 	if err != nil {
 		e.rollbackStart(ctx, entry)
 		return Session{}, err
 	}
 	entry.BackendSession = backendSession
-	if err := e.saveSession(entry); err != nil {
+	if err := e.saveSession(&entry); err != nil {
 		return Session{}, err
 	}
 	return entry, nil
@@ -335,10 +483,12 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 
 // Resume restores a persisted session and starts its provider with the last
 // durable backend session ID. It performs no implicit worktree creation.
-//
-//nolint:govet // Scoped restore checks intentionally keep the manifest error separate.
 func (e *Engine) Resume(ctx context.Context, id string) (Session, error) {
-	entry, err := e.loadSession(id)
+	return e.resumeStart(ctx, StartRequest{ID: id})
+}
+
+func (e *Engine) resumeStart(ctx context.Context, request StartRequest) (Session, error) {
+	entry, err := e.loadSession(request.ID)
 	if err != nil {
 		return Session{}, err
 	}
@@ -346,22 +496,42 @@ func (e *Engine) Resume(ctx context.Context, id string) (Session, error) {
 		return Session{}, fmt.Errorf("durableacp: session %q is closed", entry.ID)
 	}
 	if entry.WorkspaceMode == WorkspaceManaged {
-		if _, err := e.worktrees.Reopen(ctx, entry.Worktree); err != nil {
-			return Session{}, err
+		if _, reopenErr := e.worktrees.Reopen(ctx, entry.Worktree); reopenErr != nil {
+			return Session{}, reopenErr
 		}
 	}
-	if _, err := e.runtime.Restore(entry.ID); err != nil {
-		return Session{}, err
+	if _, stateErr := e.runtime.State(entry.ID); stateErr != nil {
+		if _, restoreErr := e.runtime.Restore(entry.ID); restoreErr != nil {
+			if _, createErr := e.runtime.Create(ctx, runtime.CreateRequest{ID: entry.ID, Backend: entry.Backend, Worktree: entry.Worktree.Path}); createErr != nil {
+				return Session{}, errors.Join(restoreErr, createErr)
+			}
+		}
+	}
+	configuration := entry.Configuration
+	mergeConfiguration(&configuration, configurationFromStart(request))
+	resumeBackendSessionID := strings.TrimSpace(request.ResumeBackendSessionID)
+	if resumeBackendSessionID == "" {
+		resumeBackendSessionID = entry.BackendSession.ID
 	}
 	state, err := e.runtime.Start(ctx, host.StartSessionRequest{
 		SessionID:              entry.ID,
-		ResumeBackendSessionID: entry.BackendSession.ID,
+		Prompt:                 request.Prompt,
+		Attachments:            request.Attachments,
+		Model:                  configuration.Model,
+		Reasoning:              configuration.Reasoning,
+		PermissionMode:         configuration.PermissionMode,
+		ResumeBackendSessionID: resumeBackendSessionID,
+		Ext:                    cloneRawMessage(request.Ext),
 	})
 	if err != nil {
 		return Session{}, err
 	}
 	entry.BackendSession = state
-	if err := e.saveSession(entry); err != nil {
+	entry.Configuration = configuration
+	if len(request.Ext) > 0 {
+		entry.Ext = cloneRawMessage(request.Ext)
+	}
+	if err := e.saveSession(&entry); err != nil {
 		return Session{}, err
 	}
 	return entry, nil
@@ -382,15 +552,14 @@ func (e *Engine) Repair(ctx context.Context, sessionID string) (Session, error) 
 		}
 		entry.Worktree = workspace
 	} else {
-		workspace, err := e.worktrees.Inspect(ctx, entry.Worktree.Path)
+		workspace, err := e.inspectExistingWorkspace(ctx, entry.ID, entry.Worktree.Path)
 		if err != nil {
 			return Session{}, err
 		}
-		workspace.ID = entry.ID
 		workspace.Source = entry.Worktree.Source
 		entry.Worktree = workspace
 	}
-	if err := e.saveSession(entry); err != nil {
+	if err := e.saveSession(&entry); err != nil {
 		return Session{}, err
 	}
 	return entry, nil
@@ -411,14 +580,90 @@ func (e *Engine) Send(ctx context.Context, request host.SendTurnRequest) (runtim
 	if e == nil || e.runtime == nil {
 		return runtime.SendResult{}, errors.New("durableacp: engine is not open")
 	}
-	return e.runtime.Send(ctx, request)
+	result, err := e.runtime.Send(ctx, request)
+	if err != nil {
+		return runtime.SendResult{}, err
+	}
+	if err := e.updateConfigurationFromTurn(request.SessionID, request); err != nil {
+		return runtime.SendResult{}, err
+	}
+	return result, nil
 }
 
 func (e *Engine) SendNext(ctx context.Context, request host.SendTurnRequest) (runtime.SendResult, error) {
 	if e == nil || e.runtime == nil {
 		return runtime.SendResult{}, errors.New("durableacp: engine is not open")
 	}
-	return e.runtime.SendNext(ctx, request)
+	result, err := e.runtime.SendNext(ctx, request)
+	if err != nil {
+		return runtime.SendResult{}, err
+	}
+	if err := e.updateConfigurationFromTurn(request.SessionID, request); err != nil {
+		return runtime.SendResult{}, err
+	}
+	return result, nil
+}
+
+// SetConfiguration replaces the effective provider-neutral configuration in
+// the session manifest.
+func (e *Engine) SetConfiguration(sessionID string, configuration Configuration) error {
+	if e == nil {
+		return errors.New("durableacp: engine is not open")
+	}
+	return e.updateSession(sessionID, func(entry *Session) {
+		entry.Configuration = normalizeConfiguration(configuration)
+	})
+}
+
+// Snapshot returns the complete current Engine state for one session.
+func (e *Engine) Snapshot(sessionID string) (Snapshot, error) {
+	if e == nil || e.runtime == nil || e.journal == nil {
+		return Snapshot{}, errors.New("durableacp: engine is not open")
+	}
+	entry, err := e.loadSession(strings.TrimSpace(sessionID))
+	if err != nil {
+		return Snapshot{}, err
+	}
+	status := session.StatusActive
+	updatedAt := entry.UpdatedAt
+	backendSession := entry.BackendSession
+	runtimeState, runtimeErr := e.runtime.State(entry.ID)
+	if runtimeErr == nil {
+		status = runtimeState.Session.Status
+		if runtimeState.Session.UpdatedAt.After(updatedAt) {
+			updatedAt = runtimeState.Session.UpdatedAt
+		}
+		if runtimeState.Session.BackendSession != (host.BackendSession{}) {
+			backendSession = runtimeState.Session.BackendSession
+		}
+	} else {
+		var missing *runtime.SessionNotFoundError
+		if !errors.As(runtimeErr, &missing) {
+			return Snapshot{}, runtimeErr
+		}
+	}
+	if entry.ClosedAt != nil {
+		status = session.StatusClosed
+	}
+	lastSequence, err := e.journal.LastSequence(entry.ID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return Snapshot{}, err
+	}
+	snapshot := Snapshot{
+		SessionID:           entry.ID,
+		Lifecycle:           LifecycleSnapshot{Status: status, CreatedAt: entry.CreatedAt, UpdatedAt: updatedAt, ClosedAt: entry.ClosedAt},
+		Workspace:           WorkspaceSnapshot{Mode: entry.WorkspaceMode, Workspace: entry.Worktree},
+		Backend:             BackendSnapshot{Backend: entry.Backend, Session: backendSession},
+		Configuration:       entry.Configuration,
+		LastJournalSequence: lastSequence,
+		Ext:                 cloneRawMessage(entry.Ext),
+	}
+	if runtimeErr == nil {
+		snapshot.ActiveTurn = ActiveTurnSnapshot{Active: runtimeState.TurnActive, ID: runtimeState.ActiveTurnID}
+		snapshot.Queue = QueueSnapshot{Depth: runtimeState.QueueDepth, Entries: runtimeState.QueueEntries, DispatchBlocked: runtimeState.DispatchBlocked}
+		snapshot.PendingInteraction = runtimeState.PendingInteraction
+	}
+	return snapshot, nil
 }
 
 func (e *Engine) QueueEntries(sessionID string) ([]runtime.QueueEntry, error) {
@@ -469,7 +714,7 @@ func (e *Engine) Restart(ctx context.Context, sessionID string) (host.BackendSes
 		return host.BackendSession{}, err
 	}
 	entry.BackendSession = state
-	if err := e.saveSession(entry); err != nil {
+	if err := e.saveSession(&entry); err != nil {
 		return host.BackendSession{}, err
 	}
 	return state, nil
@@ -518,7 +763,7 @@ func (e *Engine) CloseSession(sessionID string) error {
 	}
 	now := time.Now().UTC()
 	entry.ClosedAt = &now
-	return e.saveSession(entry)
+	return e.saveSession(&entry)
 }
 
 // Remove permanently removes a closed session's owned worktree and branch.
@@ -533,7 +778,9 @@ func (e *Engine) Remove(ctx context.Context, sessionID string, force bool) error
 	if entry.ClosedAt == nil {
 		if _, err := e.runtime.State(entry.ID); err != nil {
 			if _, restoreErr := e.runtime.Restore(entry.ID); restoreErr != nil {
-				return restoreErr
+				if _, createErr := e.runtime.Create(ctx, runtime.CreateRequest{ID: entry.ID, Backend: entry.Backend, Worktree: entry.Worktree.Path}); createErr != nil {
+					return errors.Join(restoreErr, createErr)
+				}
 			}
 		}
 		if err := e.CloseSession(entry.ID); err != nil {
@@ -552,7 +799,7 @@ func (e *Engine) Remove(ctx context.Context, sessionID string, force bool) error
 	if err := os.Remove(e.sessionPath(entry.ID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("durableacp: remove session manifest: %w", err)
 	}
-	return nil
+	return e.runtime.Forget(entry.ID)
 }
 
 // Sessions returns persisted engine sessions, including sessions not currently
@@ -615,7 +862,7 @@ func (e *Engine) Close() error {
 		if e.runtime != nil {
 			joined = errors.Join(joined, e.runtime.Shutdown())
 		}
-		if e.journal != nil {
+		if e.journal != nil && e.journalOwned {
 			joined = errors.Join(joined, e.journal.Close())
 		}
 		for _, closer := range e.closers {
@@ -640,6 +887,7 @@ func (e *Engine) publish(event host.Event) {
 
 func (e *Engine) rollbackStart(ctx context.Context, entry Session) {
 	_ = e.runtime.Close(entry.ID)
+	_ = e.runtime.Forget(entry.ID)
 	_ = os.Remove(e.sessionPath(entry.ID))
 	if entry.WorkspaceMode == WorkspaceManaged {
 		_ = e.worktrees.Remove(ctx, entry.Worktree, worktree.RemoveOptions{Force: true})
@@ -650,7 +898,39 @@ func (e *Engine) sessionPath(id string) string {
 	return filepath.Join(e.home, "sessions", safeFileName(id)+".json")
 }
 
-func (e *Engine) saveSession(entry Session) error {
+func (e *Engine) inspectExistingWorkspace(ctx context.Context, id, path string) (worktree.Session, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return worktree.Session{}, errors.New("durableacp: existing workspace is required")
+	}
+	if !filepath.IsAbs(path) {
+		return worktree.Session{}, errors.New("durableacp: existing workspace must be absolute")
+	}
+	path = filepath.Clean(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return worktree.Session{}, fmt.Errorf("durableacp: inspect existing workspace: %w", err)
+	}
+	if !info.IsDir() {
+		return worktree.Session{}, fmt.Errorf("durableacp: existing workspace %q is not a directory", path)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
+		path = resolved
+	}
+	workspace, inspectErr := e.worktrees.Inspect(ctx, path)
+	if inspectErr != nil {
+		workspace = worktree.Session{Path: path}
+	}
+	workspace.ID = id
+	workspace.Source = path
+	return workspace, nil
+}
+
+func (e *Engine) saveSession(entry *Session) error {
+	if entry == nil {
+		return errors.New("durableacp: nil session manifest")
+	}
+	entry.UpdatedAt = time.Now().UTC()
 	raw, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("durableacp: encode session manifest: %w", err)
@@ -675,7 +955,70 @@ func (e *Engine) loadSession(id string) (Session, error) {
 	if entry.ID == "" {
 		return Session{}, errors.New("durableacp: invalid session manifest")
 	}
+	if entry.UpdatedAt.IsZero() {
+		entry.UpdatedAt = entry.CreatedAt
+	}
+	entry.Configuration = normalizeConfiguration(entry.Configuration)
+	entry.Ext = cloneRawMessage(entry.Ext)
 	return entry, nil
+}
+
+func (e *Engine) updateConfigurationFromTurn(sessionID string, request host.SendTurnRequest) error {
+	configuration := Configuration{Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode}
+	if normalizeConfiguration(configuration) == (Configuration{}) {
+		return nil
+	}
+	return e.updateSession(sessionID, func(entry *Session) {
+		mergeConfiguration(&entry.Configuration, configuration)
+	})
+}
+
+func (e *Engine) recordTurnSubmission(submission runtime.TurnSubmission) {
+	_ = e.updateSession(submission.SessionID, func(entry *Session) {
+		entry.BackendSession = submission.Session
+	})
+}
+
+func (e *Engine) updateSession(sessionID string, update func(*Session)) error {
+	e.manifestMu.Lock()
+	defer e.manifestMu.Unlock()
+	entry, err := e.loadSession(sessionID)
+	if err != nil {
+		return err
+	}
+	if update != nil {
+		update(&entry)
+	}
+	return e.saveSession(&entry)
+}
+
+func configurationFromStart(request StartRequest) Configuration {
+	return normalizeConfiguration(Configuration{Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode})
+}
+
+func normalizeConfiguration(configuration Configuration) Configuration {
+	configuration.Model = strings.TrimSpace(configuration.Model)
+	configuration.Reasoning = strings.TrimSpace(configuration.Reasoning)
+	configuration.PermissionMode = strings.TrimSpace(configuration.PermissionMode)
+	return configuration
+}
+
+func mergeConfiguration(target *Configuration, update Configuration) {
+	update = normalizeConfiguration(update)
+	if update.Model != "" {
+		target.Model = update.Model
+	}
+	if update.Reasoning != "" {
+		target.Reasoning = update.Reasoning
+	}
+	if update.PermissionMode != "" {
+		target.PermissionMode = update.PermissionMode
+	}
+	*target = normalizeConfiguration(*target)
+}
+
+func cloneRawMessage(raw json.RawMessage) json.RawMessage {
+	return append(json.RawMessage(nil), raw...)
 }
 
 func loadSettings(home string) (Settings, error) {

@@ -82,7 +82,7 @@ if err := engine.CloseSession(session.ID); err != nil { /* handle */ }
 if err := engine.Remove(ctx, session.ID, false); err != nil { /* handle */ }
 ```
 
-For a host-managed workspace, set `WorkspaceMode: durableacp.WorkspaceExisting` and `Worktree` to an existing Git directory. Durable ACP inspects it but never deletes it. Managed worktrees can be checked and repaired after an interrupted process with `engine.Repair(ctx, sessionID)`; `engine.Prune(ctx, source)` only clears stale Git registrations.
+For a host-managed workspace, set `WorkspaceMode: durableacp.WorkspaceExisting` and `Worktree` to an existing directory. Durable ACP records Git metadata when available and never deletes it. Managed worktrees can be checked and repaired after an interrupted process with `engine.Repair(ctx, sessionID)`; `engine.Prune(ctx, source)` only clears stale Git registrations.
 
 ### State layout
 
@@ -99,6 +99,8 @@ For a host-managed workspace, set `WorkspaceMode: durableacp.WorkspaceExisting` 
 | `cache/model-catalog.json` | Best-effort provider model/mode catalog cache |
 
 The default managed branch prefix is `durable-acp`; set `durableacp.WithBranchPrefix("my-agent")` when opening an engine to choose another prefix. The setting is persisted with the supplied home.
+
+Hosts with an established journal can pass a caller-owned `journal.Store` with `WithJournalStore`, or select a directory and `journal.Option` values with `WithJournalConfiguration`. The default remains `<home>/journals`; a custom selection does not create that directory. A host that already writes normalized runtime events to the shared store can set `DisableRuntimeJournal` in that configuration to avoid duplicate records. `Engine.Snapshot` combines the manifest, live runtime state, pending interaction, effective model/reasoning/permission configuration, and the selected journal's last sequence.
 
 Lower-level `worktree.Manager.Create` derives its repository directory from the source remote by default. Hosts that already have a stable repository identifier can set `worktree.CreateRequest.RepositoryKey` to keep their existing layout; the value is sanitized and remains under the manager root.
 

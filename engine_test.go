@@ -3,6 +3,7 @@ package durableacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/meloniteai/durable-acp/host"
+	"github.com/meloniteai/durable-acp/journal"
+	"github.com/meloniteai/durable-acp/runtime"
 )
 
 //nolint:govet // Tests use scoped assertions for clearer failure locations.
@@ -70,6 +73,50 @@ func TestEngineManagedSessionLifecycle(t *testing.T) {
 func TestOpenRejectsRelativeHome(t *testing.T) {
 	if _, err := Open(context.Background(), "relative"); err == nil {
 		t.Fatal("Open succeeded with relative home")
+	}
+}
+
+func TestOpenJournalOptions(t *testing.T) {
+	storeHome := t.TempDir()
+	store, err := journal.NewStore(filepath.Join(storeHome, "history"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := Open(context.Background(), storeHome, WithJournalStore(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine.Journal() != store {
+		t.Fatal("Engine did not use supplied journal store")
+	}
+	if closeErr := engine.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if _, appendErr := store.Append(journal.Record{SessionID: "supplied", Event: "host.event"}); appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	if closeErr := store.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	configuredHome := t.TempDir()
+	configuredDirectory := filepath.Join(t.TempDir(), "events")
+	configured, err := Open(context.Background(), configuredHome, WithJournalConfiguration(JournalConfiguration{
+		Directory: configuredDirectory,
+		Options:   []journal.Option{journal.WithSchemaID("host.events.v1")},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := configured.Append("configured", "host.event", nil, nil)
+	if err != nil || record.Schema != "host.events.v1" {
+		t.Fatalf("configured journal record = %#v, %v", record, err)
+	}
+	if _, err := os.Stat(filepath.Join(configuredHome, "journals")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("configured Engine created default journal directory: %v", err)
+	}
+	if err := configured.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -256,6 +303,89 @@ func TestEngineQueueControlAndRestartFacades(t *testing.T) {
 	}
 }
 
+func TestEngineHostJournalManifestAndSnapshot(t *testing.T) {
+	home := t.TempDir()
+	store, err := journal.NewStore(filepath.Join(home, "conversations"), journal.WithSchemaID("host.events.v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &advancedEngineAdapter{}
+	engine, err := Open(
+		context.Background(), home,
+		WithAdapters(adapter),
+		WithJournalConfiguration(JournalConfiguration{Store: store, DisableRuntimeJournal: true}),
+		WithRuntimeConfiguration(runtime.Config{MaxQueuedTurns: 3, DisableCoalescing: true}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ext := json.RawMessage(`{"example":{"workflow":"loop"}}`)
+	created, err := engine.Start(context.Background(), StartRequest{
+		ID: "host-state", Backend: "advanced", WorkspaceMode: WorkspaceExisting, Worktree: engineRepo(t),
+		Model: "model-a", Reasoning: "high", PermissionMode: "approve", Ext: ext,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UpdatedAt.Before(created.CreatedAt) || created.Configuration.Model != "model-a" || string(created.Ext) != string(ext) {
+		t.Fatalf("manifest = %#v", created)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "journals")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("default journal directory exists: %v", statErr)
+	}
+	if _, appendErr := engine.Append(created.ID, "example.annotation", map[string]any{"value": true}, nil); appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	if _, sendErr := engine.Send(context.Background(), host.SendTurnRequest{SessionID: created.ID, Prompt: "active", Model: "model-b"}); sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	if blockErr := engine.BlockDispatch(created.ID); blockErr != nil {
+		t.Fatal(blockErr)
+	}
+	if _, sendErr := engine.Send(context.Background(), host.SendTurnRequest{SessionID: created.ID, Prompt: "queued"}); sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	adapter.emit(host.Event{
+		Type: host.EventInteractionRequested, BackendTurnID: "turn",
+		Interaction: &host.InteractionRequest{ID: "choice", Kind: host.InteractionChoice, Options: []host.InteractionOption{{ID: "one"}}},
+	})
+	snapshot, err := engine.Snapshot(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Lifecycle.Status != "waiting_input" || !snapshot.ActiveTurn.Active || snapshot.ActiveTurn.ID != "turn" {
+		t.Fatalf("lifecycle and turn = %#v %#v", snapshot.Lifecycle, snapshot.ActiveTurn)
+	}
+	if snapshot.Workspace.Mode != WorkspaceExisting || snapshot.Backend.Session.ID != "advanced-provider" {
+		t.Fatalf("workspace and backend = %#v %#v", snapshot.Workspace, snapshot.Backend)
+	}
+	if snapshot.Queue.Depth != 1 || !snapshot.Queue.DispatchBlocked || len(snapshot.Queue.Entries) != 1 {
+		t.Fatalf("queue = %#v", snapshot.Queue)
+	}
+	if snapshot.PendingInteraction == nil || snapshot.PendingInteraction.ID != "choice" {
+		t.Fatalf("pending interaction = %#v", snapshot.PendingInteraction)
+	}
+	if snapshot.Configuration.Model != "model-b" || snapshot.Configuration.Reasoning != "high" || snapshot.LastJournalSequence != 1 || string(snapshot.Ext) != string(ext) {
+		t.Fatalf("configuration and host data = %#v", snapshot)
+	}
+	if respondErr := engine.RespondInteraction(context.Background(), created.ID, host.InteractionResponse{RequestID: "choice", Action: "submit"}); respondErr != nil {
+		t.Fatal(respondErr)
+	}
+	resolved, err := engine.Snapshot(created.ID)
+	if err != nil || resolved.PendingInteraction != nil {
+		t.Fatalf("resolved interaction snapshot = %#v, %v", resolved.PendingInteraction, err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if record, err := store.Append(journal.Record{SessionID: created.ID, Event: "example.after_close"}); err != nil || record.Sequence != 2 {
+		t.Fatalf("caller-owned store after Engine close = %#v, %v", record, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEngineValidationConfigurationAndHelpers(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -403,6 +533,12 @@ func TestEngineRepairPruneRollbackAndNilGuards(t *testing.T) {
 	}
 	if _, err := (*Engine)(nil).SendNext(context.Background(), host.SendTurnRequest{}); err == nil {
 		t.Fatal("nil Engine prepended a turn")
+	}
+	if _, err := (*Engine)(nil).Snapshot("s"); err == nil {
+		t.Fatal("nil Engine returned a snapshot")
+	}
+	if err := (*Engine)(nil).SetConfiguration("s", Configuration{}); err == nil {
+		t.Fatal("nil Engine set configuration")
 	}
 	if _, err := (*Engine)(nil).QueueEntries("s"); err == nil {
 		t.Fatal("nil Engine listed queued turns")
