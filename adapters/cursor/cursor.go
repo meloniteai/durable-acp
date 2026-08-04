@@ -28,7 +28,7 @@ func New(options ...acpx.Option) *Adapter {
 		LegacyExtensions:        true,
 		BestEffortConfiguration: true,
 		SessionModeValues:       []string{"agent", "plan", "ask"},
-		DoneCompletionGrace:     75 * time.Millisecond,
+		DoneCompletionGrace:     325 * time.Millisecond,
 		CompleteOnDone:          true,
 		ModelInPrompt:           true,
 	}, options...)}
