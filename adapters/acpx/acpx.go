@@ -1066,6 +1066,9 @@ func (s *managedSession) emitEvent(event host.Event) {
 	if s.emit == nil {
 		return
 	}
+	if providerEventID := eventProviderID(event.Data); providerEventID != "" {
+		event.Data["provider_event_id"] = providerEventID
+	}
 	event.Backend = s.adapter.Backend()
 	if event.BackendTurnID == "" {
 		event.BackendTurnID = s.currentTurnID()
@@ -1078,6 +1081,17 @@ func (s *managedSession) emitEvent(event host.Event) {
 	}
 	s.markReplay(&event)
 	s.emit(event)
+}
+
+func eventProviderID(data map[string]any) string {
+	for _, source := range []map[string]any{data, mapValue(data, "item"), mapValue(data, "update"), mapValue(mapValue(data, "update"), "plan")} {
+		for _, field := range []string{"provider_event_id", "messageId", "message_id", "planId", "plan_id", "itemId", "item_id", "id"} {
+			if value := stringValue(source, field); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func (s *managedSession) beginReplay() {
@@ -1102,9 +1116,9 @@ func (s *managedSession) markReplay(event *host.Event) {
 	if event.Local == nil {
 		event.Local = map[string]any{}
 	}
-	event.Local["acpx.replay"] = true
+	event.Local[host.EventLocalReplay] = true
 	if s.replayFirst {
-		event.Local["acpx.replay_start"] = true
+		event.Local[host.EventLocalReplayStart] = true
 		s.replayFirst = false
 	}
 }

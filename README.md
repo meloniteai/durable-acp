@@ -71,6 +71,27 @@ func main() {
 }
 ```
 
+`Send` starts immediately when the session is idle and otherwise appends to
+its bounded queue. `SendNext` prepends urgent follow-up work. Queue entries are
+opaque requests with stable IDs and can be inspected, replaced, or removed:
+
+```go
+snapshot, err := engine.Snapshot(session.ID)
+if err != nil {
+	log.Fatal(err)
+}
+for _, queued := range snapshot.Queue.Entries {
+	log.Printf("queued %s: %s", queued.ID, queued.Request.Prompt)
+}
+
+_, err = engine.RemoveQueuedTurn(session.ID, "queue-entry-id")
+```
+
+`Interrupt` cancels the active turn and clears its queue. Use
+`InterruptActive` when queued work must remain. `Restart` only restarts an idle
+provider process and preserves the durable session, configuration, queue, and
+history.
+
 The first `Start` above creates a managed Git worktree and an owned branch. No Git state is removed on `Engine.Close`; reopening the same directory and calling `Resume(ctx, session.ID)` reconnects to the provider session. An application chooses when a session is truly done:
 
 ```go
@@ -102,7 +123,13 @@ The default managed branch prefix is `durable-acp`; set `durableacp.WithBranchPr
 
 Hosts with an established journal can pass a caller-owned `journal.Store` with `WithJournalStore`, or select a directory and `journal.Option` values with `WithJournalConfiguration`. The default remains `<home>/journals`; a custom selection does not create that directory. A host that already writes normalized runtime events to the shared store can set `DisableRuntimeJournal` in that configuration to avoid duplicate records. `Engine.Snapshot` combines the manifest, live runtime state, pending interaction, effective model/reasoning/permission configuration, and the selected journal's last sequence.
 
-Journal reads use durable sequence cursors. `ReadAfter(sessionID, sequence)` returns the incremental suffix, `Read(sessionID, after, through)` adds an inclusive upper bound, and `Tail(sessionID, limit)` returns recent records in sequence order. Runtime persistence remains semantic by default: thinking, tool, and trace events stay live-only, while stored records retain the source event ID supplied by the host runtime.
+Engine history reads use durable sequence cursors. `HistoryAfter(sessionID,
+sequence)` returns the incremental suffix, `History(sessionID, after, through)`
+adds an inclusive upper bound, and `HistoryTail(sessionID, limit)` returns
+recent records in sequence order. The same operations remain available on the
+raw journal returned by `Journal`. Runtime persistence remains semantic by
+default: thinking, tool, and trace events stay live-only, while stored records
+retain the source event ID supplied by the host runtime.
 
 Lower-level `worktree.Manager.Create` derives its repository directory from the source remote by default. Hosts that already have a stable repository identifier can set `worktree.CreateRequest.RepositoryKey` to keep their existing layout; the value is sanitized and remains under the manager root.
 
@@ -128,7 +155,27 @@ _, err := engine.Append(session.ID, "example.review_requested", map[string]any{
 }, nil)
 ```
 
-The runtime is available for advanced UI startup work: `engine.Runtime().Detect(ctx)` reports native executable availability, and `engine.Runtime().Catalog(ctx, true)` refreshes provider models, modes, and reasoning choices. Most applications should otherwise use the Engine methods above.
+`engine.Detect(ctx)` reports native executable availability without launching
+providers. `engine.Catalog(ctx, false)` returns cached models, modes, reasoning
+choices, and commands; `engine.RefreshCatalog(ctx)` probes every backend and
+reports pass, skip, or fail.
+
+### Unsupported operations and fallbacks
+
+Optional adapter operations return errors matching
+`durableacp.ErrUnsupportedOperation`. The error is stable for `errors.Is`; its
+message includes the backend and operation. Capability discovery is deliberately
+not required.
+
+- If `Restart` is unsupported, keep using the current provider session or close
+  the application and reopen the Engine, then call `Resume`.
+- If `ForkPrompt` is unsupported, send the prompt to the current session or
+  start a separate Engine session explicitly.
+- If an interaction cannot be answered, call `InterruptActive`; do not assume
+  approval or synthesize a provider-specific response.
+
+Catalog discovery is the simple exception: providers without it are reported
+as `skip` by `RefreshCatalog`, and hosts can retain their static defaults.
 
 ### Native providers and customization
 

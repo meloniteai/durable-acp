@@ -166,7 +166,7 @@ func streamSourceID(sessionID, turnID string, index int) string {
 	if turnID == "" {
 		turnID = "-"
 	}
-	return fmt.Sprintf("%s:turn:%s:message:%d", sessionID, turnID, index)
+	return fmt.Sprintf("%s:turn:%s:msg:%d", sessionID, turnID, index)
 }
 
 func streamData(event host.Event) map[string]any {

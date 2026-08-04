@@ -555,9 +555,10 @@ func TestManagedSessionElicitationAndUpdates(t *testing.T) {
 	category := acp.SessionConfigOptionCategory("model")
 	choices := acp.SessionConfigSelectOptionsUngrouped{{Value: "model", Name: "Model"}}
 	option := acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{Id: "model", Category: &category, Options: acp.SessionConfigSelectOptions{Ungrouped: &choices}}}
+	messageID := acp.MessageId("message-1")
 	updates := []acp.SessionUpdate{
 		{UserMessageChunk: &acp.SessionUpdateUserMessageChunk{Content: content}},
-		{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{Content: content}},
+		{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{Content: content, MessageId: &messageID}},
 		{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{Content: content}},
 		{ToolCall: &acp.SessionUpdateToolCall{ToolCallId: "tool", Title: "run", Kind: kind, Status: status, Content: toolContent}},
 		{ToolCallUpdate: &acp.SessionToolCallUpdate{ToolCallId: "tool", Title: &title, Kind: &kind, Status: &status, Content: toolContent}},
@@ -574,6 +575,9 @@ func TestManagedSessionElicitationAndUpdates(t *testing.T) {
 	for len(events) > 0 {
 		event := <-events
 		seen[event.Type] = true
+		if event.Type == host.EventMessage && event.Role == "assistant" && event.Data["provider_event_id"] != string(messageID) {
+			t.Fatalf("provider event id = %#v", event.Data)
+		}
 		if event.Type == host.EventToolStarted {
 			if images, _ := event.Data["images"].([]map[string]any); len(images) != 1 || images[0]["data_base64"] != "image-data" {
 				t.Fatalf("tool images = %#v", event.Data)

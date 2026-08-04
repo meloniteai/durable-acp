@@ -141,9 +141,19 @@ type managedSession struct {
 	activeTurnID       string
 	dispatchBlocked    bool
 	pendingInteraction *host.InteractionRequest
+	replay             *journal.ReplayMatcher
 	nextQueueSeq       int
 	nextSeq            int
 	coalescer          *deltaCoalescer
+	queueEmitted       bool
+	lastQueue          queueView
+}
+
+type queueView struct {
+	depth           int
+	active          bool
+	activeTurnID    string
+	dispatchBlocked bool
 }
 
 type configurationEventVersions struct {
@@ -429,6 +439,21 @@ func (r *Runtime) ReconcileTurn(sessionID string, event host.Event) error {
 	return nil
 }
 
+func (r *Runtime) SetReplayHistory(sessionID string, records []journal.Record) error {
+	if r == nil {
+		return errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	managed := r.sessions[id]
+	if managed == nil {
+		return &SessionNotFoundError{SessionID: id}
+	}
+	managed.replay = journal.NewReplayMatcher(records)
+	return nil
+}
+
 // RespondInteraction sends a normalized user response to the session adapter.
 func (r *Runtime) RespondInteraction(ctx context.Context, sessionID string, response host.InteractionResponse) error {
 	if r == nil {
@@ -439,6 +464,7 @@ func (r *Runtime) RespondInteraction(ctx context.Context, sessionID string, resp
 	}
 	r.mu.Lock()
 	managed, adapter, err := r.adapterLocked(strings.TrimSpace(sessionID))
+	pending := err == nil && managed.pendingInteraction != nil && managed.pendingInteraction.ID == response.RequestID
 	if err == nil && managed.session.Status == session.StatusWaitingInput {
 		_ = managed.session.Transition(session.StatusRunning)
 	}
@@ -452,12 +478,21 @@ func (r *Runtime) RespondInteraction(ctx context.Context, sessionID string, resp
 		allow := response.Action == "approve" || response.Action == "allow"
 		err = responder.RespondPermission(ctx, sessionID, response.RequestID, allow, response.Message, "")
 	} else {
-		return fmt.Errorf("runtime: backend %q does not support interaction responses", adapter.Backend())
+		return &UnsupportedOperationError{Backend: string(adapter.Backend()), Operation: "interaction responses"}
 	}
 	if err != nil {
 		return err
 	}
-	r.deliver(strings.TrimSpace(sessionID), host.Event{Type: host.EventInteractionResolved, InteractionResponse: &response}) //nolint:contextcheck // Event delivery may outlive the request callback.
+	if !pending {
+		return nil
+	}
+	r.mu.Lock()
+	managed = r.sessions[strings.TrimSpace(sessionID)]
+	resolved := managed == nil || managed.pendingInteraction == nil || managed.pendingInteraction.ID != response.RequestID
+	r.mu.Unlock()
+	if !resolved {
+		r.deliver(strings.TrimSpace(sessionID), host.Event{Type: host.EventInteractionResolved, InteractionResponse: &response}) //nolint:contextcheck // Event delivery may outlive the request callback.
+	}
 	return nil
 }
 
@@ -480,7 +515,7 @@ func (r *Runtime) ForkPrompt(ctx context.Context, request host.ForkPromptRequest
 	}
 	forker, ok := adapter.(host.SessionForker)
 	if !ok {
-		return host.ForkPromptResponse{}, fmt.Errorf("runtime: backend %q does not support session forks", adapter.Backend())
+		return host.ForkPromptResponse{}, &UnsupportedOperationError{Backend: string(adapter.Backend()), Operation: "session forks"}
 	}
 	request.SessionID = id
 	return forker.ForkPrompt(ctx, request)
@@ -1084,10 +1119,12 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 		return
 	}
 	dispatchNext := false
+	queueChanged := false
 	//exhaustive:ignore Provider-specific events are forwarded without runtime state changes.
 	switch event.Type {
 	case host.EventTurnStarted:
 		if event.BackendTurnID != "" {
+			queueChanged = true
 			managed.dispatching = false
 			managed.active = true
 			managed.activeTurnID = event.BackendTurnID
@@ -1107,6 +1144,7 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 	case host.EventTurnComplete, host.EventTurnFailed, host.EventProcessExited:
 		terminalMatches := event.Type == host.EventProcessExited || event.BackendTurnID == "" || managed.activeTurnID == "" || event.BackendTurnID == managed.activeTurnID
 		if terminalMatches {
+			queueChanged = true
 			managed.dispatching = false
 			managed.active = false
 			managed.activeTurnID = ""
@@ -1118,9 +1156,24 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 		}
 	default:
 	}
+	suppressReplay := false
+	if event.Local[host.EventLocalReplay] == true && managed.replay != nil {
+		if event.Local[host.EventLocalReplayStart] == true {
+			managed.replay.Reset()
+		}
+		if record, ok := journal.Translate(event); ok {
+			suppressReplay = managed.replay.Match(record)
+			if !suppressReplay {
+				managed.replay.Record(record)
+			}
+		}
+	}
 	emit := r.emit
 	store := r.journal
 	r.mu.Unlock()
+	if suppressReplay {
+		return
+	}
 
 	if store != nil {
 		if record, ok := journal.Translate(event); ok {
@@ -1139,7 +1192,7 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 		// before that lock is released and deadlock a real ACP subprocess.
 		go r.dispatchQueued(sessionID)
 	}
-	if event.Type != host.EventQueueUpdated {
+	if queueChanged {
 		r.emitQueue(sessionID)
 	}
 }
@@ -1173,15 +1226,25 @@ func (r *Runtime) emitQueue(sessionID string) {
 		r.mu.Unlock()
 		return
 	}
+	view := queueView{
+		depth: len(managed.queue), active: managed.active, activeTurnID: managed.activeTurnID,
+		dispatchBlocked: managed.dispatchBlocked,
+	}
+	if managed.queueEmitted && managed.lastQueue == view {
+		r.mu.Unlock()
+		return
+	}
+	managed.queueEmitted = true
+	managed.lastQueue = view
 	event := host.Event{
 		SessionID: sessionID,
 		Backend:   managed.session.Backend,
 		Type:      host.EventQueueUpdated,
 		Data: map[string]any{
-			"queue_depth":      len(managed.queue),
-			"active":           managed.active,
-			"active_turn_id":   managed.activeTurnID,
-			"dispatch_blocked": managed.dispatchBlocked,
+			"queue_depth":      view.depth,
+			"active":           view.active,
+			"active_turn_id":   view.activeTurnID,
+			"dispatch_blocked": view.dispatchBlocked,
 			"max_depth":        r.maxQueuedTurns,
 		},
 	}
@@ -1245,7 +1308,30 @@ func (r *Runtime) failSubmission(sessionID, queueEntryID string, err error) {
 }
 
 func (r *Runtime) interruptActive(ctx context.Context, sessionID string, adapter host.Adapter) error {
-	return adapter.Interrupt(ctx, sessionID, r.sessionSink(sessionID)) //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
+	r.mu.Lock()
+	managed := r.sessions[sessionID]
+	turnID := ""
+	backendSession := host.BackendSession{}
+	if managed != nil {
+		turnID = managed.activeTurnID
+		backendSession = managed.session.BackendSession
+	}
+	r.mu.Unlock()
+	if err := adapter.Interrupt(ctx, sessionID, r.sessionSink(sessionID)); err != nil { //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
+		return err
+	}
+	r.mu.Lock()
+	managed = r.sessions[sessionID]
+	needsTerminal := managed != nil && managed.active && managed.activeTurnID == turnID
+	r.mu.Unlock()
+	if needsTerminal {
+		r.deliver(sessionID, host.Event{ //nolint:contextcheck // Event delivery may outlive the interrupt callback.
+			Type: host.EventTurnFailed, Message: string(adapter.Backend()) + " turn interrupted",
+			BackendSessionID: backendSession.ID, BackendThreadID: backendSession.ThreadID, BackendTurnID: turnID,
+			Data: map[string]any{"session_id": backendSession.ID, "turn_id": turnID, "interrupted": true, "source": "runtime_interrupt_fallback"},
+		})
+	}
+	return nil
 }
 
 func (r *Runtime) appendLifecycle(sessionID, name string, data map[string]any) error {

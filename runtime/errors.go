@@ -1,6 +1,24 @@
 package runtime
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrUnsupportedOperation = errors.New("runtime: unsupported operation")
+
+type UnsupportedOperationError struct {
+	Backend   string
+	Operation string
+}
+
+func (e *UnsupportedOperationError) Error() string {
+	return fmt.Sprintf("runtime: backend %q does not support %s", e.Backend, e.Operation)
+}
+
+func (e *UnsupportedOperationError) Unwrap() error {
+	return ErrUnsupportedOperation
+}
 
 type SessionNotFoundError struct {
 	SessionID string
@@ -63,4 +81,8 @@ type RestartUnsupportedError struct {
 
 func (e *RestartUnsupportedError) Error() string {
 	return fmt.Sprintf("runtime: backend %q does not support session restart", e.Backend)
+}
+
+func (e *RestartUnsupportedError) Unwrap() error {
+	return ErrUnsupportedOperation
 }

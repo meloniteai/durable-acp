@@ -74,10 +74,22 @@ func TestDeltaCoalescerHelpers(t *testing.T) {
 	if isAssistantSnapshot(host.Event{Type: host.EventThinking, Role: "user"}) {
 		t.Fatal("user snapshot recognized")
 	}
-	if got := streamSourceID("s", "", 2); got != "s:turn:-:message:2" {
+	if got := streamSourceID("s", "", 2); got != "s:turn:-:msg:2" {
 		t.Fatalf("stream ID = %q", got)
 	}
 	if got := streamData(host.Event{}); got["streaming"] != true || len(got) != 1 {
 		t.Fatalf("stream data = %#v", got)
+	}
+}
+
+func TestDeltaCoalescerPreservesBlankLines(t *testing.T) {
+	chunks := []string{"**What's actually broken**", "\n\n", "| Layer | Bug |"}
+	coalescer := newDeltaCoalescer(time.Hour, func(host.Event) {})
+	for _, chunk := range chunks {
+		coalescer.Handle(host.Event{Type: host.EventMessage, Message: chunk, BackendTurnID: "t1", Data: map[string]any{"delta": chunk}})
+	}
+	want := "**What's actually broken**\n\n| Layer | Bug |"
+	if coalescer.pending == nil || coalescer.pending.Message != want {
+		t.Fatalf("coalesced message = %#v, want %q", coalescer.pending, want)
 	}
 }

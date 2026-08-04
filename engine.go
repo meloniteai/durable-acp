@@ -167,6 +167,18 @@ type StartRequest struct {
 
 type Configuration = host.SessionConfiguration
 
+type SendResult = runtime.SendResult
+
+type QueueEntry = runtime.QueueEntry
+
+type RemoveQueuedTurnResult = runtime.RemoveQueuedTurnResult
+
+type CatalogResult = runtime.CatalogResult
+
+var ErrUnsupportedOperation = runtime.ErrUnsupportedOperation
+
+type UnsupportedOperationError = runtime.UnsupportedOperationError
+
 // Session is the durable Engine-level record for a runtime session.
 type Session struct {
 	ID             string              `json:"id"`
@@ -394,6 +406,41 @@ func (e *Engine) Subscribe(listener host.EventSink) func() {
 	}
 }
 
+// Detect reports adapter availability without starting provider processes.
+func (e *Engine) Detect(ctx context.Context) []host.BackendStatus {
+	if e == nil || e.runtime == nil {
+		return nil
+	}
+	return e.runtime.Detect(ctx)
+}
+
+// Catalog returns the current provider catalog. When refresh is true, adapters
+// are probed before the snapshot is returned.
+func (e *Engine) Catalog(ctx context.Context, refresh bool) map[host.Backend]host.BackendCatalog {
+	if e == nil || e.runtime == nil {
+		return map[host.Backend]host.BackendCatalog{}
+	}
+	return e.runtime.Catalog(ctx, refresh)
+}
+
+// RefreshCatalog probes every adapter and reports pass, skip, or fail for each
+// backend. Unsupported catalog discovery is a skip, not an Engine error.
+func (e *Engine) RefreshCatalog(ctx context.Context) []CatalogResult {
+	if e == nil || e.runtime == nil {
+		return nil
+	}
+	return e.runtime.RefreshCatalog(ctx)
+}
+
+// SetCatalog replaces one cached catalog entry. It is intended for hosts that
+// learn session-scoped commands from provider events.
+func (e *Engine) SetCatalog(backend host.Backend, catalog host.BackendCatalog) {
+	if e == nil || e.runtime == nil {
+		return
+	}
+	e.runtime.SetCatalog(backend, catalog)
+}
+
 // Start creates a durable session and starts its provider adapter.
 func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, error) {
 	if e == nil || e.runtime == nil {
@@ -455,6 +502,12 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 		e.rollbackStart(ctx, entry)
 		return Session{}, err
 	}
+	if strings.TrimSpace(request.ResumeBackendSessionID) != "" {
+		if err := e.prepareReplay(entry.ID); err != nil {
+			e.rollbackStart(ctx, entry)
+			return Session{}, err
+		}
+	}
 	backendSession, err := e.runtime.Start(ctx, host.StartSessionRequest{
 		SessionID:              id,
 		Prompt:                 request.Prompt,
@@ -510,6 +563,9 @@ func (e *Engine) resumeStart(ctx context.Context, request StartRequest) (Session
 	resumeBackendSessionID := strings.TrimSpace(request.ResumeBackendSessionID)
 	if resumeBackendSessionID == "" {
 		resumeBackendSessionID = entry.BackendSession.ID
+	}
+	if replayErr := e.prepareReplay(entry.ID); replayErr != nil {
+		return Session{}, replayErr
 	}
 	state, err := e.runtime.Start(ctx, host.StartSessionRequest{
 		SessionID:              entry.ID,
@@ -577,24 +633,24 @@ func (e *Engine) Prune(ctx context.Context, source string) error {
 }
 
 // Send forwards or queues a turn for a started session.
-func (e *Engine) Send(ctx context.Context, request host.SendTurnRequest) (runtime.SendResult, error) {
+func (e *Engine) Send(ctx context.Context, request host.SendTurnRequest) (SendResult, error) {
 	if e == nil || e.runtime == nil {
-		return runtime.SendResult{}, errors.New("durableacp: engine is not open")
+		return SendResult{}, errors.New("durableacp: engine is not open")
 	}
 	result, err := e.runtime.Send(ctx, request)
 	if err != nil {
-		return runtime.SendResult{}, err
+		return SendResult{}, err
 	}
 	return result, nil
 }
 
-func (e *Engine) SendNext(ctx context.Context, request host.SendTurnRequest) (runtime.SendResult, error) {
+func (e *Engine) SendNext(ctx context.Context, request host.SendTurnRequest) (SendResult, error) {
 	if e == nil || e.runtime == nil {
-		return runtime.SendResult{}, errors.New("durableacp: engine is not open")
+		return SendResult{}, errors.New("durableacp: engine is not open")
 	}
 	result, err := e.runtime.SendNext(ctx, request)
 	if err != nil {
-		return runtime.SendResult{}, err
+		return SendResult{}, err
 	}
 	return result, nil
 }
@@ -665,23 +721,23 @@ func (e *Engine) Snapshot(sessionID string) (Snapshot, error) {
 	return snapshot, nil
 }
 
-func (e *Engine) QueueEntries(sessionID string) ([]runtime.QueueEntry, error) {
+func (e *Engine) QueueEntries(sessionID string) ([]QueueEntry, error) {
 	if e == nil || e.runtime == nil {
 		return nil, errors.New("durableacp: engine is not open")
 	}
 	return e.runtime.QueueEntries(sessionID)
 }
 
-func (e *Engine) RemoveQueuedTurn(sessionID, entryID string) (runtime.RemoveQueuedTurnResult, error) {
+func (e *Engine) RemoveQueuedTurn(sessionID, entryID string) (RemoveQueuedTurnResult, error) {
 	if e == nil || e.runtime == nil {
-		return runtime.RemoveQueuedTurnResult{}, errors.New("durableacp: engine is not open")
+		return RemoveQueuedTurnResult{}, errors.New("durableacp: engine is not open")
 	}
 	return e.runtime.RemoveQueuedTurn(sessionID, entryID)
 }
 
-func (e *Engine) ReplaceQueuedTurn(sessionID, entryID string, request host.SendTurnRequest) (runtime.QueueEntry, error) {
+func (e *Engine) ReplaceQueuedTurn(sessionID, entryID string, request host.SendTurnRequest) (QueueEntry, error) {
 	if e == nil || e.runtime == nil {
-		return runtime.QueueEntry{}, errors.New("durableacp: engine is not open")
+		return QueueEntry{}, errors.New("durableacp: engine is not open")
 	}
 	return e.runtime.ReplaceQueuedTurn(sessionID, entryID, request)
 }
@@ -732,6 +788,15 @@ func (e *Engine) InterruptActive(ctx context.Context, sessionID string) error {
 		return errors.New("durableacp: engine is not open")
 	}
 	return e.runtime.InterruptActive(ctx, sessionID)
+}
+
+// ReconcileTurn applies a terminal provider event when an interrupt or process
+// exit did not produce one. Hosts should only use this after checking Snapshot.
+func (e *Engine) ReconcileTurn(sessionID string, event host.Event) error {
+	if e == nil || e.runtime == nil {
+		return errors.New("durableacp: engine is not open")
+	}
+	return e.runtime.ReconcileTurn(sessionID, event)
 }
 
 // RespondInteraction resolves a pending adapter request.
@@ -824,6 +889,48 @@ func (e *Engine) Sessions() ([]Session, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+// History returns records after the exclusive cursor through the inclusive
+// cursor. Zero leaves that side of the range unbounded.
+func (e *Engine) History(sessionID string, after, through uint64) ([]journal.Record, error) {
+	if e == nil || e.journal == nil {
+		return nil, errors.New("durableacp: engine is not open")
+	}
+	return e.journal.Read(sessionID, after, through)
+}
+
+// HistoryAfter returns records after an exclusive durable sequence cursor.
+func (e *Engine) HistoryAfter(sessionID string, sequence uint64) ([]journal.Record, error) {
+	if e == nil || e.journal == nil {
+		return nil, errors.New("durableacp: engine is not open")
+	}
+	return e.journal.ReadAfter(sessionID, sequence)
+}
+
+// HistoryTail returns at most limit recent records in sequence order.
+func (e *Engine) HistoryTail(sessionID string, limit int) ([]journal.Record, error) {
+	if e == nil || e.journal == nil {
+		return nil, errors.New("durableacp: engine is not open")
+	}
+	return e.journal.Tail(sessionID, limit)
+}
+
+// PendingInteraction returns a detached copy of the current request, if any.
+func (e *Engine) PendingInteraction(sessionID string) (*host.InteractionRequest, error) {
+	snapshot, err := e.Snapshot(sessionID)
+	if err != nil || snapshot.PendingInteraction == nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(snapshot.PendingInteraction)
+	if err != nil {
+		return nil, fmt.Errorf("durableacp: clone pending interaction: %w", err)
+	}
+	var interaction host.InteractionRequest
+	if err := json.Unmarshal(raw, &interaction); err != nil {
+		return nil, fmt.Errorf("durableacp: clone pending interaction: %w", err)
+	}
+	return &interaction, nil
 }
 
 // Append adds an opaque extension event to a session journal. Extension names
@@ -972,6 +1079,14 @@ func (e *Engine) recordTurnSubmission(submission runtime.TurnSubmission) {
 			entry.Configuration = state.Configuration
 		}
 	})
+}
+
+func (e *Engine) prepareReplay(sessionID string) error {
+	records, err := e.journal.Read(sessionID, 0, 0)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return e.runtime.SetReplayHistory(sessionID, records)
 }
 
 func (e *Engine) persistRuntimeConfiguration(sessionID string) error {

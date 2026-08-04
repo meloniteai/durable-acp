@@ -208,14 +208,14 @@ func TestEngineExistingWorkspaceFacadesAndEvents(t *testing.T) {
 	if err := engine.Interrupt(context.Background(), created.ID); err != nil || adapter.interrupts != 1 {
 		t.Fatalf("interrupt = %v, calls = %d", err, adapter.interrupts)
 	}
-	seen := false
+	resolved := 0
 	for len(events) > 0 {
 		if (<-events).Type == host.EventInteractionResolved {
-			seen = true
+			resolved++
 		}
 	}
-	if !seen {
-		t.Fatal("interaction resolution was not published")
+	if resolved != 1 {
+		t.Fatalf("interaction resolutions = %d, want 1", resolved)
 	}
 	if err := engine.CloseSession(created.ID); err != nil {
 		t.Fatal(err)
@@ -225,6 +225,27 @@ func TestEngineExistingWorkspaceFacadesAndEvents(t *testing.T) {
 	}
 	if _, err := os.Stat(source); err != nil {
 		t.Fatalf("existing workspace was removed: %v", err)
+	}
+}
+
+func TestEngineUnsupportedOperations(t *testing.T) {
+	engine, err := Open(context.Background(), t.TempDir(), WithAdapters(engineAdapter{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	created, err := engine.Start(context.Background(), StartRequest{ID: "unsupported", Backend: "test", WorkspaceMode: WorkspaceExisting, Worktree: engineRepo(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Restart(context.Background(), created.ID); !errors.Is(err, ErrUnsupportedOperation) {
+		t.Fatalf("Restart error = %T %v", err, err)
+	}
+	if _, err := engine.ForkPrompt(context.Background(), host.ForkPromptRequest{SessionID: created.ID, Prompt: "fork"}); !errors.Is(err, ErrUnsupportedOperation) {
+		t.Fatalf("ForkPrompt error = %T %v", err, err)
+	}
+	if err := engine.RespondInteraction(context.Background(), created.ID, host.InteractionResponse{RequestID: "request", Action: "cancel"}); !errors.Is(err, ErrUnsupportedOperation) {
+		t.Fatalf("RespondInteraction error = %T %v", err, err)
 	}
 }
 
@@ -365,6 +386,15 @@ func TestEngineHostJournalManifestAndSnapshot(t *testing.T) {
 	if snapshot.PendingInteraction == nil || snapshot.PendingInteraction.ID != "choice" {
 		t.Fatalf("pending interaction = %#v", snapshot.PendingInteraction)
 	}
+	pending, err := engine.PendingInteraction(created.ID)
+	if err != nil || pending == nil || pending.ID != "choice" {
+		t.Fatalf("PendingInteraction = %#v, %v", pending, err)
+	}
+	pending.Options[0].ID = "changed"
+	unchanged, err := engine.PendingInteraction(created.ID)
+	if err != nil || unchanged.Options[0].ID != "one" {
+		t.Fatalf("detached interaction = %#v, %v", unchanged, err)
+	}
 	if snapshot.Configuration.Model != "model-b" || snapshot.Configuration.Reasoning != "high" || snapshot.LastJournalSequence != 1 || string(snapshot.Ext) != string(ext) {
 		t.Fatalf("configuration and host data = %#v", snapshot)
 	}
@@ -388,6 +418,23 @@ func TestEngineHostJournalManifestAndSnapshot(t *testing.T) {
 	persisted, err := engine.loadSession(created.ID)
 	if err != nil || persisted.Configuration != configured.Configuration {
 		t.Fatalf("persisted provider configuration = %#v, %v", persisted.Configuration, err)
+	}
+	records, err := engine.History(created.ID, 0, 0)
+	if err != nil || len(records) != 1 || records[0].Event != "example.annotation" {
+		t.Fatalf("History = %#v, %v", records, err)
+	}
+	if records, err = engine.HistoryAfter(created.ID, records[0].Sequence); err != nil || len(records) != 0 {
+		t.Fatalf("HistoryAfter = %#v, %v", records, err)
+	}
+	if records, err = engine.HistoryTail(created.ID, 1); err != nil || len(records) != 1 {
+		t.Fatalf("HistoryTail = %#v, %v", records, err)
+	}
+	engine.SetCatalog("advanced", host.BackendCatalog{Models: []host.BackendModel{{ID: "model"}}})
+	if catalog := engine.Catalog(context.Background(), false); len(catalog["advanced"].Models) != 1 {
+		t.Fatalf("Catalog = %#v", catalog)
+	}
+	if len(engine.Detect(context.Background())) == 0 {
+		t.Fatal("Detect returned no adapters")
 	}
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
@@ -800,6 +847,9 @@ func (*advancedEngineAdapter) CloseSession(string) error { return nil }
 
 func (a *advancedEngineAdapter) RespondInteraction(_ context.Context, _ string, response host.InteractionResponse) error {
 	a.answer = response
+	if a.sink != nil {
+		a.sink(host.Event{Type: host.EventInteractionResolved, InteractionResponse: &response})
+	}
 	return nil
 }
 
