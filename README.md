@@ -1,20 +1,34 @@
 # durable-acp
 
-`durable-acp` is an embeddable, durable multi-agent runtime for the [Agent Client Protocol](https://agentclientprotocol.com/). Give it an absolute state directory and a repository; it manages sessions, journals, native ACP providers, turn queues, and optional Git worktrees. A desktop app or TUI only needs to render its events and call its SDK methods.
+`durable-acp` is a small, batteries-included Go backend for hosting
+[Agent Client Protocol](https://agentclientprotocol.com/) agents. Embed one
+`Engine` in an application and it manages provider processes, durable sessions,
+bounded turn queues, normalized events, journals, snapshots, and optional Git
+worktrees.
 
-## What is included
+The library is deliberately product-neutral. It does not provide an application
+RPC server, UI framework, authentication client, workflow engine, rule engine,
+review system, or generic capability-discovery framework. Those concerns belong
+to the embedding application.
 
-- Complete stable ACP v1 wire types, generated from the official schema snapshot identified by `acp.SchemaRevision`.
-- Every client-to-agent method: initialization, authentication, session creation/loading/listing/deletion/resumption/closing, modes, configuration, prompting, and cancellation.
-- Every agent-to-client callback: session updates, permissions, file reads and writes, terminal lifecycle, and elicitation.
-- Bidirectional JSON-RPC 2.0 over newline-delimited standard I/O, including concurrent requests, typed errors, request cancellation, and extension methods.
-- A provider-neutral `host.Adapter` seam, normalized events/interactions, and a validated `session` lifecycle model.
-- A batteries-included `durableacp.Engine` with native Claude, Codex, Cursor, and Antigravity ACP adapters.
-- Durable JSONL journals, model-catalog caching, bounded turn queues, and full managed Git worktree lifecycle.
+## What you get
 
-The recommended API is the root `durableacp` package. The lower-level ACP client remains available for hosts that need direct protocol control.
+- A concrete `durableacp.Engine` for opening, starting, resuming, controlling,
+  inspecting, closing, and removing agent sessions.
+- Bundled adapters for Claude, Codex, Cursor, and Antigravity, plus a reusable
+  standard ACP subprocess adapter.
+- Provider-neutral events and interactions suitable for a desktop app, TUI, or
+  service.
+- Serialized turns with a bounded, editable queue per session.
+- Append-only JSONL history, durable sequence cursors, snapshots, and replay
+  deduplication on provider resume.
+- Managed Git worktrees or safe use of a host-owned workspace.
+- Complete stable ACP v1 wire types and a lower-level typed ACP client when the
+  Engine is not the right abstraction.
 
-This release is intentionally an embedded SDK, not a generic stdio server or CLI. A host calls the Engine directly and is free to put a desktop UI, TUI, or its own RPC boundary above it.
+The root `durableacp` package is the recommended API. Packages such as
+`runtime`, `journal`, `worktree`, and `client` remain available for hosts
+that need a lower layer.
 
 ## Install
 
@@ -22,11 +36,15 @@ This release is intentionally an embedded SDK, not a generic stdio server or CLI
 go get github.com/meloniteai/durable-acp
 ```
 
-The module currently requires Go 1.26.
+The module requires Go 1.26.
 
-## Recommended embedding
+Provider executables are separate installations. Opening an Engine does not
+download software, authenticate a user, or start a provider process.
 
-`Open` takes the absolute state directory as an SDK parameter. There is no SDK home environment variable, no `Config.Home`, and no CLI flag: the embedding application owns that decision. For example, an application that already owns `/Users/me/.my-app` passes that exact directory.
+## Quick start
+
+`Open` takes an absolute application-owned state directory. It never discovers
+a home from an environment variable or command-line flag.
 
 ```go
 package main
@@ -41,109 +59,335 @@ import (
 
 func main() {
 	ctx := context.Background()
-	engine, err := durableacp.Open(ctx, "/absolute/path/to/app-state")
+	engine, err := durableacp.Open(
+		ctx,
+		"/absolute/path/to/app-state",
+		durableacp.WithEventSink(func(event host.Event) {
+			log.Printf("%s %s", event.Type, event.Message)
+		}),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer engine.Close() // stops child processes; sessions stay resumable
-
-	engine.Subscribe(func(event host.Event) {
-		// Render messages, tools, plans, queues, and interaction cards here.
-		log.Printf("%s: %s", event.Type, event.Message)
-	})
+	defer func() {
+		if err := engine.Close(); err != nil {
+			log.Printf("close durable-acp: %v", err)
+		}
+	}()
 
 	session, err := engine.Start(ctx, durableacp.StartRequest{
-		Backend: "codex", // claude, codex, cursor, or antigravity
-		Source:  "/absolute/path/to/repository",
+		Backend: "codex",
+		Source:  "/absolute/path/to/git-repository",
 		Prompt:  "Explain this repository and suggest the first change.",
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	_, err = engine.Send(ctx, host.SendTurnRequest{
+	result, err := engine.Send(ctx, host.SendTurnRequest{
 		SessionID: session.ID,
-		Prompt:    "Implement the suggested change and run its tests.",
+		Prompt:    "Implement the change and run the relevant tests.",
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Printf("accepted=%t queued=%t", result.Accepted, result.Queued)
 }
 ```
 
-The first `Start` above creates a managed Git worktree and an owned branch. No Git state is removed on `Engine.Close`; reopening the same directory and calling `Resume(ctx, session.ID)` reconnects to the provider session. An application chooses when a session is truly done:
+The default workspace mode is managed: `Start` creates a worktree and an owned
+branch from the local Git repository in `Source`. The initial prompt starts
+immediately. A later `Send` starts immediately when the session is idle or
+enters its queue when a turn is active.
 
-```go
-// Stop the provider and retain its journal/worktree for later inspection.
-if err := engine.CloseSession(session.ID); err != nil { /* handle */ }
+## Engine at a glance
 
-// Explicit, destructive cleanup of a closed session's managed worktree,
-// branch, and manifest. Its JSONL journal remains available for history.
-if err := engine.Remove(ctx, session.ID, false); err != nil { /* handle */ }
-```
-
-For a host-managed workspace, set `WorkspaceMode: durableacp.WorkspaceExisting` and `Worktree` to an existing directory. Durable ACP records Git metadata when available and never deletes it. Managed worktrees can be checked and repaired after an interrupted process with `engine.Repair(ctx, sessionID)`; `engine.Prune(ctx, source)` only clears stale Git registrations.
-
-### State layout
-
-`Open` creates private (`0700` directories, `0600` files) state below the supplied directory:
-
-| Path | Purpose |
+| Concern | Engine methods |
 | --- | --- |
-| `config.json` | Durable ACP settings such as the managed branch prefix |
-| `sessions/<id>.json` | Small session manifests used to reopen workspaces and providers |
-| `journals/<id>.jsonl` | Append-only neutral session history |
-| `logs/providers/*.log` | Native adapter stderr diagnostics |
-| `logs/sessions/` | Reserved for host session diagnostics |
-| `worktrees/<repository>/<session>/` | SDK-owned managed worktrees |
-| `cache/model-catalog.json` | Best-effort provider model/mode catalog cache |
+| Providers | `Detect`, `Catalog`, `RefreshCatalog`, `SetCatalog` |
+| Sessions | `Start`, `Resume`, `Sessions`, `Snapshot` |
+| Turns | `Send`, `SendNext`, `Interrupt`, `InterruptActive`, `Restart` |
+| Queue | `QueueEntries`, `ReplaceQueuedTurn`, `RemoveQueuedTurn`, `BlockDispatch`, `UnblockDispatch` |
+| Configuration | `SetConfiguration` |
+| Interactions | `PendingInteraction`, `RespondInteraction`, `ForkPrompt` |
+| History | `History`, `HistoryAfter`, `HistoryTail`, `Append`, `Journal` |
+| Workspaces | `Repair`, `Prune` |
+| Cleanup | `CloseSession`, `Remove`, `Close` |
 
-The default managed branch prefix is `durable-acp`; set `durableacp.WithBranchPrefix("my-agent")` when opening an engine to choose another prefix. The setting is persisted with the supplied home.
+`Snapshot` is the single provider-neutral read model for a live or persisted
+session. It includes lifecycle state, workspace ownership, provider identifiers,
+the active turn, the ordered queue, dispatch state, pending interaction,
+effective configuration, the last journal sequence, and the session extension
+payload.
 
-Hosts with an established journal can pass a caller-owned `journal.Store` with `WithJournalStore`, or select a directory and `journal.Option` values with `WithJournalConfiguration`. The default remains `<home>/journals`; a custom selection does not create that directory. A host that already writes normalized runtime events to the shared store can set `DisableRuntimeJournal` in that configuration to avoid duplicate records. `Engine.Snapshot` combines the manifest, live runtime state, pending interaction, effective model/reasoning/permission configuration, and the selected journal's last sequence.
+## Sessions and workspaces
 
-Journal reads use durable sequence cursors. `ReadAfter(sessionID, sequence)` returns the incremental suffix, `Read(sessionID, after, through)` adds an inclusive upper bound, and `Tail(sessionID, limit)` returns recent records in sequence order. Runtime persistence remains semantic by default: thinking, tool, and trace events stay live-only, while stored records retain the source event ID supplied by the host runtime.
+Each Engine session binds a durable session ID to one backend and one workspace.
+The backend may expose its own session, thread, and turn identifiers; durable-acp
+stores those as opaque references.
 
-Lower-level `worktree.Manager.Create` derives its repository directory from the source remote by default. Hosts that already have a stable repository identifier can set `worktree.CreateRequest.RepositoryKey` to keep their existing layout; the value is sanitized and remains under the manager root.
+### Managed workspaces
 
-For a workspace the host owns, `worktree.EnsureBranch(ctx, path, branch)` creates or checks out the requested branch without claiming, relocating, or deleting that workspace.
-
-### Events, interactions, and application extensions
-
-Every adapter emits the same `host.Event` vocabulary. A frontend can render `message`, `thinking`, tool, plan, queue, and `interaction_requested` events without knowing provider internals. Answer a permission, choice, form, or plan interaction with `engine.RespondInteraction`:
+Managed mode is the default:
 
 ```go
-err := engine.RespondInteraction(ctx, session.ID, host.InteractionResponse{
-	RequestID: "interaction-7",
-	Action:    "approve", // or deny, submit, decline, cancel
-	OptionID:  "allow-once",
+session, err := engine.Start(ctx, durableacp.StartRequest{
+	Backend: "claude",
+	Source:  "/absolute/path/to/git-repository",
 })
 ```
 
-Applications can append their own opaque journal records without coupling to the runtime internals. Extension event names must be owner-qualified:
+The Engine creates a private worktree below its state directory and checks out a
+new branch named with the persisted branch prefix. It owns that worktree and
+branch and may remove them only through an explicit `Remove`.
+
+Use `WithBranchPrefix("my-app")` to select a different managed branch prefix.
+Use `Repair` after an interrupted process or manual Git operation and `Prune`
+to remove stale Git worktree registrations from the source repository.
+
+### Existing workspaces
+
+Use an existing absolute directory when the host owns the workspace:
 
 ```go
-_, err := engine.Append(session.ID, "example.review_requested", map[string]any{
-	"review_id": "r-42",
-}, nil)
+session, err := engine.Start(ctx, durableacp.StartRequest{
+	Backend:       "cursor",
+	WorkspaceMode: durableacp.WorkspaceExisting,
+	Worktree:      "/absolute/path/to/existing-workspace",
+})
 ```
 
-The runtime is available for advanced UI startup work: `engine.Runtime().Detect(ctx)` reports native executable availability, and `engine.Runtime().Catalog(ctx, true)` refreshes provider models, modes, and reasoning choices. Most applications should otherwise use the Engine methods above.
+The Engine records Git metadata when available but does not create, switch,
+relocate, or delete a host-owned workspace. `Repair` only reinspects it, and
+`Remove` only removes the Engine manifest.
 
-### Native providers and customization
+### Resume and cleanup
 
-`Open` includes four conventional ACP commands without launching any of them until a session starts. `durable-acp` does not download, install, update, or bundle provider executables: each command must already be discoverable on `PATH` when the backend is detected or started.
+Calling `Engine.Close` stops provider processes and closes Engine-owned
+resources. It leaves manifests, journals, branches, and worktrees intact.
+Reopen the same state directory and resume an active session:
 
-| Backend | Default command |
+```go
+engine, err := durableacp.Open(ctx, stateDir)
+if err != nil {
+	return err
+}
+if _, err := engine.Resume(ctx, sessionID); err != nil {
+	return err
+}
+```
+
+`Resume` reconnects with the last durable backend session ID and does not
+create a replacement workspace.
+
+Cleanup operations have intentionally different scopes:
+
+| Operation | Result |
+| --- | --- |
+| `Engine.Close` | Stops all provider processes; active sessions remain resumable |
+| `CloseSession` | Stops one provider and marks its session closed; keeps its manifest, workspace, and journal for inspection |
+| `Remove` | Closes if needed, removes an owned worktree and branch, deletes the manifest, and forgets runtime state |
+
+`Remove` never deletes a host-owned existing workspace. Session journals remain
+available after removal. A session marked by `CloseSession` is no longer
+resumable; use `Engine.Close` when the intent is process shutdown followed by
+later recovery.
+
+## Turns, queues, and control
+
+Only one provider turn runs at a time in a session.
+
+- `Send` dispatches immediately when idle and otherwise appends to the queue.
+- `SendNext` dispatches immediately when idle and otherwise prepends to the
+  queue.
+- Queue entries have stable IDs and retain the complete opaque
+  `host.SendTurnRequest`.
+- `ReplaceQueuedTurn` changes an entry without changing its position.
+- `RemoveQueuedTurn` removes only the requested entry.
+- `BlockDispatch` lets the active turn finish while preventing the next queued
+  turn from starting. `UnblockDispatch` resumes dispatch.
+
+The default maximum is 16 queued turns per session. Configure it with
+`WithRuntimeConfiguration(runtime.Config{MaxQueuedTurns: ...})`.
+
+```go
+entries, err := engine.QueueEntries(session.ID)
+if err != nil {
+	return err
+}
+for _, entry := range entries {
+	log.Printf("%s: %s", entry.ID, entry.Request.Prompt)
+}
+
+if len(entries) > 0 {
+	if _, err := engine.RemoveQueuedTurn(session.ID, entries[0].ID); err != nil {
+		return err
+	}
+}
+```
+
+`Interrupt` cancels the active turn and clears queued turns.
+`InterruptActive` cancels only the active turn and preserves queued work. If an
+adapter successfully interrupts but emits no terminal event, the runtime emits a
+neutral `turn_failed` event so the session cannot remain stuck as active.
+
+`Restart` restarts only an idle provider process. It preserves the Engine
+session, workspace, queue, configuration, and journal.
+
+## Events and interactions
+
+Subscribe at open time with `WithEventSink` or later with `Subscribe`.
+`Subscribe` returns a function that removes that listener.
+
+Adapters produce one provider-neutral `host.Event` stream. It covers messages,
+thinking, tools, file changes, plans, configuration choices, queue changes,
+turn lifecycle, process lifecycle, and user interactions. Turn-scoped events
+carry the same backend turn ID from `turn_started` through
+`turn_completed` or `turn_failed`.
+
+The runtime coalesces adjacent streaming updates before publishing them.
+Provider event identifiers are retained as `SourceEventID` when available so
+hosts can keep stable projections.
+
+Permission, choice, form, and plan requests are represented by
+`host.InteractionRequest`:
+
+```go
+pending, err := engine.PendingInteraction(session.ID)
+if err != nil {
+	return err
+}
+if pending != nil {
+	if err := engine.RespondInteraction(ctx, session.ID, host.InteractionResponse{
+		RequestID: pending.ID,
+		Action:    "approve",
+		OptionID:  "allow-once",
+	}); err != nil {
+		return err
+	}
+}
+```
+
+The Engine does not render interactions or decide approval policy. The host
+chooses how to present and answer them.
+
+## History, journals, and replay
+
+Each session has an append-only JSONL journal. Normalized runtime events are
+translated to a small neutral vocabulary such as `user.message`,
+`agent.message`, `agent.turn_started`, `agent.yielded`, and
+`agent.interaction_requested`.
+
+High-volume presentation events such as thinking, tool output, trace updates,
+and queue updates are live-only by default. Product-specific history projections
+belong in the host.
+
+History methods use monotonically increasing durable sequence numbers:
+
+```go
+snapshot, err := engine.Snapshot(session.ID)
+if err != nil {
+	return err
+}
+
+records, err := engine.History(
+	session.ID,
+	lastSeenSequence,
+	snapshot.LastJournalSequence,
+)
+if err != nil {
+	return err
+}
+for _, record := range records {
+	log.Printf("%d %s", record.Sequence, record.Event)
+}
+lastSeenSequence = snapshot.LastJournalSequence
+```
+
+- `HistoryAfter(id, sequence)` returns records after an exclusive cursor.
+- `History(id, after, through)` adds an inclusive upper bound; zero leaves
+  either side unbounded.
+- `HistoryTail(id, limit)` returns recent records in ascending sequence order.
+- `Journal()` exposes the raw store for advanced integrations.
+
+When a bundled ACP adapter reloads provider history during `Resume`, the
+runtime matches replayed semantic events against the durable journal and
+suppresses duplicates. Unmatched events continue through the normal event and
+journal paths.
+
+Hosts with an existing journal can pass a caller-owned store with
+`WithJournalStore`, or configure an Engine-owned directory with
+`WithJournalConfiguration`. Set `DisableRuntimeJournal` only when the host
+already writes normalized runtime events into that same store.
+
+## Opaque host extensions
+
+Product data can cross the generic runtime without becoming part of its
+vocabulary:
+
+- `StartRequest.Ext`, `SendTurnRequest.Ext`, and `Session.Ext` carry opaque
+  JSON.
+- Adapter events may retain provider or host data in `host.Event.Data`.
+- `Append` adds an application-owned journal record.
+
+Extension journal names must be owner-qualified so they cannot collide with core
+events:
+
+```go
+if _, err := engine.Append(
+	session.ID,
+	"example.review_requested",
+	map[string]any{"review_id": "r-42"},
+	nil,
+); err != nil {
+	return err
+}
+```
+
+The Engine stores these payloads but does not interpret them.
+
+## Unsupported operations and simple fallbacks
+
+Some adapter operations are optional. An unsupported call returns an error that
+matches `durableacp.ErrUnsupportedOperation`; the concrete
+`UnsupportedOperationError` includes the backend and operation.
+
+```go
+_, err := engine.Restart(ctx, session.ID)
+if errors.Is(err, durableacp.ErrUnsupportedOperation) {
+	log.Printf("restart is unavailable for %s", session.Backend)
+}
+```
+
+| Operation | Simple host fallback |
+| --- | --- |
+| `Restart` | Keep using the current provider session, or close the Engine and later `Resume` it |
+| `ForkPrompt` | `Send` to the current session or explicitly `Start` another Engine session |
+| `RespondInteraction` | Leave the request pending or call `InterruptActive`; never synthesize approval |
+| Catalog discovery | Keep static defaults; `RefreshCatalog` reports the backend as `skip` |
+
+This error-first contract is intentional. A host does not need to negotiate a
+generic capability document before trying a focused optional operation.
+`Detect` and catalog methods provide only provider availability and
+configuration data.
+
+## Native providers
+
+`Open` includes four conventional adapters. None launch until a session starts
+or a catalog refresh probes them.
+
+| Backend | Conventional command |
 | --- | --- |
 | `claude` | `claude-agent-acp` |
 | `codex` | `codex-acp` |
 | `cursor` | `agent acp` |
 | `antigravity` | `agy` |
 
-`engine.Runtime().Detect(ctx)` reports this prerequisite without starting a session. It returns an unavailable backend when the command is absent; it never installs software as a side effect. Some ACP adapters also require their provider CLI or credentials to be available according to that adapter's own documentation.
+`Detect` reports whether each command is available without launching a
+provider. durable-acp does not install or update those commands and does not
+manage their credentials.
 
-Install the provider-side command through its normal distribution channel before using the corresponding backend. If an application bundles or otherwise manages a sidecar, give durable-acp its absolute path; the other three remain PATH-based defaults:
+Replace any bundled adapter by registering the same backend name:
 
 ```go
 import (
@@ -152,220 +396,128 @@ import (
 	"github.com/meloniteai/durable-acp/adapters/codex"
 )
 
-engine, err := durableacp.Open(ctx, stateDir,
-	durableacp.WithAdapters(codex.New(acpx.WithCommand("/opt/agents/codex-acp"))),
+engine, err := durableacp.Open(
+	ctx,
+	stateDir,
+	durableacp.WithAdapters(
+		codex.New(acpx.WithCommand("/opt/agents/codex-acp")),
+	),
 )
 ```
 
-The individual provider packages and `adapters/acpx` are public, so a host can configure arguments, a complete child environment, stderr, or an entirely custom ACP executable without importing runtime internals.
+`adapters/acpx` also supports custom arguments, a complete child environment,
+stderr routing, client identity, and an entirely custom standard ACP executable.
+Implement `host.Adapter` to integrate a provider that does not fit that
+subprocess adapter.
 
-### Real ACP black-box coverage
+## State layout
 
-The normal test suite is hermetic. The opt-in real ACP suite drives actual ACP
-processes and actual coding models through the public `Engine`; it is not a
-mocked protocol test. Each selected agent runs these isolated journeys:
+`Open` creates private directories and files below the supplied state
+directory:
 
-| Journey | What it proves |
+| Path | Purpose |
 | --- | --- |
-| `managed` | Detection, catalog caching, managed Git worktree/branch creation, live model edit, normalized stream events, live provider restart, neutral + opaque journals, repair/prune, Engine restart/provider resume, close, and owned cleanup. |
-| `existing` | A caller-owned Git checkout survives `Repair` and `Remove`, while an initial `Start` turn receives an ACP text-resource attachment and uses it in a live edit. |
-| `queued` | A second real model turn is queued while the first is active, then executes serially with the first turn's filesystem output available. |
-| `interrupt` | A real shell tool call is cancelled, its queued follow-up is cleared, and the same provider session successfully completes a recovery turn. |
-| `permission` | A guarded agent edit emits a standard ACP permission callback; `Engine.RespondInteraction` approves it and the model completes the edit. Antigravity instead verifies its advertised native plan mode because its bridge does not implement the standard callback. |
+| `config.json` | Persisted Engine settings |
+| `sessions/<id>.json` | Small durable session manifests |
+| `journals/<id>.jsonl` | Append-only neutral history |
+| `logs/providers/*.log` | Provider stderr diagnostics |
+| `worktrees/<repository>/<session>/` | Engine-owned managed worktrees |
+| `cache/model-catalog.json` | Best-effort provider catalog cache |
 
-The runner installs and compiles once, then gives every agent/journey a private
-`CODEX_HOME`, OS home, Engine state directory, repository, worktree, and log.
-It runs those workers concurrently (four by default), so provider state cannot
-leak between tests and slow model calls do not turn the suite into one serial
-scenario. Set `DURABLE_ACP_REAL_JOBS` to tune concurrency and
-`DURABLE_ACP_REAL_KEEP_ARTIFACTS=1` to retain a failed worker's evidence.
+Directories use mode `0700` and private files use mode `0600`. A custom
+journal directory replaces the default `journals` location rather than
+duplicating it.
 
-Run Codex and Claude Code through OpenRouter with the inexpensive low-effort
-default model:
+## Architectural boundary
+
+durable-acp owns generic mechanics:
+
+- ACP process transport and provider adapters
+- session manifests and provider references
+- serialized turns and queues
+- normalized events and interactions
+- journals, snapshots, replay matching, and catalog caching
+- optional managed worktrees
+
+The embedding product owns policy and presentation:
+
+- RPC, HTTP, stdio, or application command boundaries
+- authentication and account management
+- UI state and product history projections
+- orchestration, prompt composition, loops, and workflows
+- rules, permissions policy, proofs, reviews, and approvals
+- control-plane integration and operational modes
+
+This separation keeps the Engine useful as a backend without turning it into an
+application framework.
+
+## Packages
+
+| Package | Purpose |
+| --- | --- |
+| `durableacp` | Batteries-included Engine facade |
+| `host` | Provider-neutral adapters, events, interactions, and requests |
+| `runtime` | In-memory session multiplexer, queues, event routing, and catalog cache |
+| `journal` | Append-only JSONL records, neutral translation, and replay matching |
+| `worktree` | Managed Git worktree lifecycle |
+| `adapters` | Bundled provider composition |
+| `adapters/acpx` | Reusable standard ACP subprocess adapter |
+| `acp` | Generated official stable-v1 wire schema and method metadata |
+| `client` | Typed initialized ACP client connections and callbacks |
+| `transport` | Concurrent bidirectional JSON-RPC process transport |
+| `session` | Validated provider-neutral session lifecycle |
+| `conformance` | Public ACP method-matrix and adapter assertions |
+
+Use `client.Start` directly when building a custom ACP host that does not need
+Engine-managed sessions, queues, journals, or worktrees. The wire-level `acp`
+package preserves the standard; the `host` package is the intentionally
+separate normalized model.
+
+## Verification
+
+The default suite is hermetic:
+
+```sh
+make all
+```
+
+This runs lint, vet, race-enabled tests, and an 85% minimum coverage check over
+hand-written runtime code.
+
+The opt-in real ACP suite drives the public Engine against actual providers and
+models:
 
 ```sh
 export OPENROUTER_API_KEY='...'
 scripts/run-realacp.sh --provider openrouter
 ```
 
-The runner installs pinned public Codex/Claude ACP adapters and coding CLIs
-once into a temporary directory, compiles the Go test binary once, and runs all
-five journeys for both agents. It defaults to `deepseek/deepseek-v4-flash`, low
-reasoning, Codex's `read-only` mode for its permission journey, and Claude's
-standard `default` permission mode. Override them with
-`DURABLE_ACP_REAL_MODEL`, `DURABLE_ACP_REAL_REASONING`, and either
-`DURABLE_ACP_REAL_PERMISSION_MODE` or an agent-specific variable such as
-`DURABLE_ACP_REAL_CODEX_PERMISSION_MODE`. Run only a capability while debugging
-with `--journeys interrupt`, or select several with a comma-separated list.
+The runner covers managed and existing workspaces, queue serialization,
+interrupt recovery, permission interactions, provider restart, Engine reopen
+and resume, journal replay, repair, prune, and cleanup. It isolates each journey
+with private Engine state, repositories, worktrees, provider homes, and logs.
 
-Cursor and Antigravity cannot be authenticated by an OpenRouter key. The runner
-installs Cursor CLI into its temporary home when it is absent, but it still
-needs normal Cursor authentication or `CURSOR_API_KEY`. For Antigravity it
-builds the pinned [`antigravity-acp-go`](https://github.com/meloniteai/antigravity-acp-go)
-bridge once and lets that bridge find or provision `agy`; normal `agy` OAuth or
-provider credentials are still required. Ask the runner to include every native
-agent explicitly:
-
-```sh
-# `agent acp` is the usual Cursor command.
-export DURABLE_ACP_REAL_CURSOR_ACP="$(command -v agent)"
-export DURABLE_ACP_REAL_CURSOR_ACP_ARGS='acp'
-
-# Build the pinned bridge and run it with normal agy authentication.
-scripts/run-realacp.sh --provider vanilla --agents antigravity
-
-# Or override the bridge command while debugging a local bridge change.
-export DURABLE_ACP_REAL_ANTIGRAVITY_ACP="$(command -v antigravity-acp)"
-export DURABLE_ACP_REAL_ANTIGRAVITY_ACP_ARGS='--state-dir /tmp/agy-acp-real'
-# _REPOSITORY and _REF override the source build when no command is supplied.
-
-scripts/run-realacp.sh --provider vanilla --agents all --journeys all
-```
-
-The command variables accept absolute paths and corresponding `_ARGS` values
-for nonstandard invocations. `--agents codex,claude,cursor,antigravity` and
-`--journeys managed,existing,queued,interrupt,permission` select explicit
-subsets. The direct Go tests are build-tagged and skip an unconfigured provider,
-so use the runner for a complete setup:
+Use `--agents` and `--journeys` to select subsets. Cursor and Antigravity
+require their own normal credentials and cannot authenticate from an OpenRouter
+key. The direct integration package is build-tagged:
 
 ```sh
 go test -tags=realacp -v ./integration/realacp
 ```
 
-GitHub Actions runs all five OpenRouter Codex-and-Claude journeys on relevant
-pull requests and manual dispatches. Add `OPENROUTER_API_KEY` to
-the repository Actions secrets; the workflow never exposes it and does not run
-on fork pull requests, where secrets are unavailable. Cursor and Antigravity
-need their own authenticated commands and credentials, so they cannot be made
-truthfully green in that CI job from an OpenRouter secret alone; run their full
-matrix in a credentialed environment with `--provider vanilla --agents all`.
-The same workflow has a manual `native_agents` input (`cursor`, `antigravity`,
-or `cursor,antigravity`): configure `DURABLE_ACP_CURSOR_API_KEY` and either
-`DURABLE_ACP_ANTIGRAVITY_API_KEY` or `DURABLE_ACP_GEMINI_API_KEY` first.
-
-## Low-level ACP connection
-
-Use `client.Start` directly only when building a custom ACP host outside the durable Engine. The handler may implement only the callback capabilities the host supports. This example streams session updates and leaves filesystem, terminal, elicitation, and permission callbacks disabled.
-
-```go
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"os"
-
-	"github.com/meloniteai/durable-acp/acp"
-	acpclient "github.com/meloniteai/durable-acp/client"
-)
-
-type updates struct{}
-
-func (updates) SessionUpdate(_ context.Context, notification *acp.SessionNotification) error {
-	raw, err := json.Marshal(notification)
-	if err != nil {
-		return err
-	}
-	fmt.Println(string(raw))
-	return nil
-}
-
-func main() {
-	ctx := context.Background()
-	cwd, err := os.Getwd()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	connection, err := acpclient.Start(ctx, acpclient.Spec{
-		Command: "path-to-acp-agent",
-		Handler: updates{},
-		OnHandlerError: func(err error) {
-			log.Printf("ACP callback: %v", err)
-		},
-		Initialize: acp.InitializeRequest{
-			ClientInfo: &acp.Implementation{
-				Name:    "example-host",
-				Version: "dev",
-			},
-		},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer connection.Close()
-
-	created, err := connection.NewSession(ctx, &acp.NewSessionRequest{
-		Cwd:        cwd,
-		McpServers: []acp.McpServer{},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	result, err := connection.Prompt(ctx, &acp.PromptRequest{
-		SessionId: created.SessionId,
-		Prompt:    []acp.ContentBlock{acp.TextBlock("Explain this repository.")},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("stop reason:", result.StopReason)
-}
-```
-
-Advertise callback support through `InitializeRequest.ClientCapabilities` and implement the corresponding interfaces:
-
-- `SessionUpdateHandler`
-- `PermissionHandler`
-- `FileSystemHandler`
-- `TerminalHandler`
-- `ElicitationHandler`
-- `ExtensionHandler`
-
-Unsupported standard requests receive JSON-RPC `Method not found`. Unknown extension notifications are ignored as required by ACP.
-
-## Packages
-
-| Package | Purpose |
-| --- | --- |
-| `acp` | Official stable-v1 wire schema and method metadata; no I/O |
-| `client` | Initialized typed ACP client connections, callbacks, capabilities, and extensions |
-| `transport` | Concurrent bidirectional JSON-RPC process transport |
-| `host` | Optional provider-neutral adapter and event model above the wire protocol |
-| `journal` | Durable append-only JSONL session records and neutral host-event translation |
-| `session` | Optional host-side session identity and validated lifecycle |
-| `worktree` | Independent Git worktree create, reopen, repair, prune, and remove manager |
-| `runtime` | Provider-neutral session registry, turn queue, event routing, and catalog cache |
-| `adapters` | Native bundled provider composition |
-| `adapters/acpx` | Reusable standard ACP subprocess adapter for custom providers |
-| `conformance` | Assertions that the public method matrix matches the official v1 schema |
-
-The wire-level `acp` package and normalized `host` package are intentionally separate. ACP types preserve the standard exactly; host types provide a convenient internal model for applications that normalize multiple backends.
-
 ## Schema provenance
 
-Generated files in `acp/schema_*_gen.go` come from the official ACP v1 `schema.json` and `meta.json` at the commit in `acp.SchemaRevision`. The revision and both SHA-256 checksums are pinned in the generator.
-
-To regenerate:
+Generated files in `acp/schema_*_gen.go` come from the official ACP stable-v1
+`schema.json` and `meta.json` at `acp.SchemaRevision`. The generator pins
+the source revision, generator version, and SHA-256 checksums.
 
 ```sh
 go generate ./acp
 git diff --exit-code -- acp/schema_*_gen.go
 ```
 
-Generation downloads the pinned schema and pinned Apache-2.0 Go generator, verifies the schema checksums, and never incorporates ACP's draft-v2 schema.
+Generation verifies the pinned inputs and does not incorporate draft-v2 schema
+changes.
 
-## Development
-
-```sh
-make lint
-make vet
-make test
-```
-
-`make test` runs the race detector and enforces at least 80% coverage over hand-written runtime code. Generated schema code and the generator command itself are excluded from the percentage, but are still compiled and exercised by conformance and integration tests.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for schema-update and contribution guidance.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and schema-update
+guidance.

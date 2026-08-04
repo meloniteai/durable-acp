@@ -177,6 +177,11 @@ type Event struct {
 
 type EventSink func(Event)
 
+const (
+	EventLocalReplay      = "durable-acp.replay"
+	EventLocalReplayStart = "durable-acp.replay_start"
+)
+
 type StartSessionRequest struct {
 	Backend   Backend         `json:"backend"`
 	SessionID string          `json:"session_id,omitempty"`

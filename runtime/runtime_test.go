@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -424,7 +425,7 @@ func TestRuntimeDoesNotReuseLastTurnIDForAnonymousStart(t *testing.T) {
 	if state.TurnActive || state.ActiveTurnID != "" {
 		t.Fatalf("anonymous start reused prior turn identity: %#v", state)
 	}
-	if event := events[len(events)-2]; event.Type != host.EventTurnStarted || event.BackendTurnID != "" {
+	if event := events[len(events)-1]; event.Type != host.EventTurnStarted || event.BackendTurnID != "" {
 		t.Fatalf("anonymous start = %#v", event)
 	}
 }
@@ -455,7 +456,8 @@ func TestRuntimeUsesActiveTurnIDForAdapterStream(t *testing.T) {
 
 func TestRuntimeInterruptActiveAndReconcileTurn(t *testing.T) {
 	adapter := &testAdapter{backend: "test"}
-	runtime := New(Config{}, adapter)
+	var events []host.Event
+	runtime := New(Config{DisableCoalescing: true, EventSink: func(event host.Event) { events = append(events, event) }}, adapter)
 	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "session-1", Backend: "test", Worktree: t.TempDir()}); err != nil {
 		t.Fatal(err)
 	}
@@ -478,24 +480,23 @@ func TestRuntimeInterruptActiveAndReconcileTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if adapter.interrupts != 1 || !state.TurnActive || state.QueueDepth != 1 {
+	if adapter.interrupts != 1 || state.TurnActive || state.QueueDepth != 1 || !state.DispatchBlocked {
 		t.Fatalf("state after interrupt = %#v, calls = %d", state, adapter.interrupts)
+	}
+	fallback := host.Event{}
+	for _, event := range events {
+		if event.Data["source"] == "runtime_interrupt_fallback" {
+			fallback = event
+		}
+	}
+	if fallback.Type != host.EventTurnFailed || fallback.Data["source"] != "runtime_interrupt_fallback" || fallback.Data["interrupted"] != true {
+		t.Fatalf("interrupt fallback = %#v", fallback)
 	}
 	if reconcileErr := runtime.ReconcileTurn("session-1", host.Event{Type: host.EventMessage}); reconcileErr == nil {
 		t.Fatal("ReconcileTurn accepted a non-terminal event")
 	}
 	if reconcileErr := runtime.ReconcileTurn("missing", host.Event{Type: host.EventTurnFailed}); reconcileErr == nil {
 		t.Fatal("ReconcileTurn accepted a missing session")
-	}
-	if reconcileErr := runtime.ReconcileTurn("session-1", host.Event{Type: host.EventTurnFailed, BackendTurnID: "turn-1"}); reconcileErr != nil {
-		t.Fatal(reconcileErr)
-	}
-	state, err = runtime.State("session-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.TurnActive || state.QueueDepth != 1 || !state.DispatchBlocked {
-		t.Fatalf("reconciled state = %#v", state)
 	}
 	if err := runtime.UnblockDispatch("session-1"); err != nil {
 		t.Fatal(err)
@@ -916,9 +917,13 @@ func TestRuntimeInteractionFallbackAndRestoreFailures(t *testing.T) {
 	}
 	if _, err := unsupported.ForkPrompt(context.Background(), host.ForkPromptRequest{SessionID: "plain"}); err == nil {
 		t.Fatal("ForkPrompt succeeded without adapter capability")
+	} else if !errors.Is(err, ErrUnsupportedOperation) {
+		t.Fatalf("ForkPrompt error = %T %v", err, err)
 	}
 	if err := unsupported.RespondInteraction(context.Background(), "plain", host.InteractionResponse{RequestID: "ask"}); err == nil {
 		t.Fatal("interaction succeeded without adapter capability")
+	} else if !errors.Is(err, ErrUnsupportedOperation) {
+		t.Fatalf("RespondInteraction error = %T %v", err, err)
 	}
 	if _, err := (*Runtime)(nil).Restore("s"); err == nil {
 		t.Fatal("nil runtime restored a session")
@@ -929,6 +934,32 @@ func TestRuntimeInteractionFallbackAndRestoreFailures(t *testing.T) {
 	}
 	if _, err := New(Config{Journal: store}, plain).Restore("missing"); err == nil {
 		t.Fatal("Restore accepted a missing lifecycle")
+	}
+}
+
+func TestRuntimeSuppressesProviderReplayHistory(t *testing.T) {
+	adapter := &testAdapter{backend: "replay"}
+	var events []host.Event
+	runtime := New(Config{DisableCoalescing: true, EventSink: func(event host.Event) { events = append(events, event) }}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "replay", Backend: "replay", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "replay"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SetReplayHistory("replay", []journal.Record{{Event: journal.EventAgentMessage, Data: json.RawMessage(`{"message":"existing"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "existing", Local: map[string]any{host.EventLocalReplay: true, host.EventLocalReplayStart: true}})
+	adapter.emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "new", Local: map[string]any{host.EventLocalReplay: true}})
+	messages := make([]string, 0, 2)
+	for _, event := range events {
+		if event.Type == host.EventMessage {
+			messages = append(messages, event.Message)
+		}
+	}
+	if len(messages) != 1 || messages[0] != "new" {
+		t.Fatalf("replay messages = %#v", messages)
 	}
 }
 
