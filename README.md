@@ -139,7 +139,7 @@ The runtime is available for advanced UI startup work: `engine.Runtime().Detect(
 | `claude` | `claude-agent-acp` |
 | `codex` | `codex-acp` |
 | `cursor` | `agent acp` |
-| `antigravity` | `antigravity-acp` |
+| `antigravity` | `agy` |
 
 `engine.Runtime().Detect(ctx)` reports this prerequisite without starting a session. It returns an unavailable backend when the command is absent; it never installs software as a side effect. Some ACP adapters also require their provider CLI or credentials to be available according to that adapter's own documentation.
 

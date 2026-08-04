@@ -582,7 +582,7 @@ func requireProvider(t *testing.T, backend host.Backend) liveProvider {
 			case cursor.Backend:
 				return cursor.New(options...)
 			case antigravity.Backend:
-				return antigravity.New(options...)
+				return antigravity.New(antigravity.Config{Command: command})
 			default:
 				t.Fatalf("unsupported live backend %q", backend)
 				return nil
