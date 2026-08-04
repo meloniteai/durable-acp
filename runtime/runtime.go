@@ -54,13 +54,14 @@ type CreateRequest struct {
 
 // State is the current runtime-owned view of a session.
 type State struct {
-	Session            session.Session          `json:"session"`
-	QueueDepth         int                      `json:"queue_depth"`
-	QueueEntries       []QueueEntry             `json:"queue_entries,omitempty"`
-	TurnActive         bool                     `json:"turn_active"`
-	ActiveTurnID       string                   `json:"active_turn_id,omitempty"`
-	DispatchBlocked    bool                     `json:"dispatch_blocked,omitempty"`
-	PendingInteraction *host.InteractionRequest `json:"pending_interaction,omitempty"`
+	Session            session.Session           `json:"session"`
+	Configuration      host.SessionConfiguration `json:"configuration"`
+	QueueDepth         int                       `json:"queue_depth"`
+	QueueEntries       []QueueEntry              `json:"queue_entries,omitempty"`
+	TurnActive         bool                      `json:"turn_active"`
+	ActiveTurnID       string                    `json:"active_turn_id,omitempty"`
+	DispatchBlocked    bool                      `json:"dispatch_blocked,omitempty"`
+	PendingInteraction *host.InteractionRequest  `json:"pending_interaction,omitempty"`
 }
 
 type QueueEntry struct {
@@ -132,6 +133,8 @@ type Runtime struct {
 
 type managedSession struct {
 	session            session.Session
+	configuration      host.SessionConfiguration
+	configurationEvent configurationEventVersions
 	queue              []QueueEntry
 	dispatching        bool
 	active             bool
@@ -141,6 +144,12 @@ type managedSession struct {
 	nextQueueSeq       int
 	nextSeq            int
 	coalescer          *deltaCoalescer
+}
+
+type configurationEventVersions struct {
+	model      uint64
+	reasoning  uint64
+	permission uint64
 }
 
 // New creates a Runtime over the supplied adapters. Duplicate backend names
@@ -259,6 +268,9 @@ func (r *Runtime) Start(ctx context.Context, request host.StartSessionRequest) (
 	request.SessionID = id
 	request.Backend = managed.session.Backend
 	request.Worktree = managed.session.Worktree
+	previousConfiguration := managed.configuration
+	managed.configuration = mergeConfiguration(managed.configuration, configurationFromStart(request))
+	request = fillStartConfiguration(request, managed.configuration)
 	initialTurn := strings.TrimSpace(request.Prompt) != "" || len(request.Attachments) > 0
 	if initialTurn {
 		managed.dispatching = true
@@ -270,6 +282,7 @@ func (r *Runtime) Start(ctx context.Context, request host.StartSessionRequest) (
 		r.mu.Lock()
 		if current := r.sessions[id]; current != nil {
 			current.dispatching = false
+			current.configuration = previousConfiguration
 		}
 		r.mu.Unlock()
 		return host.BackendSession{}, err
@@ -282,6 +295,7 @@ func (r *Runtime) Start(ctx context.Context, request host.StartSessionRequest) (
 	if err := r.appendLifecycle(id, "session.started", map[string]any{
 		"backend":         request.Backend,
 		"backend_session": state,
+		"configuration":   managedConfiguration(r, id),
 	}); err != nil {
 		return host.BackendSession{}, err
 	}
@@ -320,6 +334,7 @@ func (r *Runtime) send(ctx context.Context, request host.SendTurnRequest, next b
 		return SendResult{}, &SessionClosedError{SessionID: id}
 	}
 	request.SessionID = id
+	request = fillTurnConfiguration(request, managed.configuration)
 	request = cloneSendTurnRequest(request)
 	if managed.active || managed.dispatching || managed.dispatchBlocked {
 		if len(managed.queue) >= r.maxQueuedTurns {
@@ -536,6 +551,7 @@ func (r *Runtime) ReplaceQueuedTurn(sessionID, entryID string, request host.Send
 			continue
 		}
 		request.SessionID = id
+		request = fillTurnConfiguration(request, managed.configuration)
 		managed.queue[i].Request = cloneSendTurnRequest(request)
 		entry := cloneQueueEntry(managed.queue[i])
 		r.mu.Unlock()
@@ -748,6 +764,22 @@ func (r *Runtime) State(sessionID string) (State, error) {
 	return stateLocked(managed), nil
 }
 
+func (r *Runtime) SetConfiguration(sessionID string, configuration host.SessionConfiguration) error {
+	if r == nil {
+		return errors.New("runtime: nil runtime")
+	}
+	id := strings.TrimSpace(sessionID)
+	r.mu.Lock()
+	managed := r.sessions[id]
+	if managed == nil {
+		r.mu.Unlock()
+		return &SessionNotFoundError{SessionID: id}
+	}
+	managed.configuration = normalizeConfiguration(configuration)
+	r.mu.Unlock()
+	return nil
+}
+
 // Sessions returns stable snapshots ordered by creation time then ID.
 func (r *Runtime) Sessions() []State {
 	if r == nil {
@@ -800,10 +832,12 @@ func (r *Runtime) Restore(sessionID string) (State, error) {
 				continue
 			}
 			var data struct {
-				BackendSession host.BackendSession `json:"backend_session"`
+				BackendSession host.BackendSession       `json:"backend_session"`
+				Configuration  host.SessionConfiguration `json:"configuration"`
 			}
 			if json.Unmarshal(record.Data, &data) == nil {
 				restored.session.BackendSession = data.BackendSession
+				restored.configuration = normalizeConfiguration(data.Configuration)
 			}
 		case "session.closed":
 			if restored != nil && restored.session.Status != session.StatusClosed {
@@ -1018,6 +1052,7 @@ func (r *Runtime) deliver(sessionID string, event host.Event) {
 		managed.nextSeq++
 		event.Seq = managed.nextSeq
 	}
+	reconcileConfiguration(managed, event)
 	if event.SourceEventID == "" {
 		event.SourceEventID = fmt.Sprintf("%s:%d", event.SessionID, event.Seq)
 	}
@@ -1164,6 +1199,12 @@ func (r *Runtime) submitTurn(ctx context.Context, sessionID string, adapter host
 			return host.BackendSession{}, err
 		}
 	}
+	r.mu.Lock()
+	versions := configurationEventVersions{}
+	if current := r.sessions[sessionID]; current != nil {
+		versions = current.configurationEvent
+	}
+	r.mu.Unlock()
 	state, err := adapter.SendTurn(ctx, sessionID, dispatch.Request, r.sessionSink(sessionID)) //nolint:contextcheck // Adapter callbacks may dispatch queued work after the request returns.
 	if err != nil {
 		r.failSubmission(sessionID, dispatch.QueueEntryID, err) //nolint:contextcheck // Failure delivery may dispatch the next queued turn.
@@ -1172,6 +1213,7 @@ func (r *Runtime) submitTurn(ctx context.Context, sessionID string, adapter host
 	r.mu.Lock()
 	if current := r.sessions[sessionID]; current != nil {
 		current.session.BackendSession = state
+		mergeUnreportedConfiguration(current, configurationFromTurn(dispatch.Request), versions)
 	}
 	submitted := r.turnSubmitted
 	r.mu.Unlock()
@@ -1310,6 +1352,7 @@ func cloneData(data map[string]any) map[string]any {
 func stateLocked(managed *managedSession) State {
 	return State{
 		Session:            managed.session,
+		Configuration:      managed.configuration,
 		QueueDepth:         len(managed.queue),
 		QueueEntries:       cloneQueueEntries(managed.queue),
 		TurnActive:         managed.active,
@@ -1317,6 +1360,134 @@ func stateLocked(managed *managedSession) State {
 		DispatchBlocked:    managed.dispatchBlocked,
 		PendingInteraction: cloneInteractionRequest(managed.pendingInteraction),
 	}
+}
+
+func configurationFromStart(request host.StartSessionRequest) host.SessionConfiguration {
+	return normalizeConfiguration(host.SessionConfiguration{
+		Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode,
+	})
+}
+
+func configurationFromTurn(request host.SendTurnRequest) host.SessionConfiguration {
+	return normalizeConfiguration(host.SessionConfiguration{
+		Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode,
+	})
+}
+
+func normalizeConfiguration(configuration host.SessionConfiguration) host.SessionConfiguration {
+	configuration.Model = strings.TrimSpace(configuration.Model)
+	configuration.Reasoning = strings.TrimSpace(configuration.Reasoning)
+	configuration.PermissionMode = strings.TrimSpace(configuration.PermissionMode)
+	return configuration
+}
+
+func mergeConfiguration(current, update host.SessionConfiguration) host.SessionConfiguration {
+	update = normalizeConfiguration(update)
+	if update.Model != "" {
+		current.Model = update.Model
+	}
+	if update.Reasoning != "" {
+		current.Reasoning = update.Reasoning
+	}
+	if update.PermissionMode != "" {
+		current.PermissionMode = update.PermissionMode
+	}
+	return normalizeConfiguration(current)
+}
+
+func fillStartConfiguration(request host.StartSessionRequest, configuration host.SessionConfiguration) host.StartSessionRequest {
+	if strings.TrimSpace(request.Model) == "" {
+		request.Model = configuration.Model
+	}
+	if strings.TrimSpace(request.Reasoning) == "" {
+		request.Reasoning = configuration.Reasoning
+	}
+	if strings.TrimSpace(request.PermissionMode) == "" {
+		request.PermissionMode = configuration.PermissionMode
+	}
+	return request
+}
+
+func fillTurnConfiguration(request host.SendTurnRequest, configuration host.SessionConfiguration) host.SendTurnRequest {
+	if strings.TrimSpace(request.Model) == "" {
+		request.Model = configuration.Model
+	}
+	if strings.TrimSpace(request.Reasoning) == "" {
+		request.Reasoning = configuration.Reasoning
+	}
+	if strings.TrimSpace(request.PermissionMode) == "" {
+		request.PermissionMode = configuration.PermissionMode
+	}
+	return request
+}
+
+func reconcileConfiguration(managed *managedSession, event host.Event) {
+	if managed == nil || event.Data == nil {
+		return
+	}
+	//exhaustive:ignore Only generic configuration events affect this state.
+	switch event.Type {
+	case host.EventModels:
+		reconcileConfigurationValue(managed, event.Data, "current_model", "model")
+	case host.EventReasoningLevels:
+		reconcileConfigurationValue(managed, event.Data, "current_reasoning", "reasoning")
+	case host.EventPermissionModes:
+		reconcileConfigurationValue(managed, event.Data, "current_mode", "permission_mode")
+	case host.EventConfigCatalog:
+		reconcileConfigurationValue(managed, event.Data, "current_model", "model")
+		reconcileConfigurationValue(managed, event.Data, "current_reasoning", "reasoning")
+		reconcileConfigurationValue(managed, event.Data, "current_mode", "permission_mode")
+	default:
+		return
+	}
+}
+
+func reconcileConfigurationValue(managed *managedSession, data map[string]any, key, field string) {
+	raw, ok := data[key]
+	if !ok {
+		return
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return
+	}
+	value = strings.TrimSpace(value)
+	switch field {
+	case "model":
+		managed.configuration.Model = value
+		managed.configurationEvent.model++
+	case "reasoning":
+		managed.configuration.Reasoning = value
+		managed.configurationEvent.reasoning++
+	case "permission_mode":
+		managed.configuration.PermissionMode = value
+		managed.configurationEvent.permission++
+	}
+}
+
+func mergeUnreportedConfiguration(managed *managedSession, update host.SessionConfiguration, before configurationEventVersions) {
+	if managed == nil {
+		return
+	}
+	update = normalizeConfiguration(update)
+	if update.Model != "" && managed.configurationEvent.model == before.model {
+		managed.configuration.Model = update.Model
+	}
+	if update.Reasoning != "" && managed.configurationEvent.reasoning == before.reasoning {
+		managed.configuration.Reasoning = update.Reasoning
+	}
+	if update.PermissionMode != "" && managed.configurationEvent.permission == before.permission {
+		managed.configuration.PermissionMode = update.PermissionMode
+	}
+}
+
+func managedConfiguration(r *Runtime, sessionID string) host.SessionConfiguration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if managed := r.sessions[sessionID]; managed != nil {
+		return managed.configuration
+	}
+	return host.SessionConfiguration{}
 }
 
 func cloneQueueEntries(entries []QueueEntry) []QueueEntry {

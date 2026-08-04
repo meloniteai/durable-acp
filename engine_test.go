@@ -375,6 +375,20 @@ func TestEngineHostJournalManifestAndSnapshot(t *testing.T) {
 	if err != nil || resolved.PendingInteraction != nil {
 		t.Fatalf("resolved interaction snapshot = %#v, %v", resolved.PendingInteraction, err)
 	}
+	adapter.emit(host.Event{Type: host.EventModels, Data: map[string]any{"current_model": "model-canonical"}})
+	adapter.emit(host.Event{Type: host.EventReasoningLevels, Data: map[string]any{"current_reasoning": "medium"}})
+	adapter.emit(host.Event{Type: host.EventPermissionModes, Data: map[string]any{"current_mode": "manual"}})
+	configured, err := engine.Snapshot(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.Configuration != (Configuration{Model: "model-canonical", Reasoning: "medium", PermissionMode: "manual"}) {
+		t.Fatalf("provider configuration = %#v", configured.Configuration)
+	}
+	persisted, err := engine.loadSession(created.ID)
+	if err != nil || persisted.Configuration != configured.Configuration {
+		t.Fatalf("persisted provider configuration = %#v, %v", persisted.Configuration, err)
+	}
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
