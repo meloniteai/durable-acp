@@ -506,12 +506,10 @@ func (a *Adapter) Interrupt(ctx context.Context, sessionID string, _ host.EventS
 	if err != nil {
 		return err
 	}
-	cancelErr := managed.conn.Cancel(ctx, &acp.CancelNotification{SessionId: acp.SessionId(managed.backendID)})
 	managed.cancelInteractions()
-	turnID, cancel, promptDone := managed.takeTurn()
-	if cancel != nil {
-		cancel()
-	}
+	managed.cancelTurn()
+	cancelErr := managed.conn.Cancel(ctx, &acp.CancelNotification{SessionId: acp.SessionId(managed.backendID)})
+	turnID, _, promptDone := managed.takeTurn()
 	if turnID != "" {
 		managed.emitEvent(host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: "ACP turn interrupted", Data: map[string]any{"interrupted": true}})
 	}

@@ -858,7 +858,9 @@ func TestAdapterInterruptSettlesBeforeImmediateFollowUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForTrace(t, trace, "prompt:hang")
-	if err := adapter.Interrupt(context.Background(), "interrupt", nil); err != nil {
+	interruptContext, cancelInterrupt := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelInterrupt()
+	if err := adapter.Interrupt(interruptContext, "interrupt", nil); err != nil {
 		t.Fatal(err)
 	}
 	_ = waitForEvent(t, events, host.EventTurnFailed)
