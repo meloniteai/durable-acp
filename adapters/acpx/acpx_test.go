@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -356,6 +358,86 @@ func TestAdapterCatalogConfigurationAndResume(t *testing.T) {
 	}
 }
 
+func TestAdapterAppliesChangedConfigurationBeforeTurns(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "config.trace")
+	adapter := New(Config{
+		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(), "DURABLE_ACP_CONFIG_CHILD=1", "DURABLE_ACP_CONFIG_TRACE="+trace),
+	})
+	state, err := adapter.StartSession(context.Background(), "config", host.StartSessionRequest{
+		Worktree: t.TempDir(), Model: "model-b", Reasoning: "high", PermissionMode: "auto",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, sendErr := adapter.SendTurn(context.Background(), "config", host.SendTurnRequest{
+		Prompt: "one", Model: "model-b", Reasoning: "high", PermissionMode: "auto",
+	}, nil); sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	if _, sendErr := adapter.SendTurn(context.Background(), "config", host.SendTurnRequest{
+		Prompt: "two", Model: "model-b", Reasoning: "low", PermissionMode: "plan",
+	}, nil); sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	if closeErr := adapter.CloseSession("config"); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	// #nosec G304 -- trace is a test-owned path below t.TempDir.
+	raw, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(raw))
+	want := []string{"config:model=model-b", "config:reasoning=high", "mode:auto", "prompt:one", "config:reasoning=low", "mode:plan", "prompt:two"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("configuration trace = %#v, want %#v", got, want)
+	}
+	if state.ID != "provider-config" {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestAdapterTreatsUnadvertisedConfigurationAsOptional(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "config.trace")
+	adapter := New(Config{
+		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(), "DURABLE_ACP_CONFIG_CHILD=1", "DURABLE_ACP_CONFIG_EMPTY=1", "DURABLE_ACP_CONFIG_TRACE="+trace),
+	})
+	if _, err := adapter.StartSession(context.Background(), "optional", host.StartSessionRequest{
+		Worktree: t.TempDir(), Model: "unknown-model", Reasoning: "unknown-reasoning", PermissionMode: "unknown-mode",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.SendTurn(context.Background(), "optional", host.SendTurnRequest{
+		Prompt: "optional", Model: "unknown-model", Reasoning: "unknown-reasoning", PermissionMode: "unknown-mode",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.CloseSession("optional"); err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G304 -- trace is a test-owned path below t.TempDir.
+	raw, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(raw)); got != "prompt:optional" {
+		t.Fatalf("configuration trace = %q", got)
+	}
+}
+
+func TestAdapterReturnsAdvertisedConfigurationFailures(t *testing.T) {
+	adapter := New(Config{
+		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(), "DURABLE_ACP_CONFIG_CHILD=1", "DURABLE_ACP_CONFIG_FAIL=1"),
+	})
+	_, err := adapter.StartSession(context.Background(), "failure", host.StartSessionRequest{Worktree: t.TempDir(), Model: "model-b"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "set model") || !strings.Contains(err.Error(), "provider rejected configuration") {
+		t.Fatalf("configuration error = %v", err)
+	}
+}
+
 func waitForEvent(t *testing.T, events <-chan host.Event, kind host.EventType) host.Event {
 	t.Helper()
 	deadline := time.NewTimer(3 * time.Second)
@@ -373,6 +455,10 @@ func waitForEvent(t *testing.T, events <-chan host.Event, kind host.EventType) h
 }
 
 func TestACPChild(t *testing.T) {
+	if os.Getenv("DURABLE_ACP_CONFIG_CHILD") == "1" {
+		runConfigurationChild(t)
+		return
+	}
 	if os.Getenv("DURABLE_ACP_STUB_CHILD") != "1" {
 		return
 	}
@@ -445,6 +531,7 @@ func childConfigOptions() []map[string]any {
 type rpcMessage struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 	Result json.RawMessage `json:"result"`
 }
 
@@ -452,5 +539,109 @@ func writeRPC(t *testing.T, encoder *json.Encoder, id json.RawMessage, result an
 	t.Helper()
 	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func runConfigurationChild(t *testing.T) {
+	t.Helper()
+	decoder := json.NewDecoder(bufio.NewReader(os.Stdin))
+	encoder := json.NewEncoder(os.Stdout)
+	model := "model-a"
+	reasoning := "low"
+	mode := "ask"
+	configOptions := func() []map[string]any {
+		if os.Getenv("DURABLE_ACP_CONFIG_EMPTY") == "1" {
+			return nil
+		}
+		return []map[string]any{
+			{"type": "select", "id": "model", "name": "Model", "category": "model", "currentValue": model, "options": []map[string]any{{"value": "model-a", "name": "Model A"}, {"value": "model-b", "name": "Model B"}}},
+			{"type": "select", "id": "reasoning", "name": "Reasoning", "category": "thought_level", "currentValue": reasoning, "options": []map[string]any{{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}}},
+		}
+	}
+	modes := func() any {
+		if os.Getenv("DURABLE_ACP_CONFIG_EMPTY") == "1" {
+			return nil
+		}
+		return map[string]any{
+			"currentModeId":  mode,
+			"availableModes": []map[string]any{{"id": "ask", "name": "Ask"}, {"id": "auto", "name": "Auto"}, {"id": "plan", "name": "Plan"}},
+		}
+	}
+	trace := func(line string) {
+		path := os.Getenv("DURABLE_ACP_CONFIG_TRACE")
+		if path == "" {
+			return
+		}
+		// #nosec G304,G703 -- the parent test supplies the isolated trace path.
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintln(file, line); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for {
+		var message rpcMessage
+		if err := decoder.Decode(&message); err != nil {
+			return
+		}
+		switch message.Method {
+		case "initialize":
+			writeRPC(t, encoder, message.ID, map[string]any{"protocolVersion": 1})
+		case "session/new", "session/resume", "session/load":
+			writeRPC(t, encoder, message.ID, map[string]any{"sessionId": "provider-config", "configOptions": configOptions(), "modes": modes()})
+		case "session/set_config_option":
+			if os.Getenv("DURABLE_ACP_CONFIG_FAIL") == "1" {
+				if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32603, "message": "provider rejected configuration"}}); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			var params struct {
+				ConfigID string `json:"configId"`
+				Value    string `json:"value"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			switch params.ConfigID {
+			case "model":
+				model = params.Value
+			case "reasoning":
+				reasoning = params.Value
+			}
+			trace("config:" + params.ConfigID + "=" + params.Value)
+			writeRPC(t, encoder, message.ID, map[string]any{"configOptions": configOptions()})
+		case "session/set_mode":
+			var params struct {
+				ModeID string `json:"modeId"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			mode = params.ModeID
+			trace("mode:" + mode)
+			writeRPC(t, encoder, message.ID, map[string]any{})
+		case "session/prompt":
+			var params struct {
+				Prompt []struct {
+					Text string `json:"text"`
+				} `json:"prompt"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			text := ""
+			if len(params.Prompt) > 0 {
+				text = params.Prompt[0].Text
+			}
+			trace("prompt:" + text)
+			writeRPC(t, encoder, message.ID, map[string]any{"stopReason": "end_turn"})
+		}
 	}
 }

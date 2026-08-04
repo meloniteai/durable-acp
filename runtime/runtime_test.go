@@ -62,6 +62,91 @@ func TestRuntimeQueuesAndDispatchesTurns(t *testing.T) {
 	}
 }
 
+func TestRuntimeOwnsEffectiveSessionConfiguration(t *testing.T) {
+	adapter := &testAdapter{backend: "test"}
+	runtime := New(Config{DisableCoalescing: true}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "configuration", Backend: "test", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{
+		SessionID: "configuration", Model: "model-a", Reasoning: "low", PermissionMode: "ask",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := runtime.State("configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration != (host.SessionConfiguration{Model: "model-a", Reasoning: "low", PermissionMode: "ask"}) {
+		t.Fatalf("start configuration = %#v", state.Configuration)
+	}
+	if configErr := runtime.SetConfiguration("configuration", host.SessionConfiguration{Model: "model-b", Reasoning: "high", PermissionMode: "auto"}); configErr != nil {
+		t.Fatal(configErr)
+	}
+	if _, sendErr := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "configuration", Prompt: "first"}); sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	requests := adapter.requestsSnapshot()
+	if len(requests) != 1 || requests[0].Model != "model-b" || requests[0].Reasoning != "high" || requests[0].PermissionMode != "auto" {
+		t.Fatalf("first request = %#v", requests)
+	}
+	queued, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "configuration", Prompt: "second", Model: "model-c"})
+	if err != nil || !queued.Queued {
+		t.Fatalf("queued = %#v, %v", queued, err)
+	}
+	state, err = runtime.State("configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration.Model != "model-b" || len(state.QueueEntries) != 1 || state.QueueEntries[0].Request.Model != "model-c" || state.QueueEntries[0].Request.Reasoning != "high" {
+		t.Fatalf("queued configuration state = %#v", state)
+	}
+	adapter.emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "turn-1"})
+	deadline := time.Now().Add(time.Second)
+	for len(adapter.requestsSnapshot()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	state, err = runtime.State("configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration != (host.SessionConfiguration{Model: "model-c", Reasoning: "high", PermissionMode: "auto"}) {
+		t.Fatalf("dispatched configuration = %#v", state.Configuration)
+	}
+	adapter.emit(host.Event{Type: host.EventConfigCatalog, Data: map[string]any{
+		"current_model": "model-canonical", "current_reasoning": "medium", "current_mode": "manual",
+	}})
+	state, err = runtime.State("configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration != (host.SessionConfiguration{Model: "model-canonical", Reasoning: "medium", PermissionMode: "manual"}) {
+		t.Fatalf("provider configuration = %#v", state.Configuration)
+	}
+}
+
+func TestRuntimeDoesNotCommitFailedTurnConfiguration(t *testing.T) {
+	adapter := &testAdapter{backend: "test"}
+	runtime := New(Config{}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "failed-configuration", Backend: "test", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "failed-configuration", Model: "model-a"}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.sendErr = errors.New("provider rejected configuration")
+	if _, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "failed-configuration", Prompt: "fail", Model: "model-b"}); err == nil {
+		t.Fatal("Send accepted a provider failure")
+	}
+	state, err := runtime.State("failed-configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration.Model != "model-a" {
+		t.Fatalf("failed configuration = %#v", state.Configuration)
+	}
+}
+
 func TestRuntimeQueueEntriesRemovalBlockingAndDispatchLifecycle(t *testing.T) {
 	adapter := &testAdapter{backend: "test"}
 	var mu sync.Mutex
@@ -888,6 +973,7 @@ type testAdapter struct {
 	mu           sync.Mutex
 	sink         host.EventSink
 	turns        []string
+	requests     []host.SendTurnRequest
 	answer       host.InteractionResponse
 	startErr     error
 	sendErr      error
@@ -954,6 +1040,7 @@ func (a *testAdapter) SendTurn(_ context.Context, _ string, request host.SendTur
 	a.mu.Lock()
 	a.sink = emit
 	a.turns = append(a.turns, request.Prompt)
+	a.requests = append(a.requests, request)
 	turnID := fmt.Sprintf("turn-%d", len(a.turns))
 	a.mu.Unlock()
 	if a.sendErr != nil {
@@ -1005,6 +1092,12 @@ func (a *testAdapter) prompts() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.turns...)
+}
+
+func (a *testAdapter) requestsSnapshot() []host.SendTurnRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]host.SendTurnRequest(nil), a.requests...)
 }
 
 func (a *testAdapter) response() host.InteractionResponse {

@@ -61,6 +61,12 @@ type BackendSession struct {
 	TurnID   string `json:"turn_id,omitempty"`
 }
 
+type SessionConfiguration struct {
+	Model          string `json:"model,omitempty"`
+	Reasoning      string `json:"reasoning,omitempty"`
+	PermissionMode string `json:"permission_mode,omitempty"`
+}
+
 type EventType string
 
 const (
