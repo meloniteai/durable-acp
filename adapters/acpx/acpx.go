@@ -146,6 +146,7 @@ type managedSession struct {
 	turnMu     sync.RWMutex
 	turnID     string
 	turnCancel context.CancelFunc
+	promptDone chan struct{}
 	toolMu     sync.Mutex
 	tools      map[string]toolState
 	toolActive bool
@@ -445,13 +446,17 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 	}
 	turnID := fmt.Sprintf("%s:%d", managed.backendID, managed.turn.Add(1))
 	turnContext, cancelTurn := context.WithCancel(context.WithoutCancel(ctx))
-	managed.setTurn(turnID, cancelTurn)
+	promptDone := make(chan struct{})
+	managed.setTurn(turnID, cancelTurn, promptDone)
 	managed.emitEvent(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID, Data: map[string]any{"turn_id": turnID}})
 	promptFields := map[string]any{}
 	if a.config.ModelInPrompt && strings.TrimSpace(request.Model) != "" {
 		promptFields["model"] = strings.TrimSpace(request.Model)
 	}
-	go managed.runPrompt(turnContext, turnID, blocks, promptFields)
+	go func() {
+		defer close(promptDone)
+		managed.runPrompt(turnContext, turnID, blocks, promptFields)
+	}()
 	return host.BackendSession{ID: managed.backendID, ThreadID: managed.backendID, TurnID: turnID}, nil
 }
 
@@ -460,13 +465,13 @@ func (s *managedSession) runPrompt(ctx context.Context, turnID string, blocks []
 	defer s.clearTools()
 	target := s
 	response, err := s.conn.PromptWithFields(ctx, &acp.PromptRequest{SessionId: acp.SessionId(s.backendID), Prompt: blocks}, fields)
-	if err != nil && s.adapter.config.RestartOnExit && connectionDone(s.conn) {
+	if err != nil && ctx.Err() == nil && s.adapter.config.RestartOnExit && connectionDone(s.conn) {
 		replacementContext := context.WithoutCancel(ctx)
 		replacement, _, restartErr := s.adapter.replaceSession(replacementContext, s.hostID, s, s.emit)
 		if restartErr == nil {
 			replacement.turn.Store(s.turn.Load())
 			retryContext, cancelRetry := context.WithCancel(replacementContext)
-			replacement.setTurn(turnID, cancelRetry)
+			replacement.setTurn(turnID, cancelRetry, s.currentPromptDone())
 			replacement.promptMu.Lock()
 			response, err = replacement.conn.PromptWithFields(retryContext, &acp.PromptRequest{SessionId: acp.SessionId(replacement.backendID), Prompt: blocks}, fields)
 			replacement.promptMu.Unlock()
@@ -505,12 +510,19 @@ func (a *Adapter) Interrupt(ctx context.Context, sessionID string, _ host.EventS
 		return err
 	}
 	managed.cancelInteractions()
-	turnID, cancel := managed.takeTurn()
+	turnID, cancel, promptDone := managed.takeTurn()
 	if cancel != nil {
 		cancel()
 	}
 	if turnID != "" {
 		managed.emitEvent(host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: "ACP turn interrupted", Data: map[string]any{"interrupted": true}})
+	}
+	if promptDone != nil {
+		select {
+		case <-promptDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return nil
 }
@@ -1092,11 +1104,18 @@ func (s *managedSession) markReplay(event *host.Event) {
 	}
 }
 
-func (s *managedSession) setTurn(turnID string, cancel context.CancelFunc) {
+func (s *managedSession) setTurn(turnID string, cancel context.CancelFunc, promptDone chan struct{}) {
 	s.turnMu.Lock()
 	s.turnID = turnID
 	s.turnCancel = cancel
+	s.promptDone = promptDone
 	s.turnMu.Unlock()
+}
+
+func (s *managedSession) currentPromptDone() chan struct{} {
+	s.turnMu.RLock()
+	defer s.turnMu.RUnlock()
+	return s.promptDone
 }
 
 func (s *managedSession) finishTurn(turnID string) bool {
@@ -1124,14 +1143,16 @@ func (s *managedSession) cancelTurn() {
 	}
 }
 
-func (s *managedSession) takeTurn() (string, context.CancelFunc) {
+func (s *managedSession) takeTurn() (string, context.CancelFunc, chan struct{}) {
 	s.turnMu.Lock()
 	defer s.turnMu.Unlock()
 	turnID := s.turnID
 	cancel := s.turnCancel
+	promptDone := s.promptDone
 	s.turnID = ""
 	s.turnCancel = nil
-	return turnID, cancel
+	s.promptDone = nil
+	return turnID, cancel, promptDone
 }
 
 func (s *managedSession) takeTurnIf(turnID string) context.CancelFunc {
