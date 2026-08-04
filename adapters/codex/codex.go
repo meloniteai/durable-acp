@@ -39,11 +39,6 @@ func New(options ...acpx.Option) *Adapter {
 	}, options...)}
 }
 
-func (a *Adapter) Interrupt(ctx context.Context, sessionID string, emit host.EventSink) error {
-	interruptErr := a.Adapter.Interrupt(ctx, sessionID, emit)
-	return errors.Join(interruptErr, a.StopSessionProcess(sessionID))
-}
-
 func (a *Adapter) ForkPrompt(ctx context.Context, request host.ForkPromptRequest) (host.ForkPromptResponse, error) {
 	if strings.TrimSpace(request.SessionID) == "" {
 		return host.ForkPromptResponse{}, errors.New("codex: session ID is required")

@@ -241,6 +241,8 @@ type ForkMCPHTTPHeader struct {
 // Adapter emits an identified turn_started before turn-scoped, turn_completed,
 // or turn_failed events. All events for that turn use the same non-empty
 // BackendTurnID, which also matches the returned BackendSession.TurnID.
+// Interrupt ends only the active turn and preserves the provider process and
+// session for follow-up operations. CloseSession is the teardown boundary.
 type Adapter interface {
 	Backend() Backend
 	Detect(ctx context.Context) BackendStatus

@@ -59,12 +59,63 @@ func TestForkPrompt(t *testing.T) {
 	}
 }
 
+func TestInterruptPreservesProcessStateBeforeNextTurn(t *testing.T) {
+	adapter := New(
+		acpx.WithCommand(os.Args[0]),
+		acpx.WithArgs("-test.run=TestClaudeForkChild", "--"),
+		acpx.WithEnvironment(append(os.Environ(), "DURABLE_CLAUDE_FORK_CHILD=1")),
+	)
+	events := make(chan host.Event, 32)
+	if _, err := adapter.StartSession(context.Background(), "interrupt", host.StartSessionRequest{Worktree: t.TempDir()}, func(event host.Event) { events <- event }); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.CloseSession("interrupt") }()
+	if _, err := adapter.SendTurn(context.Background(), "interrupt", host.SendTurnRequest{Prompt: "start-background"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitClaudeEvent(t, events, func(event host.Event) bool { return event.Message == "claude background started" })
+	waitClaudeEvent(t, events, func(event host.Event) bool { return event.Type == host.EventTurnComplete })
+	if _, err := adapter.SendTurn(context.Background(), "interrupt", host.SendTurnRequest{Prompt: "hang-until-cancel"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitClaudeEvent(t, events, func(event host.Event) bool { return event.Message == "claude waiting for cancel" })
+	if err := adapter.Interrupt(context.Background(), "interrupt", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.SendTurn(context.Background(), "interrupt", host.SendTurnRequest{Prompt: "check-background"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitClaudeEvent(t, events, func(event host.Event) bool {
+		if event.Type == host.EventAgentRecovered {
+			t.Fatal("interrupt restarted the Claude process")
+		}
+		return event.Message == "claude background running"
+	})
+}
+
+func waitClaudeEvent(t *testing.T, events <-chan host.Event, match func(host.Event) bool) {
+	t.Helper()
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-events:
+			if match(event) {
+				return
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for Claude event")
+		}
+	}
+}
+
 func TestClaudeForkChild(t *testing.T) {
 	if os.Getenv("DURABLE_CLAUDE_FORK_CHILD") != "1" {
 		return
 	}
 	decoder := json.NewDecoder(bufio.NewReader(os.Stdin))
 	encoder := json.NewEncoder(os.Stdout)
+	background := false
 	for {
 		var message claudeRPCMessage
 		if err := decoder.Decode(&message); err != nil {
@@ -78,12 +129,58 @@ func TestClaudeForkChild(t *testing.T) {
 		case "session/fork":
 			writeClaudeRPC(t, encoder, message.ID, map[string]any{"sessionId": "provider-child"})
 		case "session/prompt":
-			appendClaudeTrace(t, "prompt:"+claudeSessionID(message.Params))
+			prompt := claudePromptText(message.Params)
+			switch prompt {
+			case "start-background":
+				background = true
+				writeClaudeUpdate(t, encoder, "agent_message_chunk", "claude background started")
+			case "hang-until-cancel":
+				writeClaudeUpdate(t, encoder, "agent_thought_chunk", "claude waiting for cancel")
+				for {
+					var next claudeRPCMessage
+					if err := decoder.Decode(&next); err != nil {
+						return
+					}
+					if next.Method == "session/cancel" {
+						break
+					}
+				}
+			case "check-background":
+				text := "claude background missing"
+				if background {
+					text = "claude background running"
+				}
+				writeClaudeUpdate(t, encoder, "agent_message_chunk", text)
+			default:
+				appendClaudeTrace(t, "prompt:"+claudeSessionID(message.Params))
+			}
 			writeClaudeRPC(t, encoder, message.ID, map[string]any{"stopReason": "end_turn"})
 		case "session/close":
 			appendClaudeTrace(t, "close:"+claudeSessionID(message.Params))
 			writeClaudeRPC(t, encoder, message.ID, map[string]any{})
 		}
+	}
+}
+
+func claudePromptText(raw json.RawMessage) string {
+	var params struct {
+		Prompt []struct {
+			Text string `json:"text"`
+		} `json:"prompt"`
+	}
+	_ = json.Unmarshal(raw, &params)
+	if len(params.Prompt) == 0 {
+		return ""
+	}
+	return params.Prompt[0].Text
+}
+
+func writeClaudeUpdate(t *testing.T, encoder *json.Encoder, update, text string) {
+	t.Helper()
+	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{
+		"sessionId": "provider-parent", "update": map[string]any{"sessionUpdate": update, "content": map[string]any{"type": "text", "text": text}},
+	}}); err != nil {
+		t.Fatal(err)
 	}
 }
 

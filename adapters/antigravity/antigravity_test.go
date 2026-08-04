@@ -126,6 +126,9 @@ func TestRestartResponseAndValidation(t *testing.T) {
 	if !turnCancelled || !provider.cancelled {
 		t.Fatal("active interrupt did not cancel the turn")
 	}
+	if provider.closed {
+		t.Fatal("active interrupt closed the provider session")
+	}
 	if err := adapter.Interrupt(context.Background(), "host", nil); err != nil {
 		t.Fatal(err)
 	}

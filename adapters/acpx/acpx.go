@@ -509,7 +509,7 @@ func (s *managedSession) runPrompt(ctx context.Context, turnID string, blocks []
 }
 
 // Interrupt cancels the active ACP prompt and resolves outstanding permission
-// and elicitation callbacks with cancellation.
+// and elicitation callbacks with cancellation while preserving the ACP process.
 func (a *Adapter) Interrupt(ctx context.Context, sessionID string, _ host.EventSink) error {
 	managed, err := a.session(sessionID)
 	if err != nil {

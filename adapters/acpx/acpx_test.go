@@ -846,7 +846,7 @@ func TestAdapterLoadPreferenceAndDeadProcessRestart(t *testing.T) {
 	}
 }
 
-func TestAdapterInterruptSettlesBeforeImmediateFollowUp(t *testing.T) {
+func TestAdapterInterruptPreservesProcessForImmediateFollowUp(t *testing.T) {
 	trace := filepath.Join(t.TempDir(), "interrupt.trace")
 	adapter := New(Config{
 		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
@@ -873,6 +873,15 @@ func TestAdapterInterruptSettlesBeforeImmediateFollowUp(t *testing.T) {
 	}
 	_ = waitForEvent(t, events, host.EventTurnComplete)
 	waitForTrace(t, trace, "prompt:again")
+	raw, err := os.ReadFile(trace) //nolint:gosec // The test owns the isolated trace path.
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(raw))
+	want := []string{"session/new", "prompt:hang", "prompt:again"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("interrupt trace = %#v, want process-local session preserved as %#v", got, want)
+	}
 }
 
 func TestAdapterTerminalEventAllowsImmediateFollowUp(t *testing.T) {
@@ -1085,13 +1094,14 @@ func runRecoveryChild(t *testing.T) {
 			}
 			trace("prompt:" + prompt)
 			if prompt == "hang" {
+			cancelled:
 				for {
 					var next rpcMessage
 					if err := decoder.Decode(&next); err != nil {
 						return
 					}
 					if next.Method == "session/cancel" {
-						return
+						break cancelled
 					}
 				}
 			}
