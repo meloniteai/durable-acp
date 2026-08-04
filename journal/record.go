@@ -24,6 +24,7 @@ type Record struct {
 	SchemaVersion int             `json:"schema_version"`
 	EventVersion  int             `json:"event_version"`
 	EventID       string          `json:"event_id"`
+	SourceEventID string          `json:"source_event_id,omitempty"`
 	Sequence      uint64          `json:"sequence"`
 	Timestamp     time.Time       `json:"timestamp"`
 	SessionID     string          `json:"session_id"`

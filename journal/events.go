@@ -60,10 +60,11 @@ func Translate(event host.Event) (Record, bool) {
 		return Record{}, false
 	}
 	return Record{
-		SessionID: event.SessionID,
-		Event:     name,
-		TurnID:    event.BackendTurnID,
-		Data:      raw,
+		SourceEventID: event.SourceEventID,
+		SessionID:     event.SessionID,
+		Event:         name,
+		TurnID:        event.BackendTurnID,
+		Data:          raw,
 	}, true
 }
 

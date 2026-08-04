@@ -185,6 +185,7 @@ func (s *Store) Append(record Record) (Record, error) {
 	if s.reducer != nil {
 		expectedSessionID := record.SessionID
 		expectedEventID := record.EventID
+		expectedSourceEventID := record.SourceEventID
 		expectedEventVersion := record.EventVersion
 		expectedTimestamp := record.Timestamp
 		reducedState, normalized, reduceErr := s.reducer(writer.state, record)
@@ -198,6 +199,7 @@ func (s *Store) Append(record Record) (Record, error) {
 		record.SchemaVersion = schemaVersion
 		record.EventVersion = expectedEventVersion
 		record.EventID = expectedEventID
+		record.SourceEventID = expectedSourceEventID
 		record.Sequence = writer.seq + 1
 		record.Timestamp = expectedTimestamp
 		record.SessionID = strings.TrimSpace(record.SessionID)
@@ -242,24 +244,39 @@ func (s *Store) Append(record Record) (Record, error) {
 	return record, nil
 }
 
-// Read returns records for sessionID through the inclusive sequence boundary.
-// A through value of zero returns every record.
-func (s *Store) Read(sessionID string, through uint64) ([]Record, error) {
+// Read returns records after the exclusive cursor through the inclusive cursor.
+// A zero cursor leaves that side of the range unbounded.
+func (s *Store) Read(sessionID string, after, through uint64) ([]Record, error) {
+	return s.read(sessionID, after, through, 0)
+}
+
+func (s *Store) read(sessionID string, after, through uint64, tail int) ([]Record, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return nil, errors.New("journal: session_id is required")
 	}
-
-	s.mu.Lock()
-	if writer := s.writers[sessionID]; writer != nil {
-		if err := writer.file.Sync(); err != nil {
-			s.mu.Unlock()
-			return nil, fmt.Errorf("journal: sync %s: %w", sessionID, err)
-		}
+	if through != 0 && after > through {
+		return nil, errors.New("journal: after sequence exceeds through sequence")
 	}
-	s.mu.Unlock()
 
-	return readJournal(s.path(sessionID), s.schemaID, through)
+	if err := s.syncSession(sessionID); err != nil {
+		return nil, err
+	}
+
+	return readJournal(s.path(sessionID), s.schemaID, after, through, tail)
+}
+
+// ReadAfter returns every record after the exclusive sequence cursor.
+func (s *Store) ReadAfter(sessionID string, after uint64) ([]Record, error) {
+	return s.Read(sessionID, after, 0)
+}
+
+// Tail returns at most the final limit records in durable sequence order.
+func (s *Store) Tail(sessionID string, limit int) ([]Record, error) {
+	if limit <= 0 {
+		return nil, errors.New("journal: tail limit must be positive")
+	}
+	return s.read(sessionID, 0, 0, limit)
 }
 
 // LastSequence returns the final durable sequence for a session.
@@ -268,18 +285,17 @@ func (s *Store) LastSequence(sessionID string) (uint64, error) {
 	if sessionID == "" {
 		return 0, errors.New("journal: session_id is required")
 	}
+	if err := s.syncSession(sessionID); err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	if writer := s.writers[sessionID]; writer != nil {
-		if err := writer.file.Sync(); err != nil {
-			s.mu.Unlock()
-			return 0, fmt.Errorf("journal: sync %s: %w", sessionID, err)
-		}
 		sequence := writer.seq
 		s.mu.Unlock()
 		return sequence, nil
 	}
 	s.mu.Unlock()
-	records, err := readJournal(s.path(sessionID), s.schemaID, 0)
+	records, err := readJournal(s.path(sessionID), s.schemaID, 0, 0, 1)
 	if err != nil {
 		return 0, err
 	}
@@ -324,7 +340,7 @@ func (s *Store) writerLocked(sessionID string) (*writer, error) {
 		return writer, nil
 	}
 
-	events, err := readJournal(s.path(sessionID), s.schemaID, 0)
+	events, err := readJournal(s.path(sessionID), s.schemaID, 0, 0, 0)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -360,7 +376,18 @@ func (s *Store) path(sessionID string) string {
 	return filepath.Join(s.dir, safeSessionID(sessionID)+journalFileExtension)
 }
 
-func readJournal(path, expectedSchema string, through uint64) ([]Record, error) {
+func (s *Store) syncSession(sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if writer := s.writers[sessionID]; writer != nil {
+		if err := writer.file.Sync(); err != nil {
+			return fmt.Errorf("journal: sync %s: %w", sessionID, err)
+		}
+	}
+	return nil
+}
+
+func readJournal(path, expectedSchema string, after, through uint64, tail int) ([]Record, error) {
 	// #nosec G304 -- path is derived from the configured store directory and a sanitized session ID.
 	file, err := os.Open(path)
 	if err != nil {
@@ -370,28 +397,36 @@ func readJournal(path, expectedSchema string, through uint64) ([]Record, error) 
 
 	reader := bufio.NewReader(file)
 	var out []Record
+	tailStart := 0
 	var lastSequence uint64
 	hasLastSequence := false
+	lineNumber := 0
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			if readErr == io.EOF && line[len(line)-1] != '\n' {
 				break
 			}
+			lineNumber++
 			var record Record
 			if err := json.Unmarshal(line, &record); err != nil {
-				return nil, fmt.Errorf("journal: decode %s line %d: %w", path, len(out)+1, err)
+				return nil, fmt.Errorf("journal: decode %s line %d: %w", path, lineNumber, err)
 			}
 			if record.Schema != expectedSchema || record.SchemaVersion != schemaVersion {
-				return nil, fmt.Errorf("journal: unsupported schema at %s line %d", path, len(out)+1)
+				return nil, fmt.Errorf("journal: unsupported schema at %s line %d", path, lineNumber)
 			}
 			if hasLastSequence && record.Sequence <= lastSequence {
-				return nil, fmt.Errorf("journal: non-monotonic sequence at %s line %d", path, len(out)+1)
+				return nil, fmt.Errorf("journal: non-monotonic sequence at %s line %d", path, lineNumber)
 			}
 			lastSequence = record.Sequence
 			hasLastSequence = true
-			if through == 0 || record.Sequence <= through {
-				out = append(out, record)
+			if record.Sequence > after && (through == 0 || record.Sequence <= through) {
+				if tail > 0 && len(out) == tail {
+					out[tailStart] = record
+					tailStart = (tailStart + 1) % tail
+				} else {
+					out = append(out, record)
+				}
 			}
 		}
 		if readErr == io.EOF {
@@ -400,6 +435,11 @@ func readJournal(path, expectedSchema string, through uint64) ([]Record, error) 
 		if readErr != nil {
 			return nil, fmt.Errorf("journal: read %s: %w", path, readErr)
 		}
+	}
+	if tailStart > 0 {
+		ordered := make([]Record, 0, len(out))
+		ordered = append(ordered, out[tailStart:]...)
+		out = append(ordered, out[:tailStart]...)
 	}
 	return out, nil
 }

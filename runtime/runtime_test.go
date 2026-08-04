@@ -649,6 +649,39 @@ func TestRuntimeRestoresLifecycleFromJournal(t *testing.T) {
 	}
 }
 
+func TestRuntimeJournalPreservesSourceEventIDAndSkipsEphemeralEvents(t *testing.T) {
+	store, err := journal.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	adapter := &testAdapter{backend: "test"}
+	runtime := New(Config{Journal: store, DisableCoalescing: true}, adapter)
+	if _, createErr := runtime.Create(context.Background(), CreateRequest{ID: "session-1", Backend: "test", Worktree: t.TempDir()}); createErr != nil {
+		t.Fatal(createErr)
+	}
+	if _, startErr := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "session-1"}); startErr != nil {
+		t.Fatal(startErr)
+	}
+	cursor, err := store.LastSequence("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter.emit(host.Event{SourceEventID: "source-message", Type: host.EventMessage, Role: "assistant", Message: "done"})
+	adapter.emit(host.Event{SourceEventID: "source-thinking", Type: host.EventThinking, Message: "private"})
+	adapter.emit(host.Event{SourceEventID: "source-tool", Type: host.EventToolStarted})
+	adapter.emit(host.Event{SourceEventID: "source-trace", Type: host.EventTraceUpdated})
+
+	records, err := store.ReadAfter("session-1", cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Event != journal.EventAgentMessage || records[0].SourceEventID != "source-message" {
+		t.Fatalf("semantic records = %#v", records)
+	}
+}
+
 //nolint:govet // Tests use scoped assertions for clearer failure locations.
 func TestRuntimeValidationQueueInterruptAndClose(t *testing.T) {
 	if _, err := (*Runtime)(nil).Create(context.Background(), CreateRequest{}); err == nil {
