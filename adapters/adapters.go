@@ -47,6 +47,6 @@ func Default(options ...Option) []host.Adapter {
 		claude.New(stderr(claude.Backend)...),
 		codex.New(stderr(codex.Backend)...),
 		cursor.New(stderr(cursor.Backend)...),
-		antigravity.New(stderr(antigravity.Backend)...),
+		antigravity.New(),
 	}
 }

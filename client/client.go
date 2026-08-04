@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"strings"
 	"time"
 
@@ -18,22 +19,36 @@ var (
 	ErrUnsupportedMethod          = errors.New("unsupported ACP client method")
 )
 
+type (
+	Direction = transport.Direction
+	Observer  = transport.Observer
+)
+
+const (
+	DirectionOutbound = transport.DirectionOutbound
+	DirectionInbound  = transport.DirectionInbound
+)
+
 type Spec struct {
-	Command        string
-	Args           []string
-	Dir            string
-	Env            []string
-	Stderr         io.Writer
-	Observe        transport.Observer
-	Handler        any
-	OnHandlerError func(error)
-	Initialize     acp.InitializeRequest
+	Command                string
+	Args                   []string
+	Dir                    string
+	Env                    []string
+	Stderr                 io.Writer
+	Observe                transport.Observer
+	Handler                any
+	OnHandlerError         func(error)
+	LegacyExtensions       bool
+	Initialize             acp.InitializeRequest
+	InitializeFields       map[string]any
+	ClientCapabilityFields map[string]any
 }
 
 type Connection struct {
 	process            *transport.Process
 	handler            any
 	onHandlerError     func(error)
+	legacyExtensions   bool
 	initializeResponse *acp.InitializeResponse
 }
 
@@ -68,6 +83,13 @@ type ExtensionHandler interface {
 	ExtensionNotification(context.Context, string, json.RawMessage) error
 }
 
+type requestIDKey struct{}
+
+func RequestID(ctx context.Context) string {
+	value, _ := ctx.Value(requestIDKey{}).(string)
+	return value
+}
+
 func Start(ctx context.Context, spec Spec) (*Connection, error) {
 	request := spec.Initialize
 	if request.ProtocolVersion == 0 {
@@ -81,9 +103,14 @@ func Start(ctx context.Context, spec Spec) (*Connection, error) {
 			acp.ProtocolVersionNumber,
 		)
 	}
+	params, err := initializeParams(request, spec.InitializeFields, spec.ClientCapabilityFields)
+	if err != nil {
+		return nil, fmt.Errorf("%s request: %w", acp.MethodInitialize, err)
+	}
 	client := &Connection{
-		handler:        spec.Handler,
-		onHandlerError: spec.OnHandlerError,
+		handler:          spec.Handler,
+		onHandlerError:   spec.OnHandlerError,
+		legacyExtensions: spec.LegacyExtensions,
 	}
 	process, err := transport.Start(ctx, transport.Spec{
 		Command:   spec.Command,
@@ -99,9 +126,28 @@ func Start(ctx context.Context, spec Spec) (*Connection, error) {
 		return nil, err
 	}
 	client.process = process
-	response, err := call[acp.InitializeResponse](ctx, process, acp.MethodInitialize, &request)
+	rawResponse, err := process.Call(ctx, acp.MethodInitialize, params)
 	if err != nil {
-		return nil, errors.Join(err, process.Close())
+		wrapped := fmt.Errorf("%s: %w", acp.MethodInitialize, err)
+		select {
+		case <-process.Done():
+			if tail := strings.TrimSpace(process.StderrTail(2 * time.Second)); tail != "" {
+				wrapped = fmt.Errorf("%w: %s", wrapped, tail)
+			}
+		default:
+		}
+		return nil, errors.Join(wrapped, process.Close())
+	}
+	rawResponse, err = normalizeInitializeResponse(rawResponse)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("%s response: %w", acp.MethodInitialize, err), process.Close())
+	}
+	var response acp.InitializeResponse
+	if unmarshalErr := json.Unmarshal(rawResponse, &response); unmarshalErr != nil {
+		return nil, errors.Join(fmt.Errorf("%s response: %w", acp.MethodInitialize, unmarshalErr), process.Close())
+	}
+	if response.ProtocolVersion == 0 {
+		response.ProtocolVersion = request.ProtocolVersion
 	}
 	if response.ProtocolVersion != acp.ProtocolVersionNumber {
 		err = fmt.Errorf(
@@ -112,8 +158,51 @@ func Start(ctx context.Context, spec Spec) (*Connection, error) {
 		)
 		return nil, errors.Join(err, process.Close())
 	}
-	client.initializeResponse = response
+	client.initializeResponse = &response
 	return client, nil
+}
+
+func initializeParams(request acp.InitializeRequest, fields, capabilityFields map[string]any) (map[string]any, error) {
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, err
+	}
+	maps.Copy(params, fields)
+	capabilities, _ := params["clientCapabilities"].(map[string]any)
+	if capabilities == nil {
+		capabilities = map[string]any{}
+		params["clientCapabilities"] = capabilities
+	}
+	maps.Copy(capabilities, capabilityFields)
+	if _, err := json.Marshal(params); err != nil {
+		return nil, err
+	}
+	return params, nil
+}
+
+func normalizeInitializeResponse(raw json.RawMessage) (json.RawMessage, error) {
+	var response map[string]any
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, err
+	}
+	agent, _ := response["agentCapabilities"].(map[string]any)
+	session, _ := agent["sessionCapabilities"].(map[string]any)
+	for _, key := range []string{"additionalDirectories", "close", "delete", "list", "resume"} {
+		enabled, ok := session[key].(bool)
+		if !ok {
+			continue
+		}
+		if enabled {
+			session[key] = map[string]any{}
+		} else {
+			delete(session, key)
+		}
+	}
+	return json.Marshal(response)
 }
 
 func (c *Connection) InitializeResponse() *acp.InitializeResponse {
@@ -152,7 +241,14 @@ func (c *Connection) ResumeSession(
 	ctx context.Context,
 	request *acp.ResumeSessionRequest,
 ) (*acp.ResumeSessionResponse, error) {
-	return call[acp.ResumeSessionResponse](ctx, c.process, acp.MethodSessionResume, request)
+	params := map[string]any{
+		"cwd": request.Cwd, "sessionId": request.SessionId,
+		"mcpServers": request.McpServers, "additionalDirectories": request.AdditionalDirectories,
+	}
+	if request.Meta != nil {
+		params["_meta"] = request.Meta
+	}
+	return call[acp.ResumeSessionResponse](ctx, c.process, acp.MethodSessionResume, params)
 }
 
 func (c *Connection) ListSessions(
@@ -199,7 +295,20 @@ func (c *Connection) Prompt(
 	ctx context.Context,
 	request *acp.PromptRequest,
 ) (*acp.PromptResponse, error) {
-	return call[acp.PromptResponse](ctx, c.process, acp.MethodSessionPrompt, request)
+	return c.PromptWithFields(ctx, request, nil)
+}
+
+func (c *Connection) PromptWithFields(ctx context.Context, request *acp.PromptRequest, fields map[string]any) (*acp.PromptResponse, error) {
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, &transport.RPCError{Code: transport.CodeInvalidParams, Message: err.Error()}
+	}
+	maps.Copy(params, fields)
+	return call[acp.PromptResponse](ctx, c.process, acp.MethodSessionPrompt, params)
 }
 
 func (c *Connection) Cancel(ctx context.Context, request *acp.CancelNotification) error {
@@ -217,12 +326,34 @@ func (c *Connection) CallExtension(
 	return c.process.Call(ctx, method, params)
 }
 
+func (c *Connection) CallProvider(
+	ctx context.Context,
+	method string,
+	params any,
+) (json.RawMessage, error) {
+	if err := c.validateProviderMethod(method); err != nil {
+		return nil, err
+	}
+	return c.process.Call(ctx, method, params)
+}
+
 func (c *Connection) NotifyExtension(
 	ctx context.Context,
 	method string,
 	params any,
 ) error {
 	if err := validateExtensionMethod(method); err != nil {
+		return err
+	}
+	return c.process.NotifyContext(ctx, method, params)
+}
+
+func (c *Connection) NotifyProvider(
+	ctx context.Context,
+	method string,
+	params any,
+) error {
+	if err := c.validateProviderMethod(method); err != nil {
 		return err
 	}
 	return c.process.NotifyContext(ctx, method, params)
@@ -248,13 +379,14 @@ func (c *Connection) handleRequest(
 	ctx context.Context,
 	message transport.Message,
 ) (any, error) {
+	ctx = context.WithValue(ctx, requestIDKey{}, wireRequestID(message.ID))
 	switch message.Method {
 	case acp.MethodSessionRequestPermission:
 		handler, ok := c.handler.(PermissionHandler)
 		if !ok {
 			return nil, unsupported(message.Method)
 		}
-		request, err := decodeParams[acp.RequestPermissionRequest](message.Params)
+		request, err := decodePermissionRequest(message.Params)
 		if err != nil {
 			return nil, err
 		}
@@ -340,7 +472,7 @@ func (c *Connection) handleRequest(
 		}
 		return handler.CreateElicitation(ctx, request)
 	default:
-		if strings.HasPrefix(message.Method, "_") {
+		if strings.HasPrefix(message.Method, "_") || c.legacyExtensions {
 			handler, ok := c.handler.(ExtensionHandler)
 			if !ok {
 				return nil, unsupported(message.Method)
@@ -349,6 +481,30 @@ func (c *Connection) handleRequest(
 		}
 		return nil, unsupported(message.Method)
 	}
+}
+
+func decodePermissionRequest(raw json.RawMessage) (*acp.RequestPermissionRequest, error) {
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, err
+	}
+	toolCall, _ := params["toolCall"].(map[string]any)
+	if _, ok := toolCall["rawInput"]; !ok {
+		rawInput := map[string]any{}
+		for _, key := range []string{"command", "path", "target", "args"} {
+			if value, exists := toolCall[key]; exists {
+				rawInput[key] = value
+			}
+		}
+		if len(rawInput) > 0 {
+			toolCall["rawInput"] = rawInput
+		}
+	}
+	normalized, err := json.Marshal(params)
+	if err != nil {
+		return nil, &transport.RPCError{Code: transport.CodeInvalidParams, Message: err.Error()}
+	}
+	return decodeParams[acp.RequestPermissionRequest](normalized)
 }
 
 func (c *Connection) handleNotification(message transport.Message) {
@@ -362,7 +518,7 @@ func (c *Connection) handleNotification(message transport.Message) {
 			break
 		}
 		var request *acp.SessionNotification
-		request, err = decodeParams[acp.SessionNotification](message.Params)
+		request, err = decodeSessionNotification(message.Params)
 		if err == nil {
 			err = handler.SessionUpdate(ctx, request)
 		}
@@ -378,7 +534,7 @@ func (c *Connection) handleNotification(message transport.Message) {
 			err = handler.ElicitationComplete(ctx, request)
 		}
 	default:
-		if !strings.HasPrefix(message.Method, "_") {
+		if !strings.HasPrefix(message.Method, "_") && !c.legacyExtensions {
 			err = unsupported(message.Method)
 			break
 		}
@@ -389,6 +545,47 @@ func (c *Connection) handleNotification(message transport.Message) {
 	}
 	if err != nil && c.onHandlerError != nil {
 		c.onHandlerError(err)
+	}
+}
+
+func decodeSessionNotification(raw json.RawMessage) (*acp.SessionNotification, error) {
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, &transport.RPCError{Code: transport.CodeInvalidParams, Message: err.Error()}
+	}
+	update, _ := params["update"].(map[string]any)
+	discriminator, _ := update["sessionUpdate"].(string)
+	var nested map[string]any
+	switch discriminator {
+	case "tool_call":
+		nested, _ = update["toolCall"].(map[string]any)
+	case "tool_call_update":
+		nested, _ = update["toolCallUpdate"].(map[string]any)
+	}
+	for key, value := range nested {
+		if _, exists := update[key]; !exists {
+			update[key] = value
+		}
+	}
+	normalized, err := json.Marshal(params)
+	if err != nil {
+		return nil, &transport.RPCError{Code: transport.CodeInvalidParams, Message: err.Error()}
+	}
+	return decodeParams[acp.SessionNotification](normalized)
+}
+
+func wireRequestID(raw json.RawMessage) string {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case float64:
+		return fmt.Sprintf("%g", typed)
+	default:
+		return ""
 	}
 }
 
@@ -440,4 +637,11 @@ func validateExtensionMethod(method string) error {
 		return fmt.Errorf("ACP extension methods must start with _: %q", method)
 	}
 	return nil
+}
+
+func (c *Connection) validateProviderMethod(method string) error {
+	if strings.HasPrefix(method, "_") || (c != nil && c.legacyExtensions && strings.TrimSpace(method) != "") {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrUnsupportedMethod, method)
 }

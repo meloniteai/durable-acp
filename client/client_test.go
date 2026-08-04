@@ -168,6 +168,35 @@ func TestClientRejectsUnsupportedRequestedProtocolVersion(t *testing.T) {
 	assert.NoError(t, validateExtensionMethod("_example/test"))
 }
 
+func TestInitializeParamsMergesExtensionFields(t *testing.T) {
+	params, err := initializeParams(acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+		ClientCapabilities: acp.ClientCapabilities{
+			Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
+		},
+	}, map[string]any{
+		"capabilities": map[string]any{},
+	}, map[string]any{
+		"plan": map[string]any{},
+	})
+	require.NoError(t, err)
+	assert.InDelta(t, acp.ProtocolVersionNumber, params["protocolVersion"], 0)
+	assert.IsType(t, map[string]any{}, params["capabilities"])
+	capabilities, ok := params["clientCapabilities"].(map[string]any)
+	require.True(t, ok)
+	assert.IsType(t, map[string]any{}, capabilities["plan"])
+	assert.IsType(t, map[string]any{}, capabilities["elicitation"])
+}
+
+func TestNormalizeInitializeResponseAcceptsBooleanSessionCapabilities(t *testing.T) {
+	raw, err := normalizeInitializeResponse(json.RawMessage(`{"agentCapabilities":{"sessionCapabilities":{"resume":true,"close":false}}}`))
+	require.NoError(t, err)
+	var response acp.InitializeResponse
+	require.NoError(t, json.Unmarshal(raw, &response))
+	require.NotNil(t, response.AgentCapabilities.SessionCapabilities.Resume)
+	assert.Nil(t, response.AgentCapabilities.SessionCapabilities.Close)
+}
+
 func TestClientRejectsUnsupportedAgentProtocolVersion(t *testing.T) {
 	client, err := Start(context.Background(), Spec{
 		Command: fixtureBinary,
@@ -197,6 +226,22 @@ func TestUnsupportedClientRequest(t *testing.T) {
 	require.ErrorAs(t, err, &rpcErr)
 	assert.Equal(t, transport.CodeMethodNotFound, rpcErr.Code)
 	assert.Contains(t, rpcErr.Message, ErrUnsupportedMethod.Error())
+}
+
+func TestClientCanForwardLegacyProviderExtensions(t *testing.T) {
+	handler := &completeHandler{calls: map[string]int{}}
+	client := &Connection{handler: handler, legacyExtensions: true}
+	result, err := client.handleRequest(context.Background(), transport.Message{
+		Method: "provider/request",
+		Params: json.RawMessage(`{"value":true}`),
+	})
+	require.NoError(t, err)
+	raw, ok := result.(json.RawMessage)
+	require.True(t, ok)
+	assert.JSONEq(t, `{"value":true}`, string(raw))
+	client.handleNotification(transport.Message{Method: "provider/update", Params: json.RawMessage(`{"value":true}`)})
+	assert.Equal(t, 1, handler.callCount("extension_request"))
+	assert.Equal(t, 1, handler.callCount("extension_notification"))
 }
 
 func TestClientRejectsInvalidCallbackParameters(t *testing.T) {

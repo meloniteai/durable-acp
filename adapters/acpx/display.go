@@ -42,11 +42,12 @@ func ToolDisplayFromACP(data map[string]any, status string) *host.ToolDisplay {
 			title = switchModeTitle(modeID)
 		}
 	}
-	if title == "" {
+	id := FirstNonEmpty(firstString(toolCall, "toolCallId", "tool_call_id", "id"), firstString(source, "toolCallId", "tool_call_id", "id"))
+	if title == "" && id == "" && target == "" {
 		return nil
 	}
 	display := &host.ToolDisplay{
-		ID:      FirstNonEmpty(firstString(toolCall, "toolCallId", "tool_call_id", "id"), firstString(source, "toolCallId", "tool_call_id", "id")),
+		ID:      id,
 		Title:   title,
 		Kind:    kind,
 		Status:  NormalizeToolStatus(FirstNonEmpty(status, stringAtValue(toolCall, "status"), stringAtValue(source, "status"))),

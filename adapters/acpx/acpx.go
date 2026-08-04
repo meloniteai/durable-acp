@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/meloniteai/durable-acp/acp"
 	"github.com/meloniteai/durable-acp/client"
@@ -24,12 +27,25 @@ import (
 // embedding host chooses installation and upgrade policy rather than relying
 // on an SDK-specific home directory or environment variable.
 type Config struct {
-	Backend     host.Backend
-	Command     string
-	Args        []string
-	Environment []string
-	Stderr      io.Writer
-	ClientName  string
+	Backend                 host.Backend
+	Command                 string
+	Args                    []string
+	Environment             []string
+	Stderr                  io.Writer
+	ClientName              string
+	ClientTitle             string
+	ClientVersion           string
+	ClientCapabilities      *acp.ClientCapabilities
+	InitializeFields        map[string]any
+	ClientCapabilityFields  map[string]any
+	LoadSessionFirst        bool
+	RestartOnExit           bool
+	LegacyExtensions        bool
+	BestEffortConfiguration bool
+	SessionModeValues       []string
+	DoneCompletionGrace     time.Duration
+	CompleteOnDone          bool
+	ModelInPrompt           bool
 }
 
 // Option customizes an ACP executable configuration.
@@ -62,6 +78,45 @@ func WithClientName(name string) Option {
 	return func(config *Config) { config.ClientName = strings.TrimSpace(name) }
 }
 
+func WithClientInfo(name, title, version string) Option {
+	return func(config *Config) {
+		config.ClientName = strings.TrimSpace(name)
+		config.ClientTitle = strings.TrimSpace(title)
+		config.ClientVersion = strings.TrimSpace(version)
+	}
+}
+
+func WithClientCapabilities(capabilities acp.ClientCapabilities) Option {
+	return func(config *Config) { config.ClientCapabilities = &capabilities }
+}
+
+func WithLoadSessionFirst(enabled bool) Option {
+	return func(config *Config) { config.LoadSessionFirst = enabled }
+}
+
+func WithRestartOnExit(enabled bool) Option {
+	return func(config *Config) { config.RestartOnExit = enabled }
+}
+
+func WithLegacyExtensions(enabled bool) Option {
+	return func(config *Config) { config.LegacyExtensions = enabled }
+}
+
+func WithBestEffortConfiguration(enabled bool) Option {
+	return func(config *Config) { config.BestEffortConfiguration = enabled }
+}
+
+func WithSessionModeValues(values ...string) Option {
+	return func(config *Config) { config.SessionModeValues = append([]string(nil), values...) }
+}
+
+func WithDoneCompletionGrace(grace time.Duration) Option {
+	return func(config *Config) {
+		config.DoneCompletionGrace = grace
+		config.CompleteOnDone = true
+	}
+}
+
 // Adapter implements host.Adapter for a standard ACP command.
 type Adapter struct {
 	config Config
@@ -77,6 +132,8 @@ type managedSession struct {
 	worktree  string
 	emit      host.EventSink
 	conn      *client.Connection
+	startupMu sync.Mutex
+	startup   []acp.SessionNotification
 	model     string
 	reasoning string
 	mode      string
@@ -84,16 +141,40 @@ type managedSession struct {
 	options   []acp.SessionConfigOption
 	modes     *acp.SessionModeState
 
-	promptMu sync.Mutex
-	turn     atomic.Uint64
-	turnMu   sync.RWMutex
-	turnID   string
+	promptMu   sync.Mutex
+	turn       atomic.Uint64
+	turnMu     sync.RWMutex
+	turnID     string
+	turnCancel context.CancelFunc
+	toolMu     sync.Mutex
+	tools      map[string]toolState
+	toolActive bool
 
 	interactionMu sync.Mutex
-	interactions  map[string]chan host.InteractionResponse
+	interactions  map[string]*pendingInteraction
 	interactionID uint64
 	done          chan struct{}
 	doneOnce      sync.Once
+	replayMu      sync.Mutex
+	replaying     bool
+	replayFirst   bool
+	forkMu        sync.Mutex
+	forks         map[string]*forkInteractionPolicy
+}
+
+type pendingInteraction struct {
+	request  host.InteractionRequest
+	response chan host.InteractionResponse
+}
+
+type toolState struct {
+	kind   string
+	target string
+}
+
+type forkInteractionPolicy struct {
+	allowedToolPrefixes []string
+	tools               map[string]string
 }
 
 // New creates an ACP command adapter. Invalid configuration is reported by
@@ -110,7 +191,81 @@ func New(config Config, options ...Option) *Adapter {
 	if config.ClientName == "" {
 		config.ClientName = "durable-acp"
 	}
+	if config.ClientVersion == "" {
+		config.ClientVersion = "1"
+	}
+	config.InitializeFields = maps.Clone(config.InitializeFields)
+	config.ClientCapabilityFields = maps.Clone(config.ClientCapabilityFields)
 	return &Adapter{config: config, sessions: map[string]*managedSession{}}
+}
+
+func adapterInitialize(config Config) acp.InitializeRequest {
+	capabilities := acp.ClientCapabilities{
+		Elicitation: &acp.ElicitationCapabilities{
+			Form: &acp.ElicitationFormCapabilities{},
+			Url:  &acp.ElicitationUrlCapabilities{},
+		},
+	}
+	if config.ClientCapabilities != nil {
+		capabilities = *config.ClientCapabilities
+	}
+	var title *string
+	if config.ClientTitle != "" {
+		value := config.ClientTitle
+		title = &value
+	}
+	return acp.InitializeRequest{
+		ClientInfo: &acp.Implementation{
+			Name:    config.ClientName,
+			Title:   title,
+			Version: config.ClientVersion,
+		},
+		ClientCapabilities: capabilities,
+	}
+}
+
+func resumeSession(ctx context.Context, connection *client.Connection, worktree, backendID string, loadFirst bool) ([]acp.SessionConfigOption, *acp.SessionModeState, error) {
+	load := func() ([]acp.SessionConfigOption, *acp.SessionModeState, error) {
+		response, err := connection.LoadSession(ctx, &acp.LoadSessionRequest{Cwd: worktree, SessionId: acp.SessionId(backendID), McpServers: []acp.McpServer{}})
+		if err != nil {
+			return nil, nil, err
+		}
+		return response.ConfigOptions, response.Modes, nil
+	}
+	resume := func() ([]acp.SessionConfigOption, *acp.SessionModeState, error) {
+		response, err := connection.ResumeSession(ctx, &acp.ResumeSessionRequest{Cwd: worktree, SessionId: acp.SessionId(backendID), McpServers: []acp.McpServer{}})
+		if err != nil {
+			return nil, nil, err
+		}
+		return response.ConfigOptions, response.Modes, nil
+	}
+	first, second := resume, load
+	label := "resume"
+	if loadFirst {
+		first, second = load, resume
+		label = "load"
+	}
+	options, modes, firstErr := first()
+	if firstErr == nil {
+		return options, modes, nil
+	}
+	options, modes, secondErr := second()
+	if secondErr == nil {
+		return options, modes, nil
+	}
+	return nil, nil, fmt.Errorf("acpx: %s session: %w", label, errors.Join(firstErr, secondErr))
+}
+
+func connectionDone(connection *client.Connection) bool {
+	if connection == nil {
+		return true
+	}
+	select {
+	case <-connection.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 // Backend identifies the configured provider.
@@ -137,7 +292,7 @@ func (a *Adapter) Detect(ctx context.Context) host.BackendStatus {
 // StartSession launches one ACP subprocess and creates or resumes its agent
 // session. Request Ext is intentionally opaque to this generic adapter.
 func (a *Adapter) StartSession(ctx context.Context, sessionID string, request host.StartSessionRequest, emit host.EventSink) (host.BackendSession, error) {
-	managed, state, err := a.openSession(ctx, sessionID, request, emit)
+	managed, state, err := a.openSession(ctx, sessionID, request, emit, true, a.config.LoadSessionFirst)
 	if err != nil {
 		return host.BackendSession{}, err
 	}
@@ -168,7 +323,7 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 	return state, nil
 }
 
-func (a *Adapter) openSession(ctx context.Context, sessionID string, request host.StartSessionRequest, emit host.EventSink) (*managedSession, host.BackendSession, error) {
+func (a *Adapter) openSession(ctx context.Context, sessionID string, request host.StartSessionRequest, emit host.EventSink, forceSelections, loadFirst bool) (*managedSession, host.BackendSession, error) {
 	if a == nil || a.Backend() == "" {
 		return nil, host.BackendSession{}, errors.New("acpx: backend is required")
 	}
@@ -194,25 +349,23 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 		hostID:       sessionID,
 		worktree:     filepath.Clean(request.Worktree),
 		emit:         emit,
-		interactions: map[string]chan host.InteractionResponse{},
+		interactions: map[string]*pendingInteraction{},
+		tools:        map[string]toolState{},
+		forks:        map[string]*forkInteractionPolicy{},
 		done:         make(chan struct{}),
 	}
 	connection, err := client.Start(ctx, client.Spec{
-		Command: resolved.Path,
-		Args:    append([]string(nil), a.config.Args...),
-		Dir:     managed.worktree,
-		Env:     adapterEnvironment(a.config.Environment, resolved.PathEnv),
-		Stderr:  a.config.Stderr,
-		Handler: managed,
-		Initialize: acp.InitializeRequest{
-			ClientInfo: &acp.Implementation{Name: a.config.ClientName, Version: "1"},
-			ClientCapabilities: acp.ClientCapabilities{
-				Elicitation: &acp.ElicitationCapabilities{
-					Form: &acp.ElicitationFormCapabilities{},
-					Url:  &acp.ElicitationUrlCapabilities{},
-				},
-			},
-		},
+		Command:                resolved.Path,
+		Args:                   append([]string(nil), a.config.Args...),
+		Dir:                    managed.worktree,
+		Env:                    adapterEnvironment(a.config.Environment, resolved.PathEnv),
+		Stderr:                 a.config.Stderr,
+		Handler:                managed,
+		Observe:                managed.observe,
+		LegacyExtensions:       a.config.LegacyExtensions,
+		Initialize:             adapterInitialize(a.config),
+		InitializeFields:       a.config.InitializeFields,
+		ClientCapabilityFields: a.config.ClientCapabilityFields,
 	})
 	if err != nil {
 		return nil, host.BackendSession{}, err
@@ -229,31 +382,31 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 			return nil, host.BackendSession{}, createErr
 		}
 		backendID = string(created.SessionId)
-		managed.backendID = backendID
+		managed.setBackendID(ctx, backendID)
 		options = created.ConfigOptions
 		modes = created.Modes
 		managed.initializeSelections(options, modes)
 		managed.emitConfig(created.ConfigOptions, created.Modes)
 	} else {
-		resumed, resumeErr := connection.ResumeSession(ctx, &acp.ResumeSessionRequest{Cwd: managed.worktree, SessionId: acp.SessionId(backendID)})
-		if resumeErr != nil {
-			loaded, loadErr := connection.LoadSession(ctx, &acp.LoadSessionRequest{Cwd: managed.worktree, SessionId: acp.SessionId(backendID)})
-			if loadErr != nil {
-				_ = connection.Close()
-				return nil, host.BackendSession{}, fmt.Errorf("acpx: resume session: %w", errors.Join(resumeErr, loadErr))
-			}
-			managed.backendID = backendID
-			options = loaded.ConfigOptions
-			modes = loaded.Modes
-			managed.initializeSelections(options, modes)
-			managed.emitConfig(loaded.ConfigOptions, loaded.Modes)
-		} else {
-			managed.backendID = backendID
-			options = resumed.ConfigOptions
-			modes = resumed.Modes
-			managed.initializeSelections(options, modes)
-			managed.emitConfig(resumed.ConfigOptions, resumed.Modes)
+		managed.setBackendID(ctx, backendID)
+		managed.beginReplay()
+		options, modes, err = resumeSession(ctx, connection, managed.worktree, backendID, loadFirst)
+		managed.endReplay()
+		if err != nil {
+			_ = connection.Close()
+			return nil, host.BackendSession{}, err
 		}
+		managed.initializeSelections(options, modes)
+		managed.emitConfig(options, modes)
+	}
+	if forceSelections && strings.TrimSpace(request.Model) != "" {
+		managed.setSelected("model", "")
+	}
+	if forceSelections && strings.TrimSpace(request.Reasoning) != "" {
+		managed.setSelected("reasoning", "")
+	}
+	if forceSelections && strings.TrimSpace(request.PermissionMode) != "" {
+		managed.setSelected("mode", "")
 	}
 	if err := managed.applySelections(ctx, request.Model, request.Reasoning, request.PermissionMode); err != nil {
 		managed.stop()
@@ -264,8 +417,7 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 	return managed, state, nil
 }
 
-// SendTurn sends an ACP prompt and emits its lifecycle around the synchronous
-// ACP request. ACP session updates continue to stream through the same sink.
+// SendTurn starts an ACP prompt and streams its lifecycle through the session sink.
 func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.SendTurnRequest, _ host.EventSink) (host.BackendSession, error) {
 	managed, err := a.session(sessionID)
 	if err != nil {
@@ -275,22 +427,71 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 	if len(blocks) == 0 {
 		return host.BackendSession{}, errors.New("acpx: prompt or attachment is required")
 	}
-	managed.promptMu.Lock()
-	defer managed.promptMu.Unlock()
+	if a.config.RestartOnExit && connectionDone(managed.conn) {
+		if _, restartErr := a.RestartSession(ctx, sessionID, managed.emit); restartErr != nil {
+			return host.BackendSession{}, restartErr
+		}
+		managed, err = a.session(sessionID)
+		if err != nil {
+			return host.BackendSession{}, err
+		}
+	}
+	if !managed.promptMu.TryLock() {
+		return host.BackendSession{}, fmt.Errorf("acpx: session %q already has an active turn", sessionID)
+	}
 	if configErr := managed.applySelections(ctx, request.Model, request.Reasoning, request.PermissionMode); configErr != nil {
+		managed.promptMu.Unlock()
 		return host.BackendSession{}, configErr
 	}
-	turnID := fmt.Sprintf("turn-%d", managed.turn.Add(1))
-	managed.setTurnID(turnID)
-	defer managed.setTurnID("")
+	turnID := fmt.Sprintf("%s:%d", managed.backendID, managed.turn.Add(1))
+	turnContext, cancelTurn := context.WithCancel(context.WithoutCancel(ctx))
+	managed.setTurn(turnID, cancelTurn)
 	managed.emitEvent(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID, Data: map[string]any{"turn_id": turnID}})
-	response, err := managed.conn.Prompt(ctx, &acp.PromptRequest{SessionId: acp.SessionId(managed.backendID), Prompt: blocks})
-	if err != nil {
-		managed.emitEvent(host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: err.Error()})
-		return host.BackendSession{}, err
+	promptFields := map[string]any{}
+	if a.config.ModelInPrompt && strings.TrimSpace(request.Model) != "" {
+		promptFields["model"] = strings.TrimSpace(request.Model)
 	}
-	managed.emitEvent(host.Event{Type: host.EventTurnComplete, BackendTurnID: turnID, Data: map[string]any{"stop_reason": response.StopReason}})
+	go managed.runPrompt(turnContext, turnID, blocks, promptFields)
 	return host.BackendSession{ID: managed.backendID, ThreadID: managed.backendID, TurnID: turnID}, nil
+}
+
+func (s *managedSession) runPrompt(ctx context.Context, turnID string, blocks []acp.ContentBlock, fields map[string]any) {
+	defer s.promptMu.Unlock()
+	defer s.clearTools()
+	target := s
+	response, err := s.conn.PromptWithFields(ctx, &acp.PromptRequest{SessionId: acp.SessionId(s.backendID), Prompt: blocks}, fields)
+	if err != nil && s.adapter.config.RestartOnExit && connectionDone(s.conn) {
+		replacementContext := context.WithoutCancel(ctx)
+		replacement, _, restartErr := s.adapter.replaceSession(replacementContext, s.hostID, s, s.emit)
+		if restartErr == nil {
+			replacement.turn.Store(s.turn.Load())
+			retryContext, cancelRetry := context.WithCancel(replacementContext)
+			replacement.setTurn(turnID, cancelRetry)
+			replacement.promptMu.Lock()
+			response, err = replacement.conn.PromptWithFields(retryContext, &acp.PromptRequest{SessionId: acp.SessionId(replacement.backendID), Prompt: blocks}, fields)
+			replacement.promptMu.Unlock()
+			target = replacement
+		} else {
+			err = errors.Join(err, restartErr)
+		}
+	}
+	if err != nil {
+		if target.finishTurn(turnID) {
+			data := map[string]any{}
+			if errors.Is(err, context.Canceled) {
+				data["interrupted"] = true
+			}
+			target.emitEvent(host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: err.Error(), Data: data})
+		}
+		return
+	}
+	if target.finishTurn(turnID) {
+		if response.StopReason == acp.StopReasonCancelled {
+			target.emitEvent(host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: "ACP turn interrupted", Data: map[string]any{"interrupted": true, "stop_reason": response.StopReason}})
+			return
+		}
+		target.emitEvent(host.Event{Type: host.EventTurnComplete, BackendTurnID: turnID, Data: map[string]any{"stop_reason": response.StopReason}})
+	}
 }
 
 // Interrupt cancels the active ACP prompt and resolves outstanding permission
@@ -300,8 +501,18 @@ func (a *Adapter) Interrupt(ctx context.Context, sessionID string, _ host.EventS
 	if err != nil {
 		return err
 	}
+	if err := managed.conn.Cancel(ctx, &acp.CancelNotification{SessionId: acp.SessionId(managed.backendID)}); err != nil {
+		return err
+	}
 	managed.cancelInteractions()
-	return managed.conn.Cancel(ctx, &acp.CancelNotification{SessionId: acp.SessionId(managed.backendID)})
+	turnID, cancel := managed.takeTurn()
+	if cancel != nil {
+		cancel()
+	}
+	if turnID != "" {
+		managed.emitEvent(host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: "ACP turn interrupted", Data: map[string]any{"interrupted": true}})
+	}
+	return nil
 }
 
 // RestartSession replaces the ACP subprocess and resumes its provider session.
@@ -312,6 +523,11 @@ func (a *Adapter) RestartSession(ctx context.Context, sessionID string, emit hos
 	}
 	managed.promptMu.Lock()
 	defer managed.promptMu.Unlock()
+	_, state, err := a.replaceSession(ctx, sessionID, managed, emit)
+	return state, err
+}
+
+func (a *Adapter) replaceSession(ctx context.Context, sessionID string, managed *managedSession, emit host.EventSink) (*managedSession, host.BackendSession, error) {
 	managed.stop()
 	_ = managed.conn.Close()
 	replacement, state, err := a.openSession(ctx, sessionID, host.StartSessionRequest{
@@ -320,21 +536,22 @@ func (a *Adapter) RestartSession(ctx context.Context, sessionID string, emit hos
 		Model:                  managed.selected("model"),
 		Reasoning:              managed.selected("reasoning"),
 		PermissionMode:         managed.selected("mode"),
-	}, emit)
+	}, emit, false, false)
 	if err != nil {
-		return host.BackendSession{}, err
+		return nil, host.BackendSession{}, err
 	}
+	replacement.turn.Store(managed.turn.Load())
 	a.mu.Lock()
 	if a.sessions[sessionID] != managed {
 		a.mu.Unlock()
 		replacement.stop()
 		_ = replacement.conn.Close()
-		return host.BackendSession{}, fmt.Errorf("acpx: session %q changed during restart", sessionID)
+		return nil, host.BackendSession{}, fmt.Errorf("acpx: session %q changed during restart", sessionID)
 	}
 	a.sessions[sessionID] = replacement
 	a.mu.Unlock()
 	replacement.emitEvent(host.Event{Type: host.EventAgentRecovered, Message: "ACP session restarted", Data: map[string]any{"restarted": true}})
-	return state, nil
+	return replacement, state, nil
 }
 
 // CloseSession terminates the ACP subprocess. It does not ask the agent to
@@ -374,7 +591,8 @@ func (a *Adapter) RespondInteraction(_ context.Context, sessionID string, respon
 		return fmt.Errorf("acpx: interaction %q not found", response.RequestID)
 	}
 	select {
-	case pending <- response:
+	case pending.response <- response:
+		managed.emitEvent(host.Event{Type: host.EventInteractionResolved, InteractionResponse: &response, Data: map[string]any{"request_id": response.RequestID, "action": response.Action}})
 		return nil
 	case <-managed.done:
 		return errors.New("acpx: session is closed")
@@ -397,15 +615,18 @@ func (a *Adapter) Catalog(ctx context.Context) (host.BackendCatalog, error) {
 		return host.BackendCatalog{}, err
 	}
 	defer func() { _ = os.RemoveAll(directory) }()
+	collector := &catalogCollector{}
 	connection, err := client.Start(ctx, client.Spec{
-		Command: resolved.Path,
-		Args:    append([]string(nil), a.config.Args...),
-		Dir:     directory,
-		Env:     adapterEnvironment(a.config.Environment, resolved.PathEnv),
-		Stderr:  a.config.Stderr,
-		Initialize: acp.InitializeRequest{
-			ClientInfo: &acp.Implementation{Name: a.config.ClientName, Version: "1"},
-		},
+		Command:                resolved.Path,
+		Args:                   append([]string(nil), a.config.Args...),
+		Dir:                    directory,
+		Env:                    adapterEnvironment(a.config.Environment, resolved.PathEnv),
+		Stderr:                 a.config.Stderr,
+		Handler:                collector,
+		LegacyExtensions:       a.config.LegacyExtensions,
+		Initialize:             adapterInitialize(a.config),
+		InitializeFields:       a.config.InitializeFields,
+		ClientCapabilityFields: a.config.ClientCapabilityFields,
 	})
 	if err != nil {
 		return host.BackendCatalog{}, err
@@ -415,7 +636,50 @@ func (a *Adapter) Catalog(ctx context.Context) (host.BackendCatalog, error) {
 	if err != nil {
 		return host.BackendCatalog{}, err
 	}
-	return catalogFromConfig(created.ConfigOptions, created.Modes), nil
+	catalog := catalogFromConfig(created.ConfigOptions, created.Modes)
+	modelOptionID := findOption(created.ConfigOptions, "model")
+	if modelOptionID != "" {
+		for index := range catalog.Models {
+			response, setErr := connection.SetSessionConfigOption(ctx, &acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+				ConfigId: acp.SessionConfigId(modelOptionID), SessionId: created.SessionId, Value: acp.SessionConfigValueId(catalog.Models[index].ID),
+			}})
+			if setErr != nil {
+				continue
+			}
+			catalog.Models[index].Reasoning = catalogFromConfig(response.ConfigOptions, nil).Reasoning
+		}
+	}
+	catalog.SlashCommands = collector.commands()
+	return catalog, nil
+}
+
+type catalogCollector struct {
+	mu            sync.Mutex
+	slashCommands []host.BackendSlashCommand
+}
+
+func (c *catalogCollector) SessionUpdate(_ context.Context, notification *acp.SessionNotification) error {
+	if notification == nil || notification.Update.AvailableCommandsUpdate == nil {
+		return nil
+	}
+	commands := make([]host.BackendSlashCommand, 0, len(notification.Update.AvailableCommandsUpdate.AvailableCommands))
+	for _, command := range notification.Update.AvailableCommandsUpdate.AvailableCommands {
+		inputHint := ""
+		if command.Input != nil && command.Input.Unstructured != nil {
+			inputHint = command.Input.Unstructured.Hint
+		}
+		commands = append(commands, host.BackendSlashCommand{Name: command.Name, Description: command.Description, InputHint: inputHint})
+	}
+	c.mu.Lock()
+	c.slashCommands = commands
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *catalogCollector) commands() []host.BackendSlashCommand {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]host.BackendSlashCommand(nil), c.slashCommands...)
 }
 
 // ResolveCommand returns only the executable path from Resolve. Callers that
@@ -450,15 +714,143 @@ func (s *managedSession) SessionUpdate(_ context.Context, notification *acp.Sess
 	if notification == nil {
 		return nil
 	}
+	s.startupMu.Lock()
+	backendID := s.backendID
+	if backendID == "" {
+		s.startup = append(s.startup, *notification)
+		s.startupMu.Unlock()
+		return nil
+	}
+	s.startupMu.Unlock()
+	if string(notification.SessionId) != "" && string(notification.SessionId) != backendID {
+		s.observeForkUpdate(string(notification.SessionId), notification.Update)
+		return nil
+	}
 	s.emitUpdate(notification.Update)
 	return nil
 }
 
-func (s *managedSession) RequestPermission(_ context.Context, request *acp.RequestPermissionRequest) (*acp.RequestPermissionResponse, error) {
+func (s *managedSession) setBackendID(ctx context.Context, backendID string) {
+	s.startupMu.Lock()
+	s.backendID = backendID
+	updates := append([]acp.SessionNotification(nil), s.startup...)
+	s.startup = nil
+	s.startupMu.Unlock()
+	for index := range updates {
+		_ = s.SessionUpdate(ctx, &updates[index])
+	}
+}
+
+func (s *managedSession) observe(_ context.Context, direction client.Direction, raw json.RawMessage) error {
+	if direction != client.DirectionInbound {
+		return nil
+	}
+	var message struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &message); err != nil {
+		return err
+	}
+	if len(message.Result) > 0 {
+		var result map[string]any
+		if json.Unmarshal(message.Result, &result) == nil && len(mapValue(result, "thread")) > 0 {
+			s.emitEvent(host.Event{Type: host.EventTraceUpdated, Data: map[string]any{"session_history": result}})
+		}
+	}
+	if message.Method != acp.MethodSessionUpdate {
+		return nil
+	}
+	var params map[string]any
+	if err := json.Unmarshal(message.Params, &params); err != nil {
+		return err
+	}
+	update := mapValue(params, "update")
+	discriminator := stringValue(update, "sessionUpdate")
+	if discriminator == "done" && s.adapter.config.CompleteOnDone {
+		s.scheduleDoneCompletion()
+		return nil
+	}
+	if event, ok := legacySessionUpdateEvent(params, update, discriminator); ok {
+		s.emitEvent(event)
+		return nil
+	}
+	if knownSessionUpdate(discriminator) {
+		return nil
+	}
+	s.emitEvent(host.Event{Type: host.EventTraceUpdated, Data: map[string]any{"provider_method": message.Method, "params": params}})
+	return nil
+}
+
+func legacySessionUpdateEvent(params, update map[string]any, discriminator string) (host.Event, bool) {
+	backendID := stringValue(params, "sessionId")
+	switch discriminator {
+	case "plan_update":
+		message := stringAtValue(update, "plan", "content")
+		if message == "" {
+			message = FirstNonEmpty(stringValue(update, "content"), stringValue(update, "message"))
+		}
+		return host.Event{Type: host.EventPlanUpdate, Message: message, BackendSessionID: backendID, Data: params}, true
+	case "plan_removed":
+		return host.Event{Type: host.EventPlanUpdate, Message: "Plan removed.", BackendSessionID: backendID, Data: params}, true
+	case "error":
+		return host.Event{Type: host.EventTurnFailed, Message: stringValue(update, "message"), BackendSessionID: backendID, Data: params}, true
+	default:
+		return host.Event{}, false
+	}
+}
+
+func (s *managedSession) scheduleDoneCompletion() {
+	turnID := s.currentTurnID()
+	if turnID == "" {
+		return
+	}
+	go func() {
+		if grace := s.adapter.config.DoneCompletionGrace; grace > 0 {
+			time.Sleep(grace)
+		}
+		s.interactionMu.Lock()
+		pending := len(s.interactions) > 0
+		s.interactionMu.Unlock()
+		s.toolMu.Lock()
+		tools := s.toolActive
+		s.toolMu.Unlock()
+		if pending || tools {
+			return
+		}
+		cancel := s.takeTurnIf(turnID)
+		if cancel == nil {
+			return
+		}
+		cancel()
+		s.promptMu.Lock()
+		finished := s.currentTurnID() == ""
+		s.promptMu.Unlock()
+		if !finished {
+			return
+		}
+		s.emitEvent(host.Event{Type: host.EventTurnComplete, BackendTurnID: turnID, Data: map[string]any{"stop_reason": "done"}})
+	}()
+}
+
+func knownSessionUpdate(value string) bool {
+	switch value {
+	case "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan", "available_commands_update", "current_mode_update", "config_option_update", "session_info_update", "usage_update":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *managedSession) RequestPermission(ctx context.Context, request *acp.RequestPermissionRequest) (*acp.RequestPermissionResponse, error) {
 	if request == nil {
 		return nil, errors.New("acpx: nil permission request")
 	}
-	id, response := s.awaitInteraction(host.InteractionRequest{
+	if string(request.SessionId) != "" && string(request.SessionId) != s.backendID {
+		return s.forkPermission(request), nil
+	}
+	id, response := s.awaitInteraction(client.RequestID(ctx), host.InteractionRequest{
 		Kind:    host.InteractionPermission,
 		Title:   permissionTitle(request.ToolCall),
 		Options: permissionOptions(request.Options),
@@ -479,15 +871,16 @@ func (s *managedSession) RequestPermission(_ context.Context, request *acp.Reque
 	}
 }
 
-func (s *managedSession) CreateElicitation(_ context.Context, request *acp.CreateElicitationRequest) (*acp.CreateElicitationResponse, error) {
+func (s *managedSession) CreateElicitation(ctx context.Context, request *acp.CreateElicitationRequest) (*acp.CreateElicitationResponse, error) {
 	if request == nil {
 		return nil, errors.New("acpx: nil elicitation request")
 	}
 	kind, title, message := elicitationDetails(request)
-	id, response := s.awaitInteraction(host.InteractionRequest{
+	id, response := s.awaitInteraction(client.RequestID(ctx), host.InteractionRequest{
 		Kind:    kind,
 		Title:   title,
 		Message: message,
+		Fields:  elicitationFields(request),
 		Data:    map[string]any{"elicitation": valueMap(request)},
 	})
 	defer s.removeInteraction(id)
@@ -506,13 +899,117 @@ func (s *managedSession) CreateElicitation(_ context.Context, request *acp.Creat
 	}
 }
 
-func (s *managedSession) awaitInteraction(request host.InteractionRequest) (string, <-chan host.InteractionResponse) {
+func (s *managedSession) ElicitationComplete(_ context.Context, notification *acp.CompleteElicitationNotification) error {
+	if notification != nil {
+		s.emitEvent(host.Event{Type: host.EventTraceUpdated, Data: map[string]any{"elicitation_complete": valueMap(*notification)}})
+	}
+	return nil
+}
+
+func (s *managedSession) observeForkUpdate(sessionID string, update acp.SessionUpdate) {
+	if update.ToolCall == nil {
+		return
+	}
+	data := valueMap(*update.ToolCall)
+	toolName := strings.TrimSpace(FirstNonEmpty(
+		stringValue(mapValue(mapValue(data, "_meta"), "claudeCode"), "toolName"),
+		stringValue(data, "toolName"),
+		update.ToolCall.Title,
+	))
+	s.forkMu.Lock()
+	if policy := s.forks[sessionID]; policy != nil {
+		policy.tools[string(update.ToolCall.ToolCallId)] = toolName
+	}
+	s.forkMu.Unlock()
+}
+
+func (s *managedSession) forkPermission(request *acp.RequestPermissionRequest) *acp.RequestPermissionResponse {
+	s.forkMu.Lock()
+	policy := s.forks[string(request.SessionId)]
+	toolName := ""
+	if policy != nil {
+		toolName = policy.tools[string(request.ToolCall.ToolCallId)]
+	}
+	allowed := false
+	for _, prefix := range policyPrefixes(policy) {
+		if strings.HasPrefix(toolName, prefix) {
+			allowed = true
+			break
+		}
+	}
+	s.forkMu.Unlock()
+	if !allowed {
+		return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}}
+	}
+	optionID := choosePermissionOption(host.InteractionResponse{Action: "approve"}, request.Options)
+	if optionID == "" {
+		return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}}
+	}
+	return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Selected: &acp.RequestPermissionOutcomeSelected{OptionId: acp.PermissionOptionId(optionID)}}}
+}
+
+func policyPrefixes(policy *forkInteractionPolicy) []string {
+	if policy == nil {
+		return nil
+	}
+	return policy.allowedToolPrefixes
+}
+
+func (s *managedSession) ExtensionRequest(ctx context.Context, method string, params json.RawMessage) (any, error) {
+	var payload any
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return nil, err
+	}
+	data := map[string]any{"method": method, "params": payload}
+	kind := host.InteractionForm
+	lower := strings.ToLower(method)
+	switch {
+	case strings.Contains(lower, "permission") || strings.Contains(lower, "approval"):
+		kind = host.InteractionPermission
+	case strings.Contains(lower, "plan"):
+		kind = host.InteractionPlan
+	case strings.Contains(lower, "question") || strings.Contains(lower, "ask"):
+		kind = host.InteractionChoice
+	}
+	id, response := s.awaitInteraction(client.RequestID(ctx), host.InteractionRequest{Kind: kind, Title: method, Data: data})
+	defer s.removeInteraction(id)
+	select {
+	case answer := <-response:
+		if answer.Values != nil {
+			if result, ok := answer.Values["_result"]; ok && len(answer.Values) == 1 {
+				return result, nil
+			}
+			return answer.Values, nil
+		}
+		return map[string]any{
+			"action":   answer.Action,
+			"optionId": answer.OptionID,
+			"message":  answer.Message,
+		}, nil
+	case <-s.done:
+		return map[string]any{"action": "cancel"}, nil
+	}
+}
+
+func (s *managedSession) ExtensionNotification(_ context.Context, method string, params json.RawMessage) error {
+	var payload any
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return err
+	}
+	s.emitEvent(host.Event{Type: host.EventTraceUpdated, Data: map[string]any{"extension_method": method, "params": payload}})
+	return nil
+}
+
+func (s *managedSession) awaitInteraction(preferredID string, request host.InteractionRequest) (string, <-chan host.InteractionResponse) {
 	s.interactionMu.Lock()
-	s.interactionID++
-	id := fmt.Sprintf("interaction-%d", s.interactionID)
+	id := strings.TrimSpace(preferredID)
+	if id == "" || s.interactions[id] != nil {
+		s.interactionID++
+		id = fmt.Sprintf("interaction-%d", s.interactionID)
+	}
 	request.ID = id
 	response := make(chan host.InteractionResponse, 1)
-	s.interactions[id] = response
+	s.interactions[id] = &pendingInteraction{request: request, response: response}
 	s.interactionMu.Unlock()
 	s.emitEvent(host.Event{Type: host.EventInteractionRequested, Interaction: &request})
 	return id, response
@@ -526,15 +1023,15 @@ func (s *managedSession) removeInteraction(id string) {
 
 func (s *managedSession) cancelInteractions() {
 	s.interactionMu.Lock()
-	responses := make([]chan host.InteractionResponse, 0, len(s.interactions))
-	for id, response := range s.interactions {
+	responses := make([]*pendingInteraction, 0, len(s.interactions))
+	for id, pending := range s.interactions {
 		delete(s.interactions, id)
-		responses = append(responses, response)
+		responses = append(responses, pending)
 	}
 	s.interactionMu.Unlock()
-	for _, response := range responses {
+	for _, pending := range responses {
 		select {
-		case response <- host.InteractionResponse{Action: "cancel"}:
+		case pending.response <- host.InteractionResponse{RequestID: pending.request.ID, Action: "cancel"}:
 		default:
 		}
 	}
@@ -543,6 +1040,7 @@ func (s *managedSession) cancelInteractions() {
 func (s *managedSession) stop() {
 	s.doneOnce.Do(func() {
 		close(s.done)
+		s.cancelTurn()
 		s.cancelInteractions()
 	})
 }
@@ -561,13 +1059,91 @@ func (s *managedSession) emitEvent(event host.Event) {
 	if event.BackendThreadID == "" {
 		event.BackendThreadID = s.backendID
 	}
+	s.markReplay(&event)
 	s.emit(event)
 }
 
-func (s *managedSession) setTurnID(turnID string) {
+func (s *managedSession) beginReplay() {
+	s.replayMu.Lock()
+	s.replaying = true
+	s.replayFirst = true
+	s.replayMu.Unlock()
+}
+
+func (s *managedSession) endReplay() {
+	s.replayMu.Lock()
+	s.replaying = false
+	s.replayMu.Unlock()
+}
+
+func (s *managedSession) markReplay(event *host.Event) {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+	if !s.replaying {
+		return
+	}
+	if event.Local == nil {
+		event.Local = map[string]any{}
+	}
+	event.Local["acpx.replay"] = true
+	if s.replayFirst {
+		event.Local["acpx.replay_start"] = true
+		s.replayFirst = false
+	}
+}
+
+func (s *managedSession) setTurn(turnID string, cancel context.CancelFunc) {
 	s.turnMu.Lock()
 	s.turnID = turnID
+	s.turnCancel = cancel
 	s.turnMu.Unlock()
+}
+
+func (s *managedSession) finishTurn(turnID string) bool {
+	s.turnMu.Lock()
+	if s.turnID != turnID {
+		s.turnMu.Unlock()
+		return false
+	}
+	cancel := s.turnCancel
+	s.turnID = ""
+	s.turnCancel = nil
+	s.turnMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return true
+}
+
+func (s *managedSession) cancelTurn() {
+	s.turnMu.Lock()
+	cancel := s.turnCancel
+	s.turnMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *managedSession) takeTurn() (string, context.CancelFunc) {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	turnID := s.turnID
+	cancel := s.turnCancel
+	s.turnID = ""
+	s.turnCancel = nil
+	return turnID, cancel
+}
+
+func (s *managedSession) takeTurnIf(turnID string) context.CancelFunc {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.turnID != turnID {
+		return nil
+	}
+	cancel := s.turnCancel
+	s.turnID = ""
+	s.turnCancel = nil
+	return cancel
 }
 
 func (s *managedSession) currentTurnID() string {
@@ -579,33 +1155,55 @@ func (s *managedSession) currentTurnID() string {
 func (s *managedSession) emitUpdate(update acp.SessionUpdate) {
 	switch {
 	case update.UserMessageChunk != nil:
-		s.emitEvent(host.Event{Type: host.EventMessage, Role: "user", Message: contentText(update.UserMessageChunk.Content)})
+		message := contentText(update.UserMessageChunk.Content)
+		if message != "" {
+			data := valueMap(*update.UserMessageChunk)
+			data["delta"] = message
+			s.emitEvent(host.Event{Type: host.EventMessage, Role: "user", Message: message, Data: data})
+		}
 	case update.AgentMessageChunk != nil:
-		s.emitEvent(host.Event{Type: host.EventMessage, Role: "assistant", Message: contentText(update.AgentMessageChunk.Content)})
+		message := contentText(update.AgentMessageChunk.Content)
+		if message != "" {
+			data := valueMap(*update.AgentMessageChunk)
+			data["delta"] = message
+			s.emitEvent(host.Event{Type: host.EventMessage, Role: "assistant", Message: message, Data: data})
+		}
 	case update.AgentThoughtChunk != nil:
-		s.emitEvent(host.Event{Type: host.EventThinking, Message: contentText(update.AgentThoughtChunk.Content)})
+		message := contentText(update.AgentThoughtChunk.Content)
+		if message != "" {
+			s.emitEvent(host.Event{Type: host.EventThinking, Message: message, Data: map[string]any{"delta": message}})
+		}
 	case update.ToolCall != nil:
-		s.emitEvent(host.Event{Type: host.EventToolStarted, ToolDisplay: toolDisplay(update.ToolCall.ToolCallId, update.ToolCall.Title, update.ToolCall.Kind, update.ToolCall.Status), Data: valueMap(*update.ToolCall)})
+		data := valueMap(*update.ToolCall)
+		display := ToolDisplayFromACP(data, string(update.ToolCall.Status))
+		s.rememberTool(string(update.ToolCall.ToolCallId), display)
+		s.toolMu.Lock()
+		s.toolActive = true
+		s.toolMu.Unlock()
+		s.emitEvent(host.Event{Type: host.EventToolStarted, ToolDisplay: display, Data: normalizedToolData(data, update.ToolCall.Content)})
 	case update.ToolCallUpdate != nil:
 		status := acp.ToolCallStatus("")
 		if update.ToolCallUpdate.Status != nil {
 			status = *update.ToolCallUpdate.Status
 		}
-		var title string
-		if update.ToolCallUpdate.Title != nil {
-			title = *update.ToolCallUpdate.Title
+		data := valueMap(*update.ToolCallUpdate)
+		display := s.mergeTool(string(update.ToolCallUpdate.ToolCallId), ToolDisplayFromACP(data, string(status)))
+		s.emitEvent(host.Event{Type: host.EventToolOutput, Message: toolContentText(update.ToolCallUpdate.Content, update.ToolCallUpdate.RawOutput), ToolDisplay: display, Data: normalizedToolData(data, update.ToolCallUpdate.Content)})
+		if display != nil && display.Status == "completed" && (display.Kind == "edit" || display.Kind == "delete" || display.Kind == "move") && display.Target != "" {
+			s.emitEvent(host.Event{Type: host.EventFileChanged, Data: map[string]any{"path": display.Target, "tool_call_id": display.ID}})
 		}
-		var kind acp.ToolKind
-		if update.ToolCallUpdate.Kind != nil {
-			kind = *update.ToolCallUpdate.Kind
-		}
-		s.emitEvent(host.Event{Type: host.EventToolOutput, ToolDisplay: toolDisplay(update.ToolCallUpdate.ToolCallId, title, kind, status), Data: valueMap(*update.ToolCallUpdate)})
 	case update.Plan != nil:
-		s.emitEvent(host.Event{Type: host.EventPlanUpdate, Data: valueMap(*update.Plan)})
+		data := valueMap(*update.Plan)
+		data["todos"] = normalizedPlanEntries(update.Plan.Entries)
+		s.emitEvent(host.Event{Type: host.EventTodoUpdate, Data: data})
 	case update.AvailableCommandsUpdate != nil:
 		commands := make([]host.BackendSlashCommand, 0, len(update.AvailableCommandsUpdate.AvailableCommands))
 		for _, command := range update.AvailableCommandsUpdate.AvailableCommands {
-			commands = append(commands, host.BackendSlashCommand{Name: command.Name, Description: command.Description})
+			inputHint := ""
+			if command.Input != nil && command.Input.Unstructured != nil {
+				inputHint = command.Input.Unstructured.Hint
+			}
+			commands = append(commands, host.BackendSlashCommand{Name: command.Name, Description: command.Description, InputHint: inputHint})
 		}
 		s.emitEvent(host.Event{Type: host.EventAvailableCommands, Data: map[string]any{"available_commands": commands}})
 	case update.ConfigOptionUpdate != nil:
@@ -614,6 +1212,121 @@ func (s *managedSession) emitUpdate(update acp.SessionUpdate) {
 		s.emitCurrentMode(update.CurrentModeUpdate.CurrentModeId)
 	case update.UsageUpdate != nil:
 		s.emitEvent(host.Event{Type: host.EventTraceUpdated, Data: valueMap(*update.UsageUpdate)})
+	}
+}
+
+func (s *managedSession) rememberTool(id string, display *host.ToolDisplay) {
+	if id == "" || display == nil {
+		return
+	}
+	s.toolMu.Lock()
+	if s.tools == nil {
+		s.tools = map[string]toolState{}
+	}
+	s.tools[id] = toolState{kind: display.Kind, target: display.Target}
+	s.toolMu.Unlock()
+}
+
+func (s *managedSession) mergeTool(id string, display *host.ToolDisplay) *host.ToolDisplay {
+	if display == nil {
+		display = &host.ToolDisplay{ID: id}
+	}
+	s.toolMu.Lock()
+	previous := s.tools[id]
+	if display.Kind == "" {
+		display.Kind = previous.kind
+	}
+	if display.Target == "" {
+		display.Target = previous.target
+	}
+	if display.Title == "" {
+		display.Title = DefaultToolTitle(display.Kind, display.Command)
+	}
+	if display.Status == "completed" || display.Status == "failed" {
+		delete(s.tools, id)
+	} else {
+		s.tools[id] = toolState{kind: display.Kind, target: display.Target}
+	}
+	s.toolMu.Unlock()
+	return display
+}
+
+func (s *managedSession) clearTools() {
+	s.toolMu.Lock()
+	s.tools = map[string]toolState{}
+	s.toolActive = false
+	s.toolMu.Unlock()
+}
+
+func normalizedPlanEntries(entries []acp.PlanEntry) []map[string]string {
+	result := make([]map[string]string, 0, len(entries))
+	for _, entry := range entries {
+		content := strings.TrimSpace(entry.Content)
+		status := strings.TrimSpace(string(entry.Status))
+		if content == "" || (status != "pending" && status != "in_progress" && status != "completed") {
+			continue
+		}
+		result = append(result, map[string]string{"content": content, "status": status})
+	}
+	return result
+}
+
+func normalizedToolData(data map[string]any, content []acp.ToolCallContent) map[string]any {
+	if data == nil {
+		data = map[string]any{}
+	}
+	images := toolContentImages(content)
+	if len(images) > 0 {
+		data["images"] = images
+	}
+	return data
+}
+
+func toolContentImages(content []acp.ToolCallContent) []map[string]any {
+	var images []map[string]any
+	for _, item := range content {
+		if item.Content == nil || item.Content.Content.Image == nil {
+			continue
+		}
+		image := item.Content.Content.Image
+		if image.Data == "" {
+			continue
+		}
+		mimeType := image.MimeType
+		if mimeType == "" {
+			mimeType = "image/png"
+		}
+		images = append(images, map[string]any{"mime_type": mimeType, "data_base64": image.Data})
+	}
+	return images
+}
+
+func toolContentText(content []acp.ToolCallContent, rawOutput any) string {
+	var parts []string
+	for _, item := range content {
+		if item.Content != nil {
+			if text := contentText(item.Content.Content); text != "" && text != "[image]" {
+				parts = append(parts, text)
+			}
+		}
+		if item.Diff != nil && item.Diff.Path != "" {
+			parts = append(parts, item.Diff.Path)
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n")
+	}
+	switch value := rawOutput.(type) {
+	case string:
+		return value
+	case nil:
+		return ""
+	default:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return ""
+		}
+		return string(raw)
 	}
 }
 
@@ -683,40 +1396,61 @@ func (s *managedSession) applySelections(ctx context.Context, model, reasoning, 
 	}
 	mode = strings.TrimSpace(mode)
 	if mode == "" || mode == s.selected("mode") {
-		return joined
+		return s.configurationResult(joined)
 	}
 	modes := s.modeState()
-	if modes != nil && len(modes.AvailableModes) > 0 {
+	if (modes != nil && len(modes.AvailableModes) > 0) || containsString(s.adapter.config.SessionModeValues, mode) {
 		if _, err := s.conn.SetSessionMode(ctx, &acp.SetSessionModeRequest{SessionId: acp.SessionId(s.backendID), ModeId: acp.SessionModeId(mode)}); err != nil {
-			return errors.Join(joined, fmt.Errorf("acpx: set mode: %w", err))
+			return s.configurationResult(errors.Join(joined, fmt.Errorf("acpx: set mode: %w", err)))
 		}
 		s.setSelected("mode", mode)
 		s.emitCurrentMode(acp.SessionModeId(mode))
-		return joined
+		return s.configurationResult(joined)
 	}
 	optionID := findOption(s.configOptions(), "mode", "permission_mode")
 	if optionID == "" {
 		s.setSelected("mode", mode)
-		return joined
+		return s.configurationResult(joined)
 	}
 	response, err := s.conn.SetSessionConfigOption(ctx, &acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
 		ConfigId: acp.SessionConfigId(optionID), SessionId: acp.SessionId(s.backendID), Value: acp.SessionConfigValueId(mode),
 	}})
 	if err != nil {
-		return errors.Join(joined, fmt.Errorf("acpx: set mode: %w", err))
+		return s.configurationResult(errors.Join(joined, fmt.Errorf("acpx: set mode: %w", err)))
 	}
 	s.setSelected("mode", mode)
 	s.emitAppliedSelection("mode", mode, response.ConfigOptions)
-	return joined
+	return s.configurationResult(joined)
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if strings.TrimSpace(candidate) == value {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *managedSession) configurationResult(err error) error {
+	if err == nil || !s.adapter.config.BestEffortConfiguration {
+		return err
+	}
+	s.emitEvent(host.Event{Type: host.EventTraceUpdated, Message: err.Error(), Data: map[string]any{"configuration_error": err.Error()}})
+	return nil
 }
 
 func (s *managedSession) emitAppliedSelection(kind, value string, options []acp.SessionConfigOption) {
 	s.emitConfig(options, nil)
+	catalog := catalogFromConfig(options, nil)
 	model, reasoning, mode := currentSelections(options)
 	switch kind {
 	case "model":
 		if model == "" {
 			s.emitEvent(host.Event{Type: host.EventModels, Data: map[string]any{"current_model": value}})
+		}
+		if len(catalog.Reasoning) == 0 {
+			s.emitEvent(host.Event{Type: host.EventReasoningLevels, Data: map[string]any{"reasoning": []host.BackendReasoning{}, "current_reasoning": ""}})
 		}
 	case "reasoning":
 		if reasoning == "" {
@@ -908,6 +1642,78 @@ func elicitationDetails(request *acp.CreateElicitationRequest) (host.Interaction
 	}
 }
 
+func elicitationFields(request *acp.CreateElicitationRequest) []host.InteractionField {
+	if request == nil || request.Form == nil {
+		return nil
+	}
+	schema := request.Form.RequestedSchema
+	required := make(map[string]bool, len(schema.Required))
+	order := make([]string, 0, len(schema.Properties))
+	seen := map[string]bool{}
+	for _, name := range schema.Required {
+		if _, ok := schema.Properties[name]; ok && !seen[name] {
+			required[name] = true
+			seen[name] = true
+			order = append(order, name)
+		}
+	}
+	optional := make([]string, 0, len(schema.Properties)-len(order))
+	for name := range schema.Properties {
+		if !seen[name] {
+			optional = append(optional, name)
+		}
+	}
+	sort.Strings(optional)
+	order = append(order, optional...)
+	fields := make([]host.InteractionField, 0, len(order))
+	for _, name := range order {
+		if strings.HasSuffix(name, "__note") {
+			continue
+		}
+		property, _ := schema.Properties[name].(map[string]any)
+		label := strings.TrimSpace(stringValue(property, "title"))
+		if label == "" {
+			label = name
+		}
+		options := elicitationOptions(property)
+		fieldType := strings.ToLower(strings.TrimSpace(stringValue(property, "type")))
+		_, hasNote := schema.Properties[name+"__note"]
+		fields = append(fields, host.InteractionField{
+			ID:            name,
+			Label:         label,
+			Description:   strings.TrimSpace(stringValue(property, "description")),
+			Required:      required[name],
+			Options:       options,
+			AllowFreeText: hasNote || len(options) == 0 && (fieldType == "" || fieldType == "string"),
+		})
+	}
+	return fields
+}
+
+func elicitationOptions(property map[string]any) []host.InteractionOption {
+	var options []host.InteractionOption
+	for _, raw := range anyValues(property["oneOf"]) {
+		item, _ := raw.(map[string]any)
+		id := strings.TrimSpace(FirstNonEmpty(stringValue(item, "const"), stringValue(item, "value"), stringValue(item, "id")))
+		if id == "" {
+			continue
+		}
+		label := strings.TrimSpace(FirstNonEmpty(stringValue(item, "title"), stringValue(item, "label"), id))
+		options = append(options, host.InteractionOption{ID: id, Label: label, Description: strings.TrimSpace(stringValue(item, "description"))})
+	}
+	if len(options) > 0 {
+		return options
+	}
+	for _, raw := range anyValues(property["enum"]) {
+		id, _ := raw.(string)
+		id = strings.TrimSpace(id)
+		if id != "" {
+			options = append(options, host.InteractionOption{ID: id, Label: id})
+		}
+	}
+	return options
+}
+
 func findOption(options []acp.SessionConfigOption, keys ...string) string {
 	for _, option := range options {
 		if option.Select == nil {
@@ -953,6 +1759,7 @@ func currentSelections(options []acp.SessionConfigOption) (string, string, strin
 
 func catalogFromConfig(options []acp.SessionConfigOption, modes *acp.SessionModeState) host.BackendCatalog {
 	catalog := host.BackendCatalog{}
+	modeIDs := map[string]bool{}
 	for _, option := range options {
 		if option.Select == nil {
 			continue
@@ -968,7 +1775,10 @@ func catalogFromConfig(options []acp.SessionConfigOption, modes *acp.SessionMode
 			case category == "model" || id == "model":
 				catalog.Models = append(catalog.Models, host.BackendModel{ID: item.ID, Label: item.Label})
 			case category == "mode" || id == "mode" || id == "permission_mode":
-				catalog.PermissionModes = append(catalog.PermissionModes, host.BackendPermissionMode{ID: item.ID, Label: item.Label})
+				if !modeIDs[item.ID] {
+					catalog.PermissionModes = append(catalog.PermissionModes, host.BackendPermissionMode{ID: item.ID, Label: item.Label})
+					modeIDs[item.ID] = true
+				}
 			case category == "thought_level" || id == "reasoning" || id == "reasoning_effort" || id == "effort":
 				catalog.Reasoning = append(catalog.Reasoning, host.BackendReasoning{ID: item.ID, Label: item.Label})
 			}
@@ -976,7 +1786,11 @@ func catalogFromConfig(options []acp.SessionConfigOption, modes *acp.SessionMode
 	}
 	if modes != nil {
 		for _, mode := range modes.AvailableModes {
-			catalog.PermissionModes = append(catalog.PermissionModes, host.BackendPermissionMode{ID: string(mode.Id), Label: mode.Name})
+			id := string(mode.Id)
+			if !modeIDs[id] {
+				catalog.PermissionModes = append(catalog.PermissionModes, host.BackendPermissionMode{ID: id, Label: mode.Name})
+				modeIDs[id] = true
+			}
 		}
 	}
 	return catalog
