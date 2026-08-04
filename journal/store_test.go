@@ -309,6 +309,90 @@ func TestStoreReaderHandlesTornTailAndRejectsEarlierProblems(t *testing.T) {
 	}
 }
 
+func TestStoreAppendRepairsTornTail(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, appendErr := store.Append(Record{SessionID: "torn", Event: "user.message"}); appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	if closeErr := store.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	path := filepath.Join(dir, "torn.jsonl")
+	// #nosec G304 -- path is inside the test temporary directory.
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, writeErr := file.WriteString(`{"partial":`); writeErr != nil {
+		_ = file.Close()
+		t.Fatal(writeErr)
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	store, err = NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	second, err := store.Append(Record{SessionID: "torn", Event: "agent.message"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Sequence != 2 {
+		t.Fatalf("sequence = %d, want 2", second.Sequence)
+	}
+	records, err := store.Read("torn", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Sequence != 1 || records[1].Sequence != 2 {
+		t.Fatalf("records = %#v", records)
+	}
+}
+
+func TestStoreReopensWriterAfterAppendFailure(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, appendErr := store.Append(Record{SessionID: "retry", Event: "user.message"}); appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	store.mu.Lock()
+	closeErr := store.writers["retry"].file.Close()
+	store.mu.Unlock()
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if _, appendErr := store.Append(Record{SessionID: "retry", Event: "agent.message"}); appendErr == nil {
+		t.Fatal("Append accepted a closed writer")
+	}
+	store.mu.Lock()
+	_, retained := store.writers["retry"]
+	store.mu.Unlock()
+	if retained {
+		t.Fatal("failed writer was retained")
+	}
+	retried, err := store.Append(Record{SessionID: "retry", Event: "agent.message"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Sequence != 2 {
+		t.Fatalf("sequence = %d, want 2", retried.Sequence)
+	}
+}
+
 func TestStoreReducerFailureAndValidation(t *testing.T) {
 	t.Parallel()
 

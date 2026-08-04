@@ -2,6 +2,7 @@ package journal
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -218,6 +219,7 @@ func (s *Store) Append(record Record) (Record, error) {
 	}
 
 	line, err := json.Marshal(record)
+	writerFailed := false
 	if err == nil {
 		line = append(line, '\n')
 		var written int
@@ -225,13 +227,21 @@ func (s *Store) Append(record Record) (Record, error) {
 		if err == nil && written != len(line) {
 			err = io.ErrShortWrite
 		}
+		writerFailed = err != nil
 	}
 	if err == nil {
 		err = writer.file.Sync()
+		writerFailed = err != nil
 	}
 	if err == nil {
 		writer.seq = record.Sequence
 		writer.state = nextState
+	}
+	if writerFailed {
+		delete(s.writers, record.SessionID)
+		if closeErr := writer.file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close failed writer: %w", closeErr))
+		}
 	}
 	listeners := append([]func(Record){}, s.listeners...)
 	s.mu.Unlock()
@@ -340,18 +350,24 @@ func (s *Store) writerLocked(sessionID string) (*writer, error) {
 		return writer, nil
 	}
 
-	events, err := readJournal(s.path(sessionID), s.schemaID, 0, 0, 0)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-
-	file, err := os.OpenFile(s.path(sessionID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	path := s.path(sessionID)
+	// #nosec G304 -- path is derived from the configured store directory and a sanitized session ID.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("journal: open %s: %w", sessionID, err)
 	}
-	if err := file.Chmod(0o600); err != nil {
+	if chmodErr := file.Chmod(0o600); chmodErr != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("journal: secure %s: %w", sessionID, err)
+		return nil, fmt.Errorf("journal: secure %s: %w", sessionID, chmodErr)
+	}
+	if repairErr := repairTornTail(file); repairErr != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("journal: repair %s: %w", sessionID, repairErr)
+	}
+	events, err := readJournal(path, s.schemaID, 0, 0, 0)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
 	}
 
 	writer := &writer{file: file}
@@ -370,6 +386,42 @@ func (s *Store) writerLocked(sessionID string) (*writer, error) {
 	}
 	s.writers[sessionID] = writer
 	return writer, nil
+}
+
+func repairTornTail(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	end := info.Size()
+	if end == 0 {
+		return nil
+	}
+	var last [1]byte
+	if _, err := file.ReadAt(last[:], end-1); err != nil {
+		return err
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	buffer := make([]byte, 32*1024)
+	truncateAt := int64(0)
+	for end > 0 {
+		start := max(0, end-int64(len(buffer)))
+		n, readErr := file.ReadAt(buffer[:int(end-start)], start)
+		if readErr != nil && readErr != io.EOF {
+			return readErr
+		}
+		if index := bytes.LastIndexByte(buffer[:n], '\n'); index >= 0 {
+			truncateAt = start + int64(index) + 1
+			break
+		}
+		end = start
+	}
+	if err := file.Truncate(truncateAt); err != nil {
+		return err
+	}
+	return file.Sync()
 }
 
 func (s *Store) path(sessionID string) string {
