@@ -168,6 +168,26 @@ func TestClientRejectsUnsupportedRequestedProtocolVersion(t *testing.T) {
 	assert.NoError(t, validateExtensionMethod("_example/test"))
 }
 
+func TestInitializeParamsMergesExtensionFields(t *testing.T) {
+	params, err := initializeParams(acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+		ClientCapabilities: acp.ClientCapabilities{
+			Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
+		},
+	}, map[string]any{
+		"capabilities": map[string]any{},
+	}, map[string]any{
+		"plan": map[string]any{},
+	})
+	require.NoError(t, err)
+	assert.InDelta(t, acp.ProtocolVersionNumber, params["protocolVersion"], 0)
+	assert.IsType(t, map[string]any{}, params["capabilities"])
+	capabilities, ok := params["clientCapabilities"].(map[string]any)
+	require.True(t, ok)
+	assert.IsType(t, map[string]any{}, capabilities["plan"])
+	assert.IsType(t, map[string]any{}, capabilities["elicitation"])
+}
+
 func TestNormalizeInitializeResponseAcceptsBooleanSessionCapabilities(t *testing.T) {
 	raw, err := normalizeInitializeResponse(json.RawMessage(`{"agentCapabilities":{"sessionCapabilities":{"resume":true,"close":false}}}`))
 	require.NoError(t, err)

@@ -299,6 +299,7 @@ func runQueuedTurns(t *testing.T, backend host.Backend) {
 
 	firstProof := "durable-acp-first-" + string(backend)
 	firstStarted := live.events.count(host.EventTurnStarted)
+	firstCompleted := live.events.count(host.EventTurnComplete)
 	firstDone := make(chan sendOutcome, 1)
 	go func() {
 		result, err := live.send(ctx, host.SendTurnRequest{
@@ -364,6 +365,11 @@ func runQueuedTurns(t *testing.T, backend host.Backend) {
 	first := <-firstDone
 	if first.err != nil || !first.result.Accepted || first.result.Queued {
 		t.Fatalf("first turn = %+v, %v", first.result, first.err)
+	}
+	if err := live.events.wait(ctx, "first queued turn to complete", func(events []host.Event) bool {
+		return countEvents(events, host.EventTurnComplete) > firstCompleted
+	}); err != nil {
+		t.Fatal(err)
 	}
 	state, err = engine.Runtime().State(session.ID)
 	if err != nil {

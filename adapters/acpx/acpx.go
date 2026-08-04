@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,6 +36,8 @@ type Config struct {
 	ClientTitle             string
 	ClientVersion           string
 	ClientCapabilities      *acp.ClientCapabilities
+	InitializeFields        map[string]any
+	ClientCapabilityFields  map[string]any
 	LoadSessionFirst        bool
 	RestartOnExit           bool
 	LegacyExtensions        bool
@@ -191,6 +194,8 @@ func New(config Config, options ...Option) *Adapter {
 	if config.ClientVersion == "" {
 		config.ClientVersion = "1"
 	}
+	config.InitializeFields = maps.Clone(config.InitializeFields)
+	config.ClientCapabilityFields = maps.Clone(config.ClientCapabilityFields)
 	return &Adapter{config: config, sessions: map[string]*managedSession{}}
 }
 
@@ -350,15 +355,17 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 		done:         make(chan struct{}),
 	}
 	connection, err := client.Start(ctx, client.Spec{
-		Command:          resolved.Path,
-		Args:             append([]string(nil), a.config.Args...),
-		Dir:              managed.worktree,
-		Env:              adapterEnvironment(a.config.Environment, resolved.PathEnv),
-		Stderr:           a.config.Stderr,
-		Handler:          managed,
-		Observe:          managed.observe,
-		LegacyExtensions: a.config.LegacyExtensions,
-		Initialize:       adapterInitialize(a.config),
+		Command:                resolved.Path,
+		Args:                   append([]string(nil), a.config.Args...),
+		Dir:                    managed.worktree,
+		Env:                    adapterEnvironment(a.config.Environment, resolved.PathEnv),
+		Stderr:                 a.config.Stderr,
+		Handler:                managed,
+		Observe:                managed.observe,
+		LegacyExtensions:       a.config.LegacyExtensions,
+		Initialize:             adapterInitialize(a.config),
+		InitializeFields:       a.config.InitializeFields,
+		ClientCapabilityFields: a.config.ClientCapabilityFields,
 	})
 	if err != nil {
 		return nil, host.BackendSession{}, err
@@ -610,14 +617,16 @@ func (a *Adapter) Catalog(ctx context.Context) (host.BackendCatalog, error) {
 	defer func() { _ = os.RemoveAll(directory) }()
 	collector := &catalogCollector{}
 	connection, err := client.Start(ctx, client.Spec{
-		Command:          resolved.Path,
-		Args:             append([]string(nil), a.config.Args...),
-		Dir:              directory,
-		Env:              adapterEnvironment(a.config.Environment, resolved.PathEnv),
-		Stderr:           a.config.Stderr,
-		Handler:          collector,
-		LegacyExtensions: a.config.LegacyExtensions,
-		Initialize:       adapterInitialize(a.config),
+		Command:                resolved.Path,
+		Args:                   append([]string(nil), a.config.Args...),
+		Dir:                    directory,
+		Env:                    adapterEnvironment(a.config.Environment, resolved.PathEnv),
+		Stderr:                 a.config.Stderr,
+		Handler:                collector,
+		LegacyExtensions:       a.config.LegacyExtensions,
+		Initialize:             adapterInitialize(a.config),
+		InitializeFields:       a.config.InitializeFields,
+		ClientCapabilityFields: a.config.ClientCapabilityFields,
 	})
 	if err != nil {
 		return host.BackendCatalog{}, err

@@ -51,6 +51,17 @@ func TestCodexForkChild(t *testing.T) {
 		}
 		switch message.Method {
 		case "initialize":
+			var params map[string]any
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			capabilities, _ := params["clientCapabilities"].(map[string]any)
+			if _, ok := capabilities["plan"].(map[string]any); !ok {
+				t.Fatalf("client capabilities = %#v, want plan capability", capabilities)
+			}
+			if _, ok := params["capabilities"].(map[string]any); !ok {
+				t.Fatalf("initialize params = %#v, want capabilities", params)
+			}
 			writeCodexRPC(t, encoder, message.ID, map[string]any{"protocolVersion": 1})
 		case "session/new":
 			writeCodexRPC(t, encoder, message.ID, map[string]any{"sessionId": "provider"})
@@ -63,6 +74,7 @@ func TestCodexForkChild(t *testing.T) {
 type codexRPCMessage struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 }
 
 func writeCodexRPC(t *testing.T, encoder *json.Encoder, id json.RawMessage, result any) {

@@ -29,6 +29,8 @@ func New(options ...acpx.Option) *Adapter {
 		Backend:                 Backend,
 		Command:                 "codex-acp",
 		ClientCapabilities:      &capabilities,
+		InitializeFields:        map[string]any{"capabilities": map[string]any{}},
+		ClientCapabilityFields:  map[string]any{"plan": map[string]any{}},
 		LoadSessionFirst:        true,
 		RestartOnExit:           true,
 		LegacyExtensions:        true,

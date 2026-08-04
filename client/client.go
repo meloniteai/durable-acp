@@ -30,16 +30,18 @@ const (
 )
 
 type Spec struct {
-	Command          string
-	Args             []string
-	Dir              string
-	Env              []string
-	Stderr           io.Writer
-	Observe          transport.Observer
-	Handler          any
-	OnHandlerError   func(error)
-	LegacyExtensions bool
-	Initialize       acp.InitializeRequest
+	Command                string
+	Args                   []string
+	Dir                    string
+	Env                    []string
+	Stderr                 io.Writer
+	Observe                transport.Observer
+	Handler                any
+	OnHandlerError         func(error)
+	LegacyExtensions       bool
+	Initialize             acp.InitializeRequest
+	InitializeFields       map[string]any
+	ClientCapabilityFields map[string]any
 }
 
 type Connection struct {
@@ -101,6 +103,10 @@ func Start(ctx context.Context, spec Spec) (*Connection, error) {
 			acp.ProtocolVersionNumber,
 		)
 	}
+	params, err := initializeParams(request, spec.InitializeFields, spec.ClientCapabilityFields)
+	if err != nil {
+		return nil, fmt.Errorf("%s request: %w", acp.MethodInitialize, err)
+	}
 	client := &Connection{
 		handler:          spec.Handler,
 		onHandlerError:   spec.OnHandlerError,
@@ -120,7 +126,7 @@ func Start(ctx context.Context, spec Spec) (*Connection, error) {
 		return nil, err
 	}
 	client.process = process
-	rawResponse, err := process.Call(ctx, acp.MethodInitialize, &request)
+	rawResponse, err := process.Call(ctx, acp.MethodInitialize, params)
 	if err != nil {
 		wrapped := fmt.Errorf("%s: %w", acp.MethodInitialize, err)
 		select {
@@ -154,6 +160,28 @@ func Start(ctx context.Context, spec Spec) (*Connection, error) {
 	}
 	client.initializeResponse = &response
 	return client, nil
+}
+
+func initializeParams(request acp.InitializeRequest, fields, capabilityFields map[string]any) (map[string]any, error) {
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, err
+	}
+	maps.Copy(params, fields)
+	capabilities, _ := params["clientCapabilities"].(map[string]any)
+	if capabilities == nil {
+		capabilities = map[string]any{}
+		params["clientCapabilities"] = capabilities
+	}
+	maps.Copy(capabilities, capabilityFields)
+	if _, err := json.Marshal(params); err != nil {
+		return nil, err
+	}
+	return params, nil
 }
 
 func normalizeInitializeResponse(raw json.RawMessage) (json.RawMessage, error) {
