@@ -461,9 +461,8 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 }
 
 func (s *managedSession) runPrompt(ctx context.Context, turnID string, blocks []acp.ContentBlock, fields map[string]any) {
-	defer s.promptMu.Unlock()
-	defer s.clearTools()
 	target := s
+	var replacementPromptMu *sync.Mutex
 	response, err := s.conn.PromptWithFields(ctx, &acp.PromptRequest{SessionId: acp.SessionId(s.backendID), Prompt: blocks}, fields)
 	if err != nil && ctx.Err() == nil && s.adapter.config.RestartOnExit && connectionDone(s.conn) {
 		replacementContext := context.WithoutCancel(ctx)
@@ -473,29 +472,39 @@ func (s *managedSession) runPrompt(ctx context.Context, turnID string, blocks []
 			retryContext, cancelRetry := context.WithCancel(replacementContext)
 			replacement.setTurn(turnID, cancelRetry, s.currentPromptDone())
 			replacement.promptMu.Lock()
+			replacementPromptMu = &replacement.promptMu
 			response, err = replacement.conn.PromptWithFields(retryContext, &acp.PromptRequest{SessionId: acp.SessionId(replacement.backendID), Prompt: blocks}, fields)
-			replacement.promptMu.Unlock()
 			target = replacement
 		} else {
 			err = errors.Join(err, restartErr)
 		}
 	}
+	var terminal *host.Event
 	if err != nil {
 		if target.finishTurn(turnID) {
 			data := map[string]any{}
 			if errors.Is(err, context.Canceled) {
 				data["interrupted"] = true
 			}
-			target.emitEvent(host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: err.Error(), Data: data})
+			terminal = &host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: err.Error(), Data: data}
 		}
-		return
-	}
-	if target.finishTurn(turnID) {
+	} else if target.finishTurn(turnID) {
 		if response.StopReason == acp.StopReasonCancelled {
-			target.emitEvent(host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: "ACP turn interrupted", Data: map[string]any{"interrupted": true, "stop_reason": response.StopReason}})
-			return
+			terminal = &host.Event{Type: host.EventTurnFailed, BackendTurnID: turnID, Message: "ACP turn interrupted", Data: map[string]any{"interrupted": true, "stop_reason": response.StopReason}}
+		} else {
+			terminal = &host.Event{Type: host.EventTurnComplete, BackendTurnID: turnID, Data: map[string]any{"stop_reason": response.StopReason}}
 		}
-		target.emitEvent(host.Event{Type: host.EventTurnComplete, BackendTurnID: turnID, Data: map[string]any{"stop_reason": response.StopReason}})
+	}
+	s.clearTools()
+	if target != s {
+		target.clearTools()
+	}
+	if replacementPromptMu != nil {
+		replacementPromptMu.Unlock()
+	}
+	s.promptMu.Unlock()
+	if terminal != nil {
+		target.emitEvent(*terminal)
 	}
 }
 

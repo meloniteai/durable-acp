@@ -871,6 +871,51 @@ func TestAdapterInterruptSettlesBeforeImmediateFollowUp(t *testing.T) {
 	waitForTrace(t, trace, "prompt:again")
 }
 
+func TestAdapterTerminalEventAllowsImmediateFollowUp(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "queue.trace")
+	adapter := New(Config{
+		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(), "DURABLE_ACP_RECOVERY_CHILD=1", "DURABLE_ACP_RECOVERY_TRACE="+trace),
+	})
+	events := make(chan host.Event, 8)
+	followUp := make(chan error, 1)
+	emit := func(event host.Event) {
+		events <- event
+		if event.Type == host.EventTurnComplete && event.BackendTurnID == "provider-recovery:1" {
+			_, err := adapter.SendTurn(context.Background(), "queue", host.SendTurnRequest{Prompt: "second"}, nil)
+			followUp <- err
+		}
+	}
+	if _, err := adapter.StartSession(context.Background(), "queue", host.StartSessionRequest{Worktree: t.TempDir()}, emit); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.CloseSession("queue") }()
+	if _, err := adapter.SendTurn(context.Background(), "queue", host.SendTurnRequest{Prompt: "first"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-followUp:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out dispatching follow-up turn")
+	}
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-events:
+			if event.Type == host.EventTurnComplete && event.BackendTurnID == "provider-recovery:2" {
+				waitForTrace(t, trace, "prompt:second")
+				return
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for follow-up completion")
+		}
+	}
+}
+
 func waitForTrace(t *testing.T, path, value string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
