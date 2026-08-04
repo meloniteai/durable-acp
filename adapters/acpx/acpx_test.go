@@ -266,7 +266,7 @@ func TestManagedSessionDoneCompletion(t *testing.T) {
 	}
 
 	turnContext, cancel := context.WithCancel(context.Background())
-	managed.setTurn("provider:1", cancel)
+	managed.setTurn("provider:1", cancel, nil)
 	if err := managed.observe(context.Background(), client.DirectionInbound, done); err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestManagedSessionDoneCompletion(t *testing.T) {
 		t.Fatal("done completion did not cancel the prompt")
 	}
 
-	managed.setTurn("provider:2", func() {})
+	managed.setTurn("provider:2", func() {}, nil)
 	managed.toolMu.Lock()
 	managed.toolActive = true
 	managed.toolMu.Unlock()
@@ -842,6 +842,98 @@ func TestAdapterLoadPreferenceAndDeadProcessRestart(t *testing.T) {
 	}
 }
 
+func TestAdapterInterruptSettlesBeforeImmediateFollowUp(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "interrupt.trace")
+	adapter := New(Config{
+		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
+		Environment:   append(os.Environ(), "DURABLE_ACP_RECOVERY_CHILD=1", "DURABLE_ACP_RECOVERY_TRACE="+trace),
+		RestartOnExit: true,
+	})
+	events := make(chan host.Event, 8)
+	if _, err := adapter.StartSession(context.Background(), "interrupt", host.StartSessionRequest{Worktree: t.TempDir()}, func(event host.Event) { events <- event }); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.CloseSession("interrupt") }()
+	if _, err := adapter.SendTurn(context.Background(), "interrupt", host.SendTurnRequest{Prompt: "hang"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitForTrace(t, trace, "prompt:hang")
+	interruptContext, cancelInterrupt := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelInterrupt()
+	if err := adapter.Interrupt(interruptContext, "interrupt", nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = waitForEvent(t, events, host.EventTurnFailed)
+	if _, err := adapter.SendTurn(context.Background(), "interrupt", host.SendTurnRequest{Prompt: "again"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = waitForEvent(t, events, host.EventTurnComplete)
+	waitForTrace(t, trace, "prompt:again")
+}
+
+func TestAdapterTerminalEventAllowsImmediateFollowUp(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "queue.trace")
+	adapter := New(Config{
+		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(), "DURABLE_ACP_RECOVERY_CHILD=1", "DURABLE_ACP_RECOVERY_TRACE="+trace),
+	})
+	events := make(chan host.Event, 8)
+	followUp := make(chan error, 1)
+	emit := func(event host.Event) {
+		events <- event
+		if event.Type == host.EventTurnComplete && event.BackendTurnID == "provider-recovery:1" {
+			_, err := adapter.SendTurn(context.Background(), "queue", host.SendTurnRequest{Prompt: "second"}, nil)
+			followUp <- err
+		}
+	}
+	if _, err := adapter.StartSession(context.Background(), "queue", host.StartSessionRequest{Worktree: t.TempDir()}, emit); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.CloseSession("queue") }()
+	if _, err := adapter.SendTurn(context.Background(), "queue", host.SendTurnRequest{Prompt: "first"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-followUp:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out dispatching follow-up turn")
+	}
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-events:
+			if event.Type == host.EventTurnComplete && event.BackendTurnID == "provider-recovery:2" {
+				waitForTrace(t, trace, "prompt:second")
+				return
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for follow-up completion")
+		}
+	}
+}
+
+func waitForTrace(t *testing.T, path, value string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		raw, err := os.ReadFile(path) //nolint:gosec // The test owns the isolated trace path.
+		if err == nil && strings.Contains(string(raw), value) {
+			return
+		}
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("trace %q missing %q: %s", path, value, raw)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func waitForAdapterTurn(t *testing.T, adapter *Adapter, sessionID string) {
 	t.Helper()
 	managed, err := adapter.session(sessionID)
@@ -988,6 +1080,17 @@ func runRecoveryChild(t *testing.T) {
 				prompt = params.Prompt[0].Text
 			}
 			trace("prompt:" + prompt)
+			if prompt == "hang" {
+				for {
+					var next rpcMessage
+					if err := decoder.Decode(&next); err != nil {
+						return
+					}
+					if next.Method == "session/cancel" {
+						return
+					}
+				}
+			}
 			writeRPC(t, encoder, message.ID, map[string]any{"stopReason": "end_turn"})
 			if prompt == "exit" {
 				os.Exit(0)
