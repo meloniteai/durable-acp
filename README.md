@@ -102,6 +102,8 @@ The default managed branch prefix is `durable-acp`; set `durableacp.WithBranchPr
 
 Hosts with an established journal can pass a caller-owned `journal.Store` with `WithJournalStore`, or select a directory and `journal.Option` values with `WithJournalConfiguration`. The default remains `<home>/journals`; a custom selection does not create that directory. A host that already writes normalized runtime events to the shared store can set `DisableRuntimeJournal` in that configuration to avoid duplicate records. `Engine.Snapshot` combines the manifest, live runtime state, pending interaction, effective model/reasoning/permission configuration, and the selected journal's last sequence.
 
+Journal reads use durable sequence cursors. `ReadAfter(sessionID, sequence)` returns the incremental suffix, `Read(sessionID, after, through)` adds an inclusive upper bound, and `Tail(sessionID, limit)` returns recent records in sequence order. Runtime persistence remains semantic by default: thinking, tool, and trace events stay live-only, while stored records retain the source event ID supplied by the host runtime.
+
 Lower-level `worktree.Manager.Create` derives its repository directory from the source remote by default. Hosts that already have a stable repository identifier can set `worktree.CreateRequest.RepositoryKey` to keep their existing layout; the value is sanitized and remains under the manager root.
 
 For a workspace the host owns, `worktree.EnsureBranch(ctx, path, branch)` creates or checks out the requested branch without claiming, relocating, or deleting that workspace.

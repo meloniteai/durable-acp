@@ -49,7 +49,7 @@ func TestEngineManagedSessionLifecycle(t *testing.T) {
 	if _, err := engine.Append(created.ID, "example.annotation", map[string]any{"value": true}, nil); err != nil {
 		t.Fatal(err)
 	}
-	records, err := engine.Journal().Read(created.ID, 0)
+	records, err := engine.Journal().Read(created.ID, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

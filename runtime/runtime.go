@@ -807,7 +807,7 @@ func (r *Runtime) Restore(sessionID string) (State, error) {
 		return State{}, errors.New("runtime: journal is required to restore a session")
 	}
 	id := strings.TrimSpace(sessionID)
-	records, err := r.journal.Read(id, 0)
+	records, err := r.journal.Read(id, 0, 0)
 	if err != nil {
 		return State{}, err
 	}

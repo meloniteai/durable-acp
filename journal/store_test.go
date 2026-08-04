@@ -58,7 +58,7 @@ func TestStoreAppendReadSessionsAndPermissions(t *testing.T) {
 		t.Fatalf("listener records = %#v", notified)
 	}
 
-	records, err := store.Read("session/one", 1)
+	records, err := store.Read("session/one", 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestStoreSchemaValidation(t *testing.T) {
 
 	bad := completeRecord("other.journal.v1", 1, "one", "agent.message", json.RawMessage(`{}`))
 	writeJournal(t, filepath.Join(dir, "one.jsonl"), bad)
-	if _, err := store.Read("one", 0); err == nil {
+	if _, err := store.Read("one", 0, 0); err == nil {
 		t.Fatal("Read accepted an unsupported schema")
 	}
 }
@@ -154,6 +154,73 @@ func TestStoreLastSequence(t *testing.T) {
 	}
 }
 
+func TestStoreCursorReadsAndTail(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	want := make([]Record, 5)
+	for i := range want {
+		want[i], err = store.Append(Record{
+			SessionID: "one",
+			Event:     "agent.message",
+			Data:      json.RawMessage(fmt.Sprintf(`{"index":%d}`, i+1)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	after, err := store.ReadAfter("one", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, want[3:]) {
+		t.Fatalf("records after cursor = %#v, want %#v", after, want[3:])
+	}
+
+	bounded, err := store.Read("one", 1, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(bounded, want[1:4]) {
+		t.Fatalf("bounded records = %#v, want %#v", bounded, want[1:4])
+	}
+
+	empty, err := store.Read("one", 4, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty cursor window = %#v", empty)
+	}
+	if _, boundsErr := store.Read("one", 5, 4); boundsErr == nil {
+		t.Fatal("Read accepted reversed cursor bounds")
+	}
+
+	tail, err := store.Tail("one", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(tail, want[3:]) {
+		t.Fatalf("tail records = %#v, want %#v", tail, want[3:])
+	}
+	all, err := store.Tail("one", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(all, want) {
+		t.Fatalf("long tail = %#v, want %#v", all, want)
+	}
+	if _, limitErr := store.Tail("one", 0); limitErr == nil {
+		t.Fatal("Tail accepted a non-positive limit")
+	}
+}
+
 func TestStoreReducerReplaysAndNormalizes(t *testing.T) {
 	t.Parallel()
 
@@ -167,11 +234,21 @@ func TestStoreReducerReplaysAndNormalizes(t *testing.T) {
 	if _, appendErr := store.Append(Record{SessionID: "one", Event: "host.state", Data: json.RawMessage(`{"activity":"running"}`)}); appendErr != nil {
 		t.Fatal(appendErr)
 	}
-	second, err := store.Append(Record{SessionID: "one", Event: "host.state", Data: json.RawMessage(`{"mode":"loop"}`)})
+	presentation := &Presentation{Surfaces: []string{"conversation"}, Label: "State", Attention: true}
+	second, err := store.Append(Record{
+		SourceEventID: "source-2",
+		SessionID:     "one",
+		Event:         "host.state",
+		Data:          json.RawMessage(`{"mode":"loop"}`),
+		Presentation:  presentation,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertJSONEqual(t, second.Data, `{"activity":"running","mode":"loop"}`)
+	if second.SourceEventID != "source-2" || !reflect.DeepEqual(second.Presentation, presentation) {
+		t.Fatalf("reduced envelope = %#v", second)
+	}
 	if closeErr := store.Close(); closeErr != nil {
 		t.Fatal(closeErr)
 	}
@@ -206,7 +283,7 @@ func TestStoreReaderHandlesTornTailAndRejectsEarlierProblems(t *testing.T) {
 	if writeErr := os.WriteFile(filepath.Join(dir, "torn.jsonl"), append(line, []byte(`{"schema":`)...), 0o600); writeErr != nil {
 		t.Fatal(writeErr)
 	}
-	records, err := store.Read("torn", 0)
+	records, err := store.Read("torn", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +295,7 @@ func TestStoreReaderHandlesTornTailAndRejectsEarlierProblems(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "bad.jsonl"), badBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Read("bad", 0); err == nil {
+	if _, err := store.Read("bad", 0, 0); err == nil {
 		t.Fatal("Read accepted malformed non-tail JSON")
 	}
 
@@ -227,8 +304,92 @@ func TestStoreReaderHandlesTornTailAndRejectsEarlierProblems(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "order.jsonl"), append(marshalLine(t, first), marshalLine(t, second)...), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Read("order", 1); err == nil {
+	if _, err := store.Read("order", 0, 1); err == nil {
 		t.Fatal("Read accepted non-monotonic records")
+	}
+}
+
+func TestStoreAppendRepairsTornTail(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, appendErr := store.Append(Record{SessionID: "torn", Event: "user.message"}); appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	if closeErr := store.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	path := filepath.Join(dir, "torn.jsonl")
+	// #nosec G304 -- path is inside the test temporary directory.
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, writeErr := file.WriteString(`{"partial":`); writeErr != nil {
+		_ = file.Close()
+		t.Fatal(writeErr)
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	store, err = NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	second, err := store.Append(Record{SessionID: "torn", Event: "agent.message"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Sequence != 2 {
+		t.Fatalf("sequence = %d, want 2", second.Sequence)
+	}
+	records, err := store.Read("torn", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Sequence != 1 || records[1].Sequence != 2 {
+		t.Fatalf("records = %#v", records)
+	}
+}
+
+func TestStoreReopensWriterAfterAppendFailure(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, appendErr := store.Append(Record{SessionID: "retry", Event: "user.message"}); appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	store.mu.Lock()
+	closeErr := store.writers["retry"].file.Close()
+	store.mu.Unlock()
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if _, appendErr := store.Append(Record{SessionID: "retry", Event: "agent.message"}); appendErr == nil {
+		t.Fatal("Append accepted a closed writer")
+	}
+	store.mu.Lock()
+	_, retained := store.writers["retry"]
+	store.mu.Unlock()
+	if retained {
+		t.Fatal("failed writer was retained")
+	}
+	retried, err := store.Append(Record{SessionID: "retry", Event: "agent.message"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Sequence != 2 {
+		t.Fatalf("sequence = %d, want 2", retried.Sequence)
 	}
 }
 
@@ -254,7 +415,7 @@ func TestStoreReducerFailureAndValidation(t *testing.T) {
 	if _, err := store.Append(Record{}); err == nil {
 		t.Fatal("Append accepted a missing session and event")
 	}
-	if _, err := store.Read("", 0); err == nil {
+	if _, err := store.Read("", 0, 0); err == nil {
 		t.Fatal("Read accepted a missing session")
 	}
 }

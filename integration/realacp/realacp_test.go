@@ -164,7 +164,7 @@ func runManagedLifecycle(t *testing.T, backend host.Backend) {
 	}, presentation); err != nil {
 		t.Fatalf("append opaque journal record: %v", err)
 	}
-	records, err := live.engineValue(t).Journal().Read(session.ID, 0)
+	records, err := live.engineValue(t).Journal().Read(session.ID, 0, 0)
 	if err != nil {
 		t.Fatalf("read journal: %v", err)
 	}

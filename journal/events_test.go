@@ -30,7 +30,10 @@ func TestTranslate(t *testing.T) {
 		{name: "plan", event: host.Event{Type: host.EventPlanUpdate}, want: EventAgentPlanProposed, ok: true},
 		{name: "todo", event: host.Event{Type: host.EventTodoUpdate}, want: EventAgentTodoUpdated, ok: true},
 		{name: "extension", event: host.Event{Type: host.EventType("example.state_changed")}, want: "example.state_changed", ok: true},
-		{name: "unknown", event: host.Event{Type: host.EventToolStarted}, ok: false},
+		{name: "thinking is ephemeral", event: host.Event{Type: host.EventThinking}, ok: false},
+		{name: "tool start is ephemeral", event: host.Event{Type: host.EventToolStarted}, ok: false},
+		{name: "tool output is ephemeral", event: host.Event{Type: host.EventToolOutput}, ok: false},
+		{name: "trace is ephemeral", event: host.Event{Type: host.EventTraceUpdated}, ok: false},
 		{name: "message without role", event: host.Event{Type: host.EventMessage}, ok: false},
 	}
 	for _, test := range tests {
@@ -47,6 +50,7 @@ func TestTranslatePreservesNeutralData(t *testing.T) {
 	t.Parallel()
 
 	record, ok := Translate(host.Event{
+		SourceEventID:    "source-1",
 		SessionID:        "one",
 		Backend:          "codex",
 		BackendSessionID: "backend-session",
@@ -57,7 +61,7 @@ func TestTranslatePreservesNeutralData(t *testing.T) {
 		Message:          "done",
 		Data:             map[string]any{"source": "test"},
 	})
-	if !ok || record.SessionID != "one" || record.TurnID != "turn" {
+	if !ok || record.SourceEventID != "source-1" || record.SessionID != "one" || record.TurnID != "turn" {
 		t.Fatalf("record = %#v ok=%t", record, ok)
 	}
 	var data map[string]any
