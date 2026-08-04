@@ -506,9 +506,7 @@ func (a *Adapter) Interrupt(ctx context.Context, sessionID string, _ host.EventS
 	if err != nil {
 		return err
 	}
-	if err := managed.conn.Cancel(ctx, &acp.CancelNotification{SessionId: acp.SessionId(managed.backendID)}); err != nil {
-		return err
-	}
+	cancelErr := managed.conn.Cancel(ctx, &acp.CancelNotification{SessionId: acp.SessionId(managed.backendID)})
 	managed.cancelInteractions()
 	turnID, cancel, promptDone := managed.takeTurn()
 	if cancel != nil {
@@ -521,10 +519,10 @@ func (a *Adapter) Interrupt(ctx context.Context, sessionID string, _ host.EventS
 		select {
 		case <-promptDone:
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.Join(cancelErr, ctx.Err())
 		}
 	}
-	return nil
+	return cancelErr
 }
 
 // RestartSession replaces the ACP subprocess and resumes its provider session.
