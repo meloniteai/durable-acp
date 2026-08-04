@@ -39,7 +39,7 @@ func TestForkPrompt(t *testing.T) {
 	}
 }
 
-func TestInterruptReconnectsBeforeNextTurn(t *testing.T) {
+func TestInterruptPreservesProcessBeforeNextTurn(t *testing.T) {
 	adapter := New(
 		acpx.WithCommand(os.Args[0]),
 		acpx.WithArgs("-test.run=TestCodexForkChild", "--"),
@@ -60,9 +60,22 @@ func TestInterruptReconnectsBeforeNextTurn(t *testing.T) {
 	if _, err := adapter.SendTurn(context.Background(), "interrupt", host.SendTurnRequest{Prompt: "after-cancel"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitCodexEvent(t, events, func(event host.Event) bool { return event.Type == host.EventAgentRecovered })
-	waitCodexEvent(t, events, func(event host.Event) bool { return event.Message == "codex saw after-cancel" })
-	waitCodexEvent(t, events, func(event host.Event) bool { return event.Type == host.EventTurnComplete })
+	sawMessage := false
+	sawComplete := false
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for !sawMessage || !sawComplete {
+		select {
+		case event := <-events:
+			if event.Type == host.EventAgentRecovered {
+				t.Fatal("interrupt restarted the Codex process")
+			}
+			sawMessage = sawMessage || event.Message == "codex saw after-cancel"
+			sawComplete = sawComplete || event.Type == host.EventTurnComplete
+		case <-timer.C:
+			t.Fatalf("follow-up did not complete on the existing process: message=%v complete=%v", sawMessage, sawComplete)
+		}
+	}
 }
 
 func waitCodexEvent(t *testing.T, events <-chan host.Event, match func(host.Event) bool) {
