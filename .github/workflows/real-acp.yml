@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       native_agents:
-        description: 'Optional native agents to run with their own configured credentials (cursor, antigravity, or both)'
+        description: 'Native agents: cursor, antigravity, or both'
         required: false
         default: ''
   pull_request:
@@ -17,6 +17,8 @@ on:
       - "integration/realacp/**"
       - "journal/**"
       - "runtime/**"
+      - "scripts/realacp-helpers.sh"
+      - "scripts/realacp_helpers_test.go"
       - "scripts/realacp-openrouter.codex.toml"
       - "scripts/run-realacp.sh"
       - "worktree/**"

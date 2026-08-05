@@ -3,6 +3,8 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(dirname "$script_dir")"
+source "$script_dir/realacp-helpers.sh"
+caller_codex_home="$(realacp_codex_source_home "${CODEX_HOME:-}" "${HOME:-}")"
 provider="openrouter"
 agents="codex,claude"
 journeys="${DURABLE_ACP_REAL_JOURNEYS:-managed,existing,queued,interrupt,permission}"
@@ -15,6 +17,10 @@ The runner installs the selected public Codex/Claude ACPs and coding CLIs once,
 installs Cursor CLI into its temporary home when needed, and builds the pinned
 Antigravity ACP bridge plus agy when needed. It compiles the realacp Go test
 binary once, then runs each selected agent journey in a separate state directory.
+
+Vanilla Codex runs copy only the caller's cached auth.json into each private
+worker home. Other personal Codex configuration, plugins, skills, and sessions
+remain isolated, and copied credentials are removed from retained artifacts.
 
 Journeys: managed (worktree, journal, restart/resume, cleanup), existing
 (caller-owned workspace plus attachment), queued (serial turn queue), interrupt
@@ -120,6 +126,7 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
+  realacp_scrub_codex_auth "$run_root"
   if [ "${DURABLE_ACP_REAL_KEEP_ARTIFACTS:-}" = "1" ]; then
     printf 'Real ACP artifacts kept at %s\n' "$run_root"
   else
@@ -132,7 +139,7 @@ deps="$run_root/deps"
 mkdir -p "$deps"
 packages=()
 if contains_agent codex; then
-  packages+=("@agentclientprotocol/codex-acp@1.1.7" "@openai/codex@0.145.0-alpha.4")
+  packages+=("@agentclientprotocol/codex-acp@1.1.9" "@openai/codex@0.146.0")
 fi
 if contains_agent claude; then
   packages+=("@agentclientprotocol/claude-agent-acp@0.55.0" "@anthropic-ai/claude-code@2.1.220")
@@ -194,21 +201,7 @@ fi
 
 if [ "$provider" = "openrouter" ]; then
   model="${DURABLE_ACP_REAL_MODEL:-deepseek/deepseek-v4-flash}"
-  export DURABLE_ACP_REAL_MODEL="$model"
-  export DURABLE_ACP_REAL_CODEX_MODEL="${DURABLE_ACP_REAL_CODEX_MODEL:-$model}"
-  # Claude Code's ACP model picker uses aliases; ANTHROPIC_MODEL above maps
-  # the default `opus` alias to the OpenRouter model.
-  export DURABLE_ACP_REAL_CLAUDE_MODEL="${DURABLE_ACP_REAL_CLAUDE_MODEL:-opus}"
-  export DURABLE_ACP_REAL_REASONING="${DURABLE_ACP_REAL_REASONING:-low}"
-  export ANTHROPIC_BASE_URL="${DURABLE_ACP_CLAUDE_OPENROUTER_BASE_URL:-https://openrouter.ai/api}"
-  export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
-  export ANTHROPIC_API_KEY=""
-  export ANTHROPIC_MODEL="$model"
-  export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
-  export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
-  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
-  export CLAUDE_MODEL_CONFIG="{\"availableModels\":[\"$model\"]}"
-  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  realacp_configure_openrouter "$model"
 fi
 
 if contains_agent antigravity; then
@@ -372,7 +365,9 @@ for index in "${!test_names[@]}"; do
   fi
   (
     cd "$repo_root"
-    export CODEX_HOME="$worker_codex_home"
+	if [[ "$name" = TestRealACPCodex* ]]; then
+	  realacp_configure_codex_worker "$provider" "$caller_codex_home" "$worker_codex_home" "$DURABLE_ACP_REAL_CODEX_CLI"
+	fi
 	if [ "${antigravity_built_by_runner:-}" = "1" ] && [[ "$name" = TestRealACPAntigravity* ]]; then
 	  # The bridge owns a persistent session store, so every parallel test gets
 	  # one instead of racing through a shared sidecar state directory.
