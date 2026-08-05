@@ -113,6 +113,30 @@ func TestStoreSchemaValidation(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsCollidingSessionFilenames(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if _, appendErr := store.Append(Record{SessionID: "session/one", Event: "agent.message"}); appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	if _, appendErr := store.Append(Record{SessionID: "session_one", Event: "agent.message"}); appendErr == nil {
+		t.Fatal("Append mixed two session IDs that map to the same journal filename")
+	}
+	if _, readErr := store.Read("session_one", 0, 0); readErr == nil {
+		t.Fatal("Read returned another session's colliding journal")
+	}
+	records, err := store.Read("session/one", 0, 0)
+	if err != nil || len(records) != 1 || records[0].SessionID != "session/one" {
+		t.Fatalf("original session records = %#v, %v", records, err)
+	}
+}
+
 func TestStoreLastSequence(t *testing.T) {
 	t.Parallel()
 

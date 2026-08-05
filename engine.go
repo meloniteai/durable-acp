@@ -526,15 +526,21 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 	if runtimeState, stateErr := e.runtime.State(entry.ID); stateErr == nil {
 		entry.Configuration = runtimeState.Configuration
 	}
-	if err := e.saveSession(&entry); err != nil {
+	if err := e.updateSession(entry.ID, func(current *Session) {
+		current.BackendSession = entry.BackendSession
+		current.Configuration = entry.Configuration
+	}); err != nil {
 		return Session{}, err
 	}
-	return entry, nil
+	return e.loadSession(entry.ID)
 }
 
 // Resume restores a persisted session and starts its provider with the last
 // durable backend session ID. It performs no implicit worktree creation.
 func (e *Engine) Resume(ctx context.Context, id string) (Session, error) {
+	if e == nil || e.runtime == nil {
+		return Session{}, errors.New("durableacp: engine is not open")
+	}
 	return e.resumeStart(ctx, StartRequest{ID: id})
 }
 
@@ -588,16 +594,25 @@ func (e *Engine) resumeStart(ctx context.Context, request StartRequest) (Session
 	if len(request.Ext) > 0 {
 		entry.Ext = cloneRawMessage(request.Ext)
 	}
-	if err := e.saveSession(&entry); err != nil {
+	if err := e.updateSession(entry.ID, func(current *Session) {
+		current.BackendSession = entry.BackendSession
+		current.Configuration = entry.Configuration
+		if len(request.Ext) > 0 {
+			current.Ext = cloneRawMessage(entry.Ext)
+		}
+	}); err != nil {
 		return Session{}, err
 	}
-	return entry, nil
+	return e.loadSession(entry.ID)
 }
 
 // Repair verifies a session workspace after an interrupted process or manual
 // Git operation. Managed worktrees are returned to their owned branch;
 // existing workspaces are only inspected and never modified.
 func (e *Engine) Repair(ctx context.Context, sessionID string) (Session, error) {
+	if e == nil || e.runtime == nil || e.worktrees == nil {
+		return Session{}, errors.New("durableacp: engine is not open")
+	}
 	entry, err := e.loadSession(sessionID)
 	if err != nil {
 		return Session{}, err
@@ -616,10 +631,12 @@ func (e *Engine) Repair(ctx context.Context, sessionID string) (Session, error) 
 		workspace.Source = entry.Worktree.Source
 		entry.Worktree = workspace
 	}
-	if err := e.saveSession(&entry); err != nil {
+	if err := e.updateSession(entry.ID, func(current *Session) {
+		current.Worktree = entry.Worktree
+	}); err != nil {
 		return Session{}, err
 	}
-	return entry, nil
+	return e.loadSession(entry.ID)
 }
 
 // Prune removes stale Git worktree registrations for source. It deliberately
@@ -768,8 +785,9 @@ func (e *Engine) Restart(ctx context.Context, sessionID string) (host.BackendSes
 	if err != nil {
 		return host.BackendSession{}, err
 	}
-	entry.BackendSession = state
-	if err := e.saveSession(&entry); err != nil {
+	if err := e.updateSession(entry.ID, func(current *Session) {
+		current.BackendSession = state
+	}); err != nil {
 		return host.BackendSession{}, err
 	}
 	return state, nil
@@ -818,6 +836,9 @@ func (e *Engine) ForkPrompt(ctx context.Context, request host.ForkPromptRequest)
 
 // CloseSession stops the provider while retaining all managed session state.
 func (e *Engine) CloseSession(sessionID string) error {
+	if e == nil || e.runtime == nil {
+		return errors.New("durableacp: engine is not open")
+	}
 	entry, err := e.loadSession(sessionID)
 	if err != nil {
 		return err
@@ -826,8 +847,9 @@ func (e *Engine) CloseSession(sessionID string) error {
 		return err
 	}
 	now := time.Now().UTC()
-	entry.ClosedAt = &now
-	return e.saveSession(&entry)
+	return e.updateSession(entry.ID, func(current *Session) {
+		current.ClosedAt = &now
+	})
 }
 
 // Remove permanently removes a closed session's owned worktree and branch.
@@ -835,6 +857,9 @@ func (e *Engine) CloseSession(sessionID string) error {
 //
 //nolint:govet // Each recovery step reports its own error.
 func (e *Engine) Remove(ctx context.Context, sessionID string, force bool) error {
+	if e == nil || e.runtime == nil || e.worktrees == nil {
+		return errors.New("durableacp: engine is not open")
+	}
 	entry, err := e.loadSession(sessionID)
 	if err != nil {
 		return err
@@ -1036,6 +1061,12 @@ func (e *Engine) inspectExistingWorkspace(ctx context.Context, id, path string) 
 }
 
 func (e *Engine) saveSession(entry *Session) error {
+	e.manifestMu.Lock()
+	defer e.manifestMu.Unlock()
+	return e.saveSessionLocked(entry)
+}
+
+func (e *Engine) saveSessionLocked(entry *Session) error {
 	if entry == nil {
 		return errors.New("durableacp: nil session manifest")
 	}
@@ -1061,8 +1092,8 @@ func (e *Engine) loadSession(id string) (Session, error) {
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		return Session{}, fmt.Errorf("durableacp: decode session manifest: %w", err)
 	}
-	if entry.ID == "" {
-		return Session{}, errors.New("durableacp: invalid session manifest")
+	if entry.ID != id || !validSessionID(entry.ID) {
+		return Session{}, fmt.Errorf("durableacp: session manifest ID %q does not match %q", entry.ID, id)
 	}
 	if entry.UpdatedAt.IsZero() {
 		entry.UpdatedAt = entry.CreatedAt
@@ -1112,7 +1143,7 @@ func (e *Engine) updateSession(sessionID string, update func(*Session)) error {
 	if update != nil {
 		update(&entry)
 	}
-	return e.saveSession(&entry)
+	return e.saveSessionLocked(&entry)
 }
 
 func configurationFromStart(request StartRequest) Configuration {

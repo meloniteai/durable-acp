@@ -350,6 +350,20 @@ func TestStartReturnsProcessFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestStartContextDoesNotOwnReturnedConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	connection, err := Start(ctx, Spec{Command: fixtureBinary})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, connection.Close()) })
+
+	cancel()
+	_, err = connection.Authenticate(context.Background(), &acp.AuthenticateRequest{})
+	require.NoError(t, err)
+
+	_, err = Start(ctx, Spec{Command: fixtureBinary})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestClientObservesTheWireConversation(t *testing.T) {
 	type observedMessage struct {
 		direction transport.Direction

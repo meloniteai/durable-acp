@@ -89,6 +89,10 @@ func main() {
 		case "_fixture/notify":
 		case "echo":
 			encode(encoder, message{JSONRPC: "2.0", ID: msg.ID, Result: msg.Params})
+		case "environment":
+			value, present := os.LookupEnv("DURABLE_ACP_TRANSPORT_TEST_ENV")
+			result, _ := json.Marshal(map[string]any{"present": present, "value": value})
+			encode(encoder, message{JSONRPC: "2.0", ID: msg.ID, Result: result})
 		case "fail":
 			encode(encoder, message{
 				JSONRPC: "2.0",

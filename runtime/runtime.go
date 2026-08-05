@@ -889,8 +889,9 @@ func (r *Runtime) Restore(sessionID string) (State, error) {
 	} else {
 		r.sessions[id] = restored
 	}
+	state := stateLocked(restored)
 	r.mu.Unlock()
-	return stateLocked(restored), nil
+	return state, nil
 }
 
 // Detect returns every registered backend in deterministic order.
