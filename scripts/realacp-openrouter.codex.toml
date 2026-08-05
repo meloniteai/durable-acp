@@ -6,5 +6,5 @@ name = "OpenRouter"
 base_url = "__BASE_URL__"
 env_key = "OPENROUTER_API_KEY"
 wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
+request_max_retries = 2
+stream_max_retries = 2
