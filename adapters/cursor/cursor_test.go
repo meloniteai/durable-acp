@@ -16,6 +16,9 @@ func TestNewDeclaresCursorBackend(t *testing.T) {
 	if adapter := New(); adapter == nil || adapter.Backend() != Backend {
 		t.Fatalf("adapter = %#v", adapter)
 	}
+	if defaultCommand != "cursor-agent" {
+		t.Fatalf("default command = %q", defaultCommand)
+	}
 }
 
 func TestDoneBeforeLatePermissionKeepsTurnActive(t *testing.T) {

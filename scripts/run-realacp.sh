@@ -168,10 +168,7 @@ if contains_agent claude; then
 fi
 
 if contains_agent cursor && [ -z "${DURABLE_ACP_REAL_CURSOR_ACP:-}" ]; then
-  if command -v agent >/dev/null; then
-    export DURABLE_ACP_REAL_CURSOR_ACP="$(command -v agent)"
-    export DURABLE_ACP_REAL_CURSOR_ACP_ARGS="${DURABLE_ACP_REAL_CURSOR_ACP_ARGS:-acp}"
-  elif command -v cursor-agent >/dev/null; then
+  if command -v cursor-agent >/dev/null; then
     export DURABLE_ACP_REAL_CURSOR_ACP="$(command -v cursor-agent)"
     export DURABLE_ACP_REAL_CURSOR_ACP_ARGS="${DURABLE_ACP_REAL_CURSOR_ACP_ARGS:-acp}"
   else

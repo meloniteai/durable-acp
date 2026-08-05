@@ -12,16 +12,18 @@ import (
 // Backend is the stable backend name used in Engine session manifests.
 const Backend host.Backend = "cursor"
 
+const defaultCommand = "cursor-agent"
+
 // Adapter drives the Cursor command-line agent in ACP mode.
 type Adapter struct{ *acpx.Adapter }
 
-// New creates an adapter for Cursor's conventional `agent acp` command. Use
+// New creates an adapter for Cursor's conventional `cursor-agent acp` command. Use
 // acpx.WithCommand or acpx.WithArgs for a different installation.
 func New(options ...acpx.Option) *Adapter {
 	capabilities := acp.ClientCapabilities{Meta: map[string]any{"parameterizedModelPicker": true}}
 	return &Adapter{Adapter: acpx.New(acpx.Config{
 		Backend:                 Backend,
-		Command:                 "agent",
+		Command:                 defaultCommand,
 		Args:                    []string{"acp"},
 		ClientCapabilities:      &capabilities,
 		RestartOnExit:           true,
