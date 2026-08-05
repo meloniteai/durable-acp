@@ -273,7 +273,7 @@ func (s *Store) read(sessionID string, after, through uint64, tail int) ([]Recor
 		return nil, err
 	}
 
-	return readJournal(s.path(sessionID), s.schemaID, after, through, tail)
+	return readJournal(s.path(sessionID), s.schemaID, sessionID, after, through, tail)
 }
 
 // ReadAfter returns every record after the exclusive sequence cursor.
@@ -305,7 +305,7 @@ func (s *Store) LastSequence(sessionID string) (uint64, error) {
 		return sequence, nil
 	}
 	s.mu.Unlock()
-	records, err := readJournal(s.path(sessionID), s.schemaID, 0, 0, 1)
+	records, err := readJournal(s.path(sessionID), s.schemaID, sessionID, 0, 0, 1)
 	if err != nil {
 		return 0, err
 	}
@@ -364,7 +364,7 @@ func (s *Store) writerLocked(sessionID string) (*writer, error) {
 		_ = file.Close()
 		return nil, fmt.Errorf("journal: repair %s: %w", sessionID, repairErr)
 	}
-	events, err := readJournal(path, s.schemaID, 0, 0, 0)
+	events, err := readJournal(path, s.schemaID, sessionID, 0, 0, 0)
 	if err != nil {
 		_ = file.Close()
 		return nil, err
@@ -439,7 +439,7 @@ func (s *Store) syncSession(sessionID string) error {
 	return nil
 }
 
-func readJournal(path, expectedSchema string, after, through uint64, tail int) ([]Record, error) {
+func readJournal(path, expectedSchema, expectedSessionID string, after, through uint64, tail int) ([]Record, error) {
 	// #nosec G304 -- path is derived from the configured store directory and a sanitized session ID.
 	file, err := os.Open(path)
 	if err != nil {
@@ -466,6 +466,15 @@ func readJournal(path, expectedSchema string, after, through uint64, tail int) (
 			}
 			if record.Schema != expectedSchema || record.SchemaVersion != schemaVersion {
 				return nil, fmt.Errorf("journal: unsupported schema at %s line %d", path, lineNumber)
+			}
+			if record.SessionID != expectedSessionID {
+				return nil, fmt.Errorf(
+					"journal: session filename collision at %s line %d: found %q, want %q",
+					path,
+					lineNumber,
+					record.SessionID,
+					expectedSessionID,
+				)
 			}
 			if hasLastSequence && record.Sequence <= lastSequence {
 				return nil, fmt.Errorf("journal: non-monotonic sequence at %s line %d", path, lineNumber)

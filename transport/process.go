@@ -120,6 +120,9 @@ type processResponse struct {
 }
 
 func Start(ctx context.Context, spec Spec) (*Process, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	stderr := spec.Stderr
 	if stderr == nil {
 		stderr = io.Discard
@@ -129,7 +132,7 @@ func Start(ctx context.Context, spec Spec) (*Process, error) {
 	if strings.TrimSpace(spec.Dir) != "" {
 		cmd.Dir = spec.Dir
 	}
-	if len(spec.Env) > 0 {
+	if spec.Env != nil {
 		cmd.Env = spec.Env
 	}
 	stdin, err := cmd.StdinPipe()

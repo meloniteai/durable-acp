@@ -319,7 +319,7 @@ func TestEngineQueueControlAndRestartFacades(t *testing.T) {
 		t.Fatalf("restart = %#v, %v, calls = %d", restarted, err, adapter.restartCount())
 	}
 	persisted, err := engine.loadSession(created.ID)
-	if err != nil || persisted.BackendSession.ID != restarted.ID {
+	if err != nil || persisted.BackendSession.ID != restarted.ID || persisted.Configuration.Model != "restarted-model" {
 		t.Fatalf("persisted restart = %#v, %v", persisted.BackendSession, err)
 	}
 }
@@ -508,6 +508,12 @@ func TestEngineValidationConfigurationAndHelpers(t *testing.T) {
 	if _, err := engine.loadSession("corrupt"); err == nil {
 		t.Fatal("loadSession accepted invalid manifest")
 	}
+	if err := os.WriteFile(engine.sessionPath("mismatch"), []byte(`{"id":"different"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.loadSession("mismatch"); err == nil {
+		t.Fatal("loadSession accepted a manifest belonging to another session")
+	}
 	for raw, want := range map[string]string{"hello world": "hello-world", "": "session", "../x": "---x"} {
 		if got := safeFileName(raw); got != want {
 			t.Fatalf("safeFileName(%q) = %q, want %q", raw, got, want)
@@ -595,6 +601,12 @@ func TestEngineRepairPruneRollbackAndNilGuards(t *testing.T) {
 	if _, err := (*Engine)(nil).SendNext(context.Background(), host.SendTurnRequest{}); err == nil {
 		t.Fatal("nil Engine prepended a turn")
 	}
+	if _, err := (*Engine)(nil).Resume(context.Background(), "s"); err == nil {
+		t.Fatal("nil Engine resumed a session")
+	}
+	if _, err := (*Engine)(nil).Repair(context.Background(), "s"); err == nil {
+		t.Fatal("nil Engine repaired a session")
+	}
 	if _, err := (*Engine)(nil).Snapshot("s"); err == nil {
 		t.Fatal("nil Engine returned a snapshot")
 	}
@@ -630,6 +642,12 @@ func TestEngineRepairPruneRollbackAndNilGuards(t *testing.T) {
 	}
 	if _, err := (*Engine)(nil).ForkPrompt(context.Background(), host.ForkPromptRequest{}); err == nil {
 		t.Fatal("nil Engine forked a prompt")
+	}
+	if err := (*Engine)(nil).CloseSession("s"); err == nil {
+		t.Fatal("nil Engine closed a session")
+	}
+	if err := (*Engine)(nil).Remove(context.Background(), "s", false); err == nil {
+		t.Fatal("nil Engine removed a session")
 	}
 	if _, err := (*Engine)(nil).Append("s", "host.note", nil, nil); err == nil {
 		t.Fatal("nil Engine appended a record")
@@ -773,10 +791,11 @@ func (a *queueEngineAdapter) Interrupt(context.Context, string, host.EventSink) 
 
 func (*queueEngineAdapter) CloseSession(string) error { return nil }
 
-func (a *queueEngineAdapter) RestartSession(context.Context, string, host.EventSink) (host.BackendSession, error) {
+func (a *queueEngineAdapter) RestartSession(_ context.Context, _ string, sink host.EventSink) (host.BackendSession, error) {
 	a.mu.Lock()
 	a.restarts++
 	a.mu.Unlock()
+	sink(host.Event{Type: host.EventModels, Data: map[string]any{"current_model": "restarted-model"}})
 	return host.BackendSession{ID: "queue-provider-restarted"}, nil
 }
 

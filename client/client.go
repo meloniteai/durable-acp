@@ -91,6 +91,9 @@ func RequestID(ctx context.Context) string {
 }
 
 func Start(ctx context.Context, spec Spec) (*Connection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	request := spec.Initialize
 	if request.ProtocolVersion == 0 {
 		request.ProtocolVersion = acp.ProtocolVersionNumber
@@ -112,7 +115,9 @@ func Start(ctx context.Context, spec Spec) (*Connection, error) {
 		onHandlerError:   spec.OnHandlerError,
 		legacyExtensions: spec.LegacyExtensions,
 	}
-	process, err := transport.Start(ctx, transport.Spec{
+	// Initialization is bounded by ctx, but a successfully returned connection
+	// is caller-owned and remains alive until Close or child exit.
+	process, err := transport.Start(context.WithoutCancel(ctx), transport.Spec{
 		Command:   spec.Command,
 		Args:      spec.Args,
 		Dir:       spec.Dir,

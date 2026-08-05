@@ -135,6 +135,17 @@ func TestCallCancellationNotifiesPeer(t *testing.T) {
 	assert.JSONEq(t, `{"usable":true}`, string(result))
 }
 
+func TestEmptyEnvironmentDoesNotInheritParent(t *testing.T) {
+	t.Setenv("DURABLE_ACP_TRANSPORT_TEST_ENV", "parent")
+	proc, err := Start(context.Background(), Spec{Command: fixtureBinary, Env: []string{}})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, proc.Close()) })
+
+	result, err := proc.Call(context.Background(), "environment", nil)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"present":false,"value":""}`, string(result))
+}
+
 func TestServerRequestCancellation(t *testing.T) {
 	proc := startFixture(t, Spec{
 		OnRequest: func(ctx context.Context, msg Message) (any, error) {

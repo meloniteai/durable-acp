@@ -163,6 +163,44 @@ func TestRestartResponseAndValidation(t *testing.T) {
 	}
 }
 
+func TestConcurrentSendWaitsForSessionInitialization(t *testing.T) {
+	started := make(chan struct{})
+	continueStart := make(chan struct{})
+	provider := &fakeAgent{skipInteraction: true, newSessionStarted: started, continueNewSession: continueStart}
+	adapter := New(Config{Command: os.Args[0], StateDir: t.TempDir()})
+	adapter.newAgent = func(_, _, _, _, _, _ string) agent { return provider }
+	worktree := t.TempDir()
+
+	startResult := make(chan error, 1)
+	go func() {
+		_, err := adapter.StartSession(context.Background(), "host", host.StartSessionRequest{Worktree: worktree}, nil)
+		startResult <- err
+	}()
+	<-started
+
+	sendResult := make(chan error, 1)
+	go func() {
+		_, err := adapter.SendTurn(context.Background(), "host", host.SendTurnRequest{Prompt: "hello"}, nil)
+		sendResult <- err
+	}()
+	select {
+	case err := <-sendResult:
+		t.Fatalf("SendTurn returned before initialization completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(continueStart)
+	if err := <-startResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-sendResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.CloseSession("host"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAdapterHelpersAndDiscoveryFailures(t *testing.T) {
 	available := New(Config{Command: os.Args[0], ConversationsDir: t.TempDir(), StateDir: t.TempDir(), Version: "2"}, Config{Command: "ignored"})
 	if status := available.Detect(context.Background()); !status.Available || status.Command == "" {
@@ -237,17 +275,25 @@ func TestPromptFailureOutcomes(t *testing.T) {
 }
 
 type fakeAgent struct {
-	closed          bool
-	resumes         int
-	resumeErr       error
-	emptySessionID  bool
-	skipInteraction bool
-	promptErr       error
-	outcome         *antigravityacp.PromptOutcome
-	cancelled       bool
+	closed             bool
+	resumes            int
+	resumeErr          error
+	emptySessionID     bool
+	skipInteraction    bool
+	promptErr          error
+	outcome            *antigravityacp.PromptOutcome
+	cancelled          bool
+	newSessionStarted  chan struct{}
+	continueNewSession chan struct{}
 }
 
 func (a *fakeAgent) NewSession(_ string, _ []string, _ antigravityacp.Client) (string, []antigravityacp.ConfigOption) {
+	if a.newSessionStarted != nil {
+		close(a.newSessionStarted)
+	}
+	if a.continueNewSession != nil {
+		<-a.continueNewSession
+	}
 	if a.emptySessionID {
 		return "", nil
 	}

@@ -37,16 +37,23 @@ type Adapter struct {
 
 type managedSession struct {
 	adapter   *Adapter
-	agent     agent
 	hostID    string
 	backendID string
 	worktree  string
+
+	agentMu   sync.RWMutex
+	agent     agent
+	emitMu    sync.RWMutex
 	emit      host.EventSink
+	ready     chan struct{}
+	startOnce sync.Once
+	startErr  error
 
 	turnMu     sync.Mutex
 	turn       uint64
 	turnID     string
 	turnCancel context.CancelFunc
+	restarting bool
 
 	interactionMu sync.Mutex
 	interaction   uint64
@@ -134,7 +141,7 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 	}
 	managed := &managedSession{
 		adapter: a, agent: provider, hostID: sessionID, worktree: worktree, emit: emit,
-		interactions: map[string]chan host.InteractionResponse{}, done: make(chan struct{}),
+		interactions: map[string]chan host.InteractionResponse{}, done: make(chan struct{}), ready: make(chan struct{}),
 	}
 	a.mu.Lock()
 	if a.sessions[sessionID] != nil {
@@ -152,16 +159,19 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 	} else {
 		options, err = provider.ResumeSession(backendID, worktree, nil, client)
 		if err != nil {
+			managed.finishStart(err)
 			a.remove(sessionID, managed)
 			return host.BackendSession{}, fmt.Errorf("antigravity: resume session: %w", err)
 		}
 	}
 	managed.backendID = strings.TrimSpace(backendID)
 	if managed.backendID == "" {
+		managed.finishStart(errors.New("provider returned an empty session ID"))
 		a.remove(sessionID, managed)
 		return host.BackendSession{}, errors.New("antigravity: provider returned an empty session ID")
 	}
 	options = managed.applyConfiguration(request.Model, request.PermissionMode, options)
+	managed.finishStart(nil)
 	managed.emitConfig(options)
 	state := host.BackendSession{ID: managed.backendID, ThreadID: managed.backendID}
 	if strings.TrimSpace(request.Prompt) != "" {
@@ -185,9 +195,9 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 		return host.BackendSession{}, errors.New("antigravity: prompt is required")
 	}
 	managed.turnMu.Lock()
-	if managed.turnID != "" {
+	if managed.turnID != "" || managed.restarting {
 		managed.turnMu.Unlock()
-		return host.BackendSession{}, errors.New("antigravity: turn already active")
+		return host.BackendSession{}, errors.New("antigravity: turn already active or session restarting")
 	}
 	managed.turn++
 	turnID := fmt.Sprintf("%s:%d", managed.backendID, managed.turn)
@@ -195,7 +205,7 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 	managed.turnID = turnID
 	managed.turnCancel = cancel
 	if emit != nil {
-		managed.emit = emit
+		managed.setEventSink(emit)
 	}
 	managed.turnMu.Unlock()
 	managed.emitEvent(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID, Data: map[string]any{"turn_id": turnID}})
@@ -208,7 +218,7 @@ func (s *managedSession) runPrompt(ctx context.Context, turnID string, request h
 	if len(options) > 0 {
 		s.emitConfig(options)
 	}
-	outcome, err := s.agent.Prompt(s.backendID, request.Prompt, &sessionClient{session: s})
+	outcome, err := s.currentAgent().Prompt(s.backendID, request.Prompt, &sessionClient{session: s})
 	select {
 	case <-ctx.Done():
 		return
@@ -241,7 +251,7 @@ func (a *Adapter) Interrupt(_ context.Context, sessionID string, _ host.EventSin
 	if turnID == "" {
 		return nil
 	}
-	managed.agent.Cancel(managed.backendID)
+	managed.currentAgent().Cancel(managed.backendID)
 	if cancel != nil {
 		cancel()
 	}
@@ -258,8 +268,9 @@ func (a *Adapter) CloseSession(sessionID string) error {
 	if managed == nil {
 		return nil
 	}
+	<-managed.ready
 	managed.stop()
-	managed.agent.CloseSession(managed.backendID)
+	managed.currentAgent().CloseSession(managed.backendID)
 	return nil
 }
 
@@ -269,11 +280,15 @@ func (a *Adapter) RestartSession(ctx context.Context, sessionID string, _ host.E
 		return host.BackendSession{}, err
 	}
 	managed.turnMu.Lock()
-	active := managed.turnID != ""
+	active := managed.turnID != "" || managed.restarting
+	if !active {
+		managed.restarting = true
+	}
 	managed.turnMu.Unlock()
 	if active {
 		return host.BackendSession{}, errors.New("antigravity: cannot restart during an active turn")
 	}
+	defer managed.finishRestart()
 	provider, err := a.createAgent(ctx, managed.worktree)
 	if err != nil {
 		return host.BackendSession{}, err
@@ -282,7 +297,14 @@ func (a *Adapter) RestartSession(ctx context.Context, sessionID string, _ host.E
 	if err != nil {
 		return host.BackendSession{}, fmt.Errorf("antigravity: restart session: %w", err)
 	}
-	managed.agent = provider
+	a.mu.Lock()
+	if a.sessions[sessionID] != managed {
+		a.mu.Unlock()
+		provider.CloseSession(managed.backendID)
+		return host.BackendSession{}, errors.New("antigravity: session closed during restart")
+	}
+	managed.replaceAgent(provider)
+	a.mu.Unlock()
 	managed.emitConfig(options)
 	managed.emitEvent(host.Event{Type: host.EventAgentRecovered, Message: "Antigravity session recovered", Data: map[string]any{"restarted": true}})
 	return host.BackendSession{ID: managed.backendID, ThreadID: managed.backendID}, nil
@@ -360,6 +382,10 @@ func (a *Adapter) session(sessionID string) (*managedSession, error) {
 	if managed == nil {
 		return nil, fmt.Errorf("antigravity: session %q not found", sessionID)
 	}
+	<-managed.ready
+	if managed.startErr != nil {
+		return nil, fmt.Errorf("antigravity: session %q failed to start: %w", sessionID, managed.startErr)
+	}
 	return managed, nil
 }
 
@@ -372,13 +398,51 @@ func (a *Adapter) remove(sessionID string, managed *managedSession) {
 	managed.stop()
 }
 
+func (s *managedSession) finishStart(err error) {
+	s.startOnce.Do(func() {
+		s.startErr = err
+		close(s.ready)
+	})
+}
+
+func (s *managedSession) currentAgent() agent {
+	s.agentMu.RLock()
+	defer s.agentMu.RUnlock()
+	return s.agent
+}
+
+func (s *managedSession) replaceAgent(provider agent) {
+	s.agentMu.Lock()
+	s.agent = provider
+	s.agentMu.Unlock()
+}
+
+func (s *managedSession) setEventSink(emit host.EventSink) {
+	s.emitMu.Lock()
+	s.emit = emit
+	s.emitMu.Unlock()
+}
+
+func (s *managedSession) eventSink() host.EventSink {
+	s.emitMu.RLock()
+	defer s.emitMu.RUnlock()
+	return s.emit
+}
+
+func (s *managedSession) finishRestart() {
+	s.turnMu.Lock()
+	s.restarting = false
+	s.turnMu.Unlock()
+}
+
 func (s *managedSession) applyConfiguration(model, mode string, fallback []antigravityacp.ConfigOption) []antigravityacp.ConfigOption {
 	options := fallback
+	provider := s.currentAgent()
 	for _, selection := range []struct{ id, value string }{{"model", strings.TrimSpace(model)}, {"mode", strings.TrimSpace(mode)}} {
 		if selection.value == "" {
 			continue
 		}
-		updated, err := s.agent.SetConfigOption(s.backendID, selection.id, selection.value)
+		updated, err := provider.SetConfigOption(s.backendID, selection.id, selection.value)
 		if err != nil {
 			s.emitEvent(host.Event{Type: host.EventTraceUpdated, Message: err.Error(), Data: map[string]any{"configuration_error": err.Error()}})
 			continue
@@ -517,7 +581,8 @@ func (s *managedSession) translateUpdate(update *antigravityacp.SessionUpdate) h
 }
 
 func (s *managedSession) emitEvent(event host.Event) {
-	if s.emit == nil {
+	emit := s.eventSink()
+	if emit == nil {
 		return
 	}
 	event.Backend = Backend
@@ -530,7 +595,7 @@ func (s *managedSession) emitEvent(event host.Event) {
 	if event.BackendTurnID == "" {
 		event.BackendTurnID = s.currentTurnID()
 	}
-	s.emit(event)
+	emit(event)
 }
 
 func (s *managedSession) currentTurnID() string {
