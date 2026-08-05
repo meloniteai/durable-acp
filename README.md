@@ -380,7 +380,7 @@ or a catalog refresh probes them.
 | --- | --- |
 | `claude` | `claude-agent-acp` |
 | `codex` | `codex-acp` |
-| `cursor` | `agent acp` |
+| `cursor` | `cursor-agent acp` |
 | `antigravity` | `agy` |
 
 `Detect` reports whether each command is available without launching a

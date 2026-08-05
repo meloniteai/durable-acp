@@ -26,7 +26,7 @@ import (
 const (
 	defaultQueueDepth       = 16
 	defaultCoalesceInterval = 24 * time.Millisecond
-	defaultCatalogTimeout   = 45 * time.Second
+	defaultCatalogTimeout   = 10 * time.Second
 )
 
 // Config configures a Runtime. Journal and EventSink are optional, allowing
