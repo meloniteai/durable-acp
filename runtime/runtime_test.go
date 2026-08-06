@@ -947,7 +947,7 @@ func TestRuntimeSuppressesProviderReplayHistory(t *testing.T) {
 	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "replay"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.SetReplayHistory("replay", []journal.Record{{Event: journal.EventAgentMessage, Data: json.RawMessage(`{"message":"existing"}`)}}); err != nil {
+	if err := runtime.SetReplayHistory("replay", []journal.Record{{SessionID: "replay", Event: journal.EventAgentMessage, Data: json.RawMessage(`{"message":"existing"}`)}}); err != nil {
 		t.Fatal(err)
 	}
 	adapter.emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "existing", Local: map[string]any{host.EventLocalReplay: true, host.EventLocalReplayStart: true}})

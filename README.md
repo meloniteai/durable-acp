@@ -315,20 +315,24 @@ runtime matches replayed semantic events against the durable journal and
 suppresses duplicates. Unmatched events continue through the normal event and
 journal paths.
 
-Replay identity is session-scoped and ordered. It combines conversation,
-backend thread, event kind and role, provider turn when available, and the
-event's normalized semantic payload. Provider event IDs strengthen a match
-when they agree but are not required to survive a provider restart. This keeps
-identical messages in separate turns distinct while allowing live and replay
-representations of the same item to use different provider-generated IDs.
+Replay identity is an ordered occurrence coordinate: session, conversation,
+backend thread, logical turn ordinal, event kind, and occurrence ordinal within
+that turn. Logical turn ordinals are reconstructed independently for the
+persisted and replay streams from user-message boundaries and provider turn
+transitions. Provider event IDs and content are not identity inputs. Adjacent
+cumulative snapshots with one source event ID are treated as one occurrence
+inside their own stream. This keeps repeated identical messages distinct and
+allows live and replay representations to use different IDs or payload
+formatting.
 
 Previously, two non-empty but different provider event IDs were a hard
 mismatch, and recording that first miss advanced the replay cursor past the
 remaining journal. Providers that mint new IDs for history replay therefore
-duplicated the first event and every event after it. Unmatched replay records
-now leave the remaining journal matchable. Provider adapters can also restore
-synthetic turn counters from replay-local item identities without treating
-those item IDs as durable canonical identity.
+duplicated the first event and every event after it. The matcher now compares
+reconstructable occurrence coordinates, and unmatched replay records leave the
+remaining journal matchable. Provider adapters can restore synthetic turn
+counters from replay-local item identities without treating those item IDs as
+durable canonical identity.
 
 Hosts with an existing journal can pass a caller-owned store with
 `WithJournalStore`, or configure an Engine-owned directory with
