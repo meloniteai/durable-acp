@@ -46,6 +46,8 @@ type Config struct {
 	DoneCompletionGrace     time.Duration
 	CompleteOnDone          bool
 	ModelInPrompt           bool
+	ResumeTurnCount         func(json.RawMessage) uint64
+	ReplayTurnIdentity      func(json.RawMessage) string
 }
 
 // Option customizes an ACP executable configuration.
@@ -159,6 +161,7 @@ type managedSession struct {
 	replayMu      sync.Mutex
 	replaying     bool
 	replayFirst   bool
+	replayTurns   map[string]struct{}
 	forkMu        sync.Mutex
 	forks         map[string]*forkInteractionPolicy
 }
@@ -762,6 +765,7 @@ func (s *managedSession) observe(_ context.Context, direction client.Direction, 
 	if direction != client.DirectionInbound {
 		return nil
 	}
+	s.observeReplayTurn(raw)
 	var message struct {
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
@@ -773,6 +777,9 @@ func (s *managedSession) observe(_ context.Context, direction client.Direction, 
 	if len(message.Result) > 0 {
 		var result map[string]any
 		if json.Unmarshal(message.Result, &result) == nil && len(mapValue(result, "thread")) > 0 {
+			if s.adapter.config.ResumeTurnCount != nil {
+				s.seedTurn(s.adapter.config.ResumeTurnCount(message.Result))
+			}
 			s.emitEvent(host.Event{Type: host.EventTraceUpdated, Data: map[string]any{"session_history": result}})
 		}
 	}
@@ -798,6 +805,39 @@ func (s *managedSession) observe(_ context.Context, direction client.Direction, 
 	}
 	s.emitEvent(host.Event{Type: host.EventTraceUpdated, Data: map[string]any{"provider_method": message.Method, "params": params}})
 	return nil
+}
+
+func (s *managedSession) seedTurn(count uint64) {
+	for {
+		current := s.turn.Load()
+		if current >= count || s.turn.CompareAndSwap(current, count) {
+			return
+		}
+	}
+}
+
+func (s *managedSession) observeReplayTurn(raw json.RawMessage) {
+	identity := s.adapter.config.ReplayTurnIdentity
+	if identity == nil {
+		return
+	}
+	key := strings.TrimSpace(identity(raw))
+	if key == "" {
+		return
+	}
+	s.replayMu.Lock()
+	if !s.replaying {
+		s.replayMu.Unlock()
+		return
+	}
+	if _, exists := s.replayTurns[key]; exists {
+		s.replayMu.Unlock()
+		return
+	}
+	s.replayTurns[key] = struct{}{}
+	count := len(s.replayTurns)
+	s.replayMu.Unlock()
+	s.seedTurn(uint64(count))
 }
 
 func legacySessionUpdateEvent(params, update map[string]any, discriminator string) (host.Event, bool) {
@@ -1098,12 +1138,14 @@ func (s *managedSession) beginReplay() {
 	s.replayMu.Lock()
 	s.replaying = true
 	s.replayFirst = true
+	s.replayTurns = map[string]struct{}{}
 	s.replayMu.Unlock()
 }
 
 func (s *managedSession) endReplay() {
 	s.replayMu.Lock()
 	s.replaying = false
+	s.replayTurns = nil
 	s.replayMu.Unlock()
 }
 

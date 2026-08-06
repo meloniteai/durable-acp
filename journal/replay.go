@@ -11,8 +11,11 @@ type ReplayMatcher struct {
 }
 
 type replayKey struct {
+	session      string
 	conversation string
 	event        string
+	thread       string
+	turn         string
 	providerID   string
 	content      string
 }
@@ -35,11 +38,21 @@ func (m *ReplayMatcher) Match(record Record) bool {
 	if !ok {
 		return false
 	}
+	bestIndex := -1
+	bestRank := replayNoMatch
 	for index := m.next; index < len(m.records); index++ {
-		if !m.records[index].equal(key) {
+		rank := m.records[index].matchRank(key)
+		if rank <= bestRank {
 			continue
 		}
-		m.next = index + 1
+		bestIndex = index
+		bestRank = rank
+		if rank == replayProviderMatch {
+			break
+		}
+	}
+	if bestIndex >= 0 {
+		m.next = bestIndex + 1
 		return true
 	}
 	return false
@@ -60,17 +73,34 @@ func (m *ReplayMatcher) Record(record Record) {
 		return
 	}
 	m.records = append(m.records, key)
-	m.next = len(m.records)
 }
 
-func (k replayKey) equal(other replayKey) bool {
-	if k.event != other.event || k.conversation != "" && other.conversation != "" && k.conversation != other.conversation {
-		return false
+type replayMatchRank uint8
+
+const (
+	replayNoMatch replayMatchRank = iota
+	replaySemanticMatch
+	replayScopedMatch
+	replayProviderMatch
+)
+
+func (k replayKey) matchRank(other replayKey) replayMatchRank {
+	if k.session != "" && other.session != "" && k.session != other.session ||
+		k.event != other.event ||
+		k.conversation != "" && other.conversation != "" && k.conversation != other.conversation ||
+		k.thread != "" && other.thread != "" && k.thread != other.thread {
+		return replayNoMatch
 	}
-	if k.providerID != "" && other.providerID != "" {
-		return k.providerID == other.providerID
+	if k.providerID != "" && k.providerID == other.providerID {
+		return replayProviderMatch
 	}
-	return k.content == other.content
+	if k.content != other.content {
+		return replayNoMatch
+	}
+	if k.event != EventUserMessage && k.turn != "" && other.turn != "" && k.turn == other.turn {
+		return replayScopedMatch
+	}
+	return replaySemanticMatch
 }
 
 func replayKeyFor(record Record) (replayKey, bool) {
@@ -79,8 +109,11 @@ func replayKeyFor(record Record) (replayKey, bool) {
 		return replayKey{}, false
 	}
 	key := replayKey{
+		session:      record.SessionID,
 		conversation: record.Conversation,
 		event:        record.Event,
+		thread:       replayAgentString(data, "backend_thread_id"),
+		turn:         strings.TrimSpace(record.TurnID),
 		providerID:   replayString(data, "provider_event_id"),
 	}
 	switch record.Event {
@@ -113,6 +146,11 @@ func replaySelectedJSON(data map[string]any, keys ...string) string {
 func replayString(data map[string]any, key string) string {
 	value, _ := data[key].(string)
 	return value
+}
+
+func replayAgentString(data map[string]any, key string) string {
+	agent, _ := data["agent"].(map[string]any)
+	return replayString(agent, key)
 }
 
 func replayJSON(value any) string {

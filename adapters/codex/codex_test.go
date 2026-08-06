@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -15,6 +16,30 @@ import (
 func TestNewDeclaresCodexBackend(t *testing.T) {
 	if adapter := New(); adapter == nil || adapter.Backend() != Backend {
 		t.Fatalf("adapter = %#v", adapter)
+	}
+}
+
+func TestCodexResumeIdentityParsers(t *testing.T) {
+	if count := codexResumeTurnCount(json.RawMessage(`{"thread":{"turns":[{},{}]}}`)); count != 2 {
+		t.Fatalf("resume turn count = %d, want 2", count)
+	}
+	if count := codexResumeTurnCount(json.RawMessage(`{`)); count != 0 {
+		t.Fatalf("invalid resume turn count = %d, want 0", count)
+	}
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{`{"method":"session/update","params":{"sessionId":"thread","update":{"sessionUpdate":"user_message_chunk","messageId":"item-1"}}}`, "thread:item-1"},
+		{`{"method":"session/update","params":{"sessionId":"thread","update":{"sessionUpdate":"user_message_chunk","itemId":"item-2"}}}`, "thread:item-2"},
+		{`{"method":"session/update","params":{"sessionId":"thread","update":{"sessionUpdate":"agent_message_chunk","messageId":"item-3"}}}`, ""},
+		{`{"method":"session/update","params":{"sessionId":"thread","update":{"sessionUpdate":"user_message_chunk"}}}`, ""},
+		{`{`, ""},
+	}
+	for _, test := range tests {
+		if got := codexReplayTurnIdentity(json.RawMessage(test.raw)); got != test.want {
+			t.Fatalf("replay turn identity = %q, want %q", got, test.want)
+		}
 	}
 }
 
@@ -78,6 +103,28 @@ func TestInterruptPreservesProcessBeforeNextTurn(t *testing.T) {
 	}
 }
 
+func TestResumeSeedsTurnSequenceFromCodexHistory(t *testing.T) {
+	adapter := New(
+		acpx.WithCommand(os.Args[0]),
+		acpx.WithArgs("-test.run=TestCodexForkChild", "--"),
+		acpx.WithEnvironment(append(os.Environ(), "DURABLE_CODEX_FORK_CHILD=1")),
+	)
+	if _, err := adapter.StartSession(context.Background(), "resume", host.StartSessionRequest{
+		Worktree:               t.TempDir(),
+		ResumeBackendSessionID: "provider-history",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.CloseSession("resume") }()
+	turn, err := adapter.SendTurn(context.Background(), "resume", host.SendTurnRequest{Prompt: "after-history"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.TurnID != "provider-history:3" {
+		t.Fatalf("resumed turn id = %q, want provider-history:3", turn.TurnID)
+	}
+}
+
 func waitCodexEvent(t *testing.T, events <-chan host.Event, match func(host.Event) bool) {
 	t.Helper()
 	timer := time.NewTimer(3 * time.Second)
@@ -122,7 +169,20 @@ func TestCodexForkChild(t *testing.T) {
 		case "session/new":
 			writeCodexRPC(t, encoder, message.ID, map[string]any{"sessionId": "provider"})
 		case "session/resume", "session/load":
-			writeCodexRPC(t, encoder, message.ID, map[string]any{"sessionId": "provider"})
+			var params struct {
+				SessionID string `json:"sessionId"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			if params.SessionID == "provider-history" {
+				for index := 1; index <= 2; index++ {
+					if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": params.SessionID, "update": map[string]any{"sessionUpdate": "user_message_chunk", "messageId": fmt.Sprintf("item-%d", index), "content": map[string]any{"type": "text", "text": "same"}}}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			writeCodexRPC(t, encoder, message.ID, map[string]any{"sessionId": params.SessionID})
 		case "session/prompt":
 			var params struct {
 				Prompt []struct {
