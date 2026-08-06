@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -68,6 +69,133 @@ func TestEngineManagedSessionLifecycle(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, "sessions", created.ID+".json")); !os.IsNotExist(err) {
 		t.Fatalf("removed manifest stat error = %v", err)
 	}
+}
+
+func TestEngineResumeReplayIsIdempotentWithDifferentProviderIDs(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	worktree := t.TempDir()
+	provider := &replayEngineProvider{}
+
+	first := openReplayEngine(t, ctx, home, provider)
+	started, err := first.Start(ctx, StartRequest{
+		ID: "replay-resume", Backend: "replay", WorkspaceMode: WorkspaceExisting, Worktree: worktree,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := first.Send(ctx, host.SendTurnRequest{SessionID: started.ID, Prompt: "same"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := replayConversationRecords(t, first, started.ID)
+	if len(want) != 4 {
+		t.Fatalf("initial conversation records = %d, want 4", len(want))
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := openReplayEngine(t, ctx, home, provider)
+	if _, err := second.Resume(ctx, started.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := replayConversationRecords(t, second, started.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("first resume changed canonical history\ngot:  %#v\nwant: %#v", got, want)
+	}
+	if _, err := second.Send(ctx, host.SendTurnRequest{SessionID: started.ID, Prompt: "same"}); err != nil {
+		t.Fatal(err)
+	}
+	wantAfterNewTurn := replayConversationRecords(t, second, started.ID)
+	if len(wantAfterNewTurn) != 6 {
+		t.Fatalf("post-resume conversation records = %d, want 6", len(wantAfterNewTurn))
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	third := openReplayEngine(t, ctx, home, provider)
+	defer func() { _ = third.Close() }()
+	if _, err := third.Resume(ctx, started.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := replayConversationRecords(t, third, started.ID); !reflect.DeepEqual(got, wantAfterNewTurn) {
+		t.Fatalf("second resume changed canonical history\ngot:  %#v\nwant: %#v", got, wantAfterNewTurn)
+	}
+}
+
+type replayEngineProvider struct {
+	mu      sync.Mutex
+	turns   int
+	resumes int
+}
+
+func (*replayEngineProvider) Backend() host.Backend { return "replay" }
+
+func (*replayEngineProvider) Detect(context.Context) host.BackendStatus {
+	return host.BackendStatus{Backend: "replay", Available: true}
+}
+
+func (p *replayEngineProvider) StartSession(_ context.Context, _ string, request host.StartSessionRequest, emit host.EventSink) (host.BackendSession, error) {
+	p.mu.Lock()
+	turns := p.turns
+	if request.ResumeBackendSessionID != "" {
+		p.resumes++
+		generation := p.resumes
+		for turn := 1; turn <= turns; turn++ {
+			local := map[string]any{host.EventLocalReplay: true}
+			if turn == 1 {
+				local[host.EventLocalReplayStart] = true
+			}
+			turnID := fmt.Sprintf("provider-thread:%d", turn)
+			emit(host.Event{Type: host.EventMessage, Role: "user", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("item-%d-%d-user", generation, turn)}, Local: local})
+			emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("item-%d-%d-agent", generation, turn)}, Local: map[string]any{host.EventLocalReplay: true}})
+		}
+	}
+	p.mu.Unlock()
+	return host.BackendSession{ID: "provider-thread", ThreadID: "provider-thread"}, nil
+}
+
+func (p *replayEngineProvider) SendTurn(_ context.Context, _ string, _ host.SendTurnRequest, emit host.EventSink) (host.BackendSession, error) {
+	p.mu.Lock()
+	p.turns++
+	turn := p.turns
+	p.mu.Unlock()
+	turnID := fmt.Sprintf("provider-thread:%d", turn)
+	emit(host.Event{Type: host.EventTurnStarted, BackendTurnID: turnID})
+	emit(host.Event{Type: host.EventMessage, Role: "user", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("msg-%d-user", turn)}})
+	emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("msg-%d-agent", turn)}})
+	emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: turnID})
+	return host.BackendSession{ID: "provider-thread", ThreadID: "provider-thread", TurnID: turnID}, nil
+}
+
+func (*replayEngineProvider) Interrupt(context.Context, string, host.EventSink) error { return nil }
+
+func (*replayEngineProvider) CloseSession(string) error { return nil }
+
+func openReplayEngine(t *testing.T, ctx context.Context, home string, provider host.Adapter) *Engine {
+	t.Helper()
+	engine, err := Open(ctx, home, WithAdapters(provider))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine
+}
+
+func replayConversationRecords(t *testing.T, engine *Engine, sessionID string) []journal.Record {
+	t.Helper()
+	records, err := engine.History(sessionID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation := make([]journal.Record, 0, len(records))
+	for _, record := range records {
+		if record.Event == journal.EventUserMessage || record.Event == journal.EventAgentMessage {
+			conversation = append(conversation, record)
+		}
+	}
+	return conversation
 }
 
 func TestOpenRejectsRelativeHome(t *testing.T) {

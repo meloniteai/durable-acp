@@ -248,6 +248,36 @@ func TestAdapterSessionValidation(t *testing.T) {
 	}
 }
 
+func TestManagedSessionSeedsDistinctReplayTurns(t *testing.T) {
+	adapter := New(Config{Backend: "test", ReplayTurnIdentity: func(raw json.RawMessage) string {
+		var message struct {
+			Key string `json:"key"`
+		}
+		_ = json.Unmarshal(raw, &message)
+		return message.Key
+	}})
+	managed := &managedSession{adapter: adapter}
+	managed.beginReplay()
+	for _, raw := range []json.RawMessage{json.RawMessage(`{"key":"one"}`), json.RawMessage(`{"key":"one"}`), json.RawMessage(`{"key":"two"}`)} {
+		if err := managed.observe(context.Background(), client.DirectionInbound, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if managed.turn.Load() != 2 {
+		t.Fatalf("replayed turn count = %d, want 2", managed.turn.Load())
+	}
+	managed.seedTurn(1)
+	managed.seedTurn(3)
+	managed.endReplay()
+	if err := managed.observe(context.Background(), client.DirectionInbound, json.RawMessage(`{"key":"four"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if managed.turn.Load() != 3 {
+		t.Fatalf("post-replay turn count = %d, want 3", managed.turn.Load())
+	}
+	(&managedSession{adapter: New(Config{Backend: "test"})}).observeReplayTurn(nil)
+}
+
 func TestManagedSessionDoneCompletion(t *testing.T) {
 	adapter := New(Config{Backend: "cursor", CompleteOnDone: true, DoneCompletionGrace: 10 * time.Millisecond})
 	events := make(chan host.Event, 4)

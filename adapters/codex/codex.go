@@ -36,7 +36,46 @@ func New(options ...acpx.Option) *Adapter {
 		LegacyExtensions:        true,
 		BestEffortConfiguration: true,
 		SessionModeValues:       []string{"plan"},
+		ResumeTurnCount:         codexResumeTurnCount,
+		ReplayTurnIdentity:      codexReplayTurnIdentity,
 	}, options...)}
+}
+
+func codexResumeTurnCount(raw json.RawMessage) uint64 {
+	var response struct {
+		Thread struct {
+			Turns []json.RawMessage `json:"turns"`
+		} `json:"thread"`
+	}
+	if json.Unmarshal(raw, &response) != nil {
+		return 0
+	}
+	return uint64(len(response.Thread.Turns))
+}
+
+func codexReplayTurnIdentity(raw json.RawMessage) string {
+	var message struct {
+		Method string `json:"method"`
+		Params struct {
+			SessionID string `json:"sessionId"`
+			Update    struct {
+				SessionUpdate string `json:"sessionUpdate"`
+				MessageID     string `json:"messageId"`
+				ItemID        string `json:"itemId"`
+			} `json:"update"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(raw, &message) != nil || message.Method != "session/update" || message.Params.Update.SessionUpdate != "user_message_chunk" {
+		return ""
+	}
+	itemID := strings.TrimSpace(message.Params.Update.MessageID)
+	if itemID == "" {
+		itemID = strings.TrimSpace(message.Params.Update.ItemID)
+	}
+	if itemID == "" {
+		return ""
+	}
+	return strings.TrimSpace(message.Params.SessionID) + ":" + itemID
 }
 
 func (a *Adapter) ForkPrompt(ctx context.Context, request host.ForkPromptRequest) (host.ForkPromptResponse, error) {
