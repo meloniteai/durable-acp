@@ -336,8 +336,10 @@ durable canonical identity.
 
 Hosts with an existing journal can pass a caller-owned store with
 `WithJournalStore`, or configure an Engine-owned directory with
-`WithJournalConfiguration`. Set `DisableRuntimeJournal` only when the host
-already writes normalized runtime events into that same store.
+`WithJournalConfiguration`. Set `DisableRuntimeJournalWrites` only when the
+host already writes normalized runtime events into that same store. The
+runtime still reads the shared store to reconstruct and reconcile interrupted
+turns during resume.
 
 ## Opaque host extensions
 

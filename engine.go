@@ -66,10 +66,10 @@ type openOptions struct {
 // persistence-provider abstraction. Store remains owned by the caller;
 // Directory stores are opened and closed by the Engine.
 type JournalConfiguration struct {
-	Store                 *journal.Store
-	Directory             string
-	Options               []journal.Option
-	DisableRuntimeJournal bool
+	Store                       *journal.Store
+	Directory                   string
+	Options                     []journal.Option
+	DisableRuntimeJournalWrites bool
 }
 
 // WithAdapters adds adapters or replaces a built-in adapter with the same
@@ -343,11 +343,8 @@ func Open(ctx context.Context, home string, options ...Option) (*Engine, error) 
 	if !resolved.hasRuntimeConfig {
 		runtimeConfig = runtime.Config{}
 	}
-	if resolved.journal.DisableRuntimeJournal {
-		runtimeConfig.Journal = nil
-	} else {
-		runtimeConfig.Journal = store
-	}
+	runtimeConfig.Journal = store
+	runtimeConfig.DisableJournalWrites = runtimeConfig.DisableJournalWrites || resolved.journal.DisableRuntimeJournalWrites
 	runtimeConfig.EventSink = engine.publish
 	hostTurnSubmitted := runtimeConfig.TurnSubmitted
 	runtimeConfig.TurnSubmitted = func(submission runtime.TurnSubmission) {
@@ -558,10 +555,11 @@ func (e *Engine) resumeStart(ctx context.Context, request StartRequest) (Session
 		}
 	}
 	if _, stateErr := e.runtime.State(entry.ID); stateErr != nil {
-		if _, restoreErr := e.runtime.Restore(entry.ID); restoreErr != nil {
-			if _, createErr := e.runtime.Create(ctx, runtime.CreateRequest{ID: entry.ID, Backend: entry.Backend, Worktree: entry.Worktree.Path}); createErr != nil {
-				return Session{}, errors.Join(restoreErr, createErr)
-			}
+		if _, restoreErr := e.runtime.Restore(runtime.RestoreRequest{ //nolint:contextcheck // Restore emits recovery events independently of the resume request lifetime.
+			ID: entry.ID, Backend: entry.Backend, Worktree: entry.Worktree.Path,
+			BackendSession: entry.BackendSession, Configuration: entry.Configuration,
+		}); restoreErr != nil {
+			return Session{}, restoreErr
 		}
 	}
 	configuration := entry.Configuration
@@ -866,10 +864,11 @@ func (e *Engine) Remove(ctx context.Context, sessionID string, force bool) error
 	}
 	if entry.ClosedAt == nil {
 		if _, err := e.runtime.State(entry.ID); err != nil {
-			if _, restoreErr := e.runtime.Restore(entry.ID); restoreErr != nil {
-				if _, createErr := e.runtime.Create(ctx, runtime.CreateRequest{ID: entry.ID, Backend: entry.Backend, Worktree: entry.Worktree.Path}); createErr != nil {
-					return errors.Join(restoreErr, createErr)
-				}
+			if _, restoreErr := e.runtime.Restore(runtime.RestoreRequest{ //nolint:contextcheck // Restore emits recovery events independently of the remove request lifetime.
+				ID: entry.ID, Backend: entry.Backend, Worktree: entry.Worktree.Path,
+				BackendSession: entry.BackendSession, Configuration: entry.Configuration,
+			}); restoreErr != nil {
+				return restoreErr
 			}
 		}
 		if err := e.CloseSession(entry.ID); err != nil {

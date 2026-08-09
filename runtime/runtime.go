@@ -33,16 +33,17 @@ const (
 // the package to be used as an in-memory multiplexer in tests or short-lived
 // applications.
 type Config struct {
-	Journal           *journal.Store
-	EventSink         host.EventSink
-	TurnDispatched    func(TurnDispatch) error
-	TurnSubmitted     func(TurnSubmission)
-	MaxQueuedTurns    int
-	CatalogCacheDir   string
-	CatalogTimeout    time.Duration
-	CatalogUpdated    func(host.Backend, host.BackendCatalog)
-	CoalesceInterval  time.Duration
-	DisableCoalescing bool
+	Journal              *journal.Store
+	EventSink            host.EventSink
+	TurnDispatched       func(TurnDispatch) error
+	TurnSubmitted        func(TurnSubmission)
+	MaxQueuedTurns       int
+	CatalogCacheDir      string
+	CatalogTimeout       time.Duration
+	CatalogUpdated       func(host.Backend, host.BackendCatalog)
+	CoalesceInterval     time.Duration
+	DisableCoalescing    bool
+	DisableJournalWrites bool
 }
 
 // CreateRequest creates a session before its provider process is started.
@@ -50,6 +51,15 @@ type CreateRequest struct {
 	ID       string
 	Backend  host.Backend
 	Worktree string
+}
+
+// RestoreRequest supplies identity that may live outside the shared event journal.
+type RestoreRequest struct {
+	ID             string
+	Backend        host.Backend
+	Worktree       string
+	BackendSession host.BackendSession
+	Configuration  host.SessionConfiguration
 }
 
 // State is the current runtime-owned view of a session.
@@ -118,6 +128,7 @@ type Runtime struct {
 	adapters         map[host.Backend]host.Adapter
 	sessions         map[string]*managedSession
 	journal          *journal.Store
+	journalWrites    bool
 	emit             host.EventSink
 	turnDispatched   func(TurnDispatch) error
 	turnSubmitted    func(TurnSubmission)
@@ -181,6 +192,7 @@ func New(config Config, adapters ...host.Adapter) *Runtime {
 		adapters:         map[host.Backend]host.Adapter{},
 		sessions:         map[string]*managedSession{},
 		journal:          config.Journal,
+		journalWrites:    !config.DisableJournalWrites,
 		emit:             config.EventSink,
 		turnDispatched:   config.TurnDispatched,
 		turnSubmitted:    config.TurnSubmitted,
@@ -835,19 +847,31 @@ func (r *Runtime) Sessions() []State {
 	return states
 }
 
-// Restore reconstructs one session identity from its journal. It does not
-// start an adapter or resume a provider session.
-func (r *Runtime) Restore(sessionID string) (State, error) {
+// Restore reconstructs one session identity from its journal. It resolves any
+// active turn left behind by the previous runtime before returning.
+func (r *Runtime) Restore(request RestoreRequest) (State, error) {
 	if r == nil || r.journal == nil {
 		return State{}, errors.New("runtime: journal is required to restore a session")
 	}
-	id := strings.TrimSpace(sessionID)
+	id := strings.TrimSpace(request.ID)
 	records, err := r.journal.Read(id, 0, 0)
 	if err != nil {
 		return State{}, err
 	}
 	var restored *managedSession
+	backend := host.Backend(strings.TrimSpace(string(request.Backend)))
+	worktree := strings.TrimSpace(request.Worktree)
+	if backend != "" && worktree != "" {
+		created := session.New(id, backend, filepath.Clean(worktree))
+		_ = created.Transition(session.StatusActive)
+		created.BackendSession = request.BackendSession
+		restored = &managedSession{session: *created, configuration: normalizeConfiguration(request.Configuration)}
+	}
 	for _, record := range records {
+		recordSequence := restoredEventSequence(record.Sequence)
+		if restored != nil && recordSequence > restored.nextSeq {
+			restored.nextSeq = recordSequence
+		}
 		switch record.Event {
 		case "session.created":
 			var data struct {
@@ -860,8 +884,9 @@ func (r *Runtime) Restore(sessionID string) (State, error) {
 			created := session.New(id, data.Backend, data.Worktree)
 			created.CreatedAt = record.Timestamp
 			created.UpdatedAt = record.Timestamp
+			created.BackendSession = request.BackendSession
 			_ = created.Transition(session.StatusActive)
-			restored = &managedSession{session: *created}
+			restored = &managedSession{session: *created, configuration: normalizeConfiguration(request.Configuration), nextSeq: recordSequence}
 		case "session.started":
 			if restored == nil {
 				continue
@@ -878,20 +903,144 @@ func (r *Runtime) Restore(sessionID string) (State, error) {
 			if restored != nil && restored.session.Status != session.StatusClosed {
 				_ = restored.session.Transition(session.StatusClosed)
 			}
+		case journal.EventAgentTurnStarted:
+			if restored == nil || strings.TrimSpace(record.TurnID) == "" {
+				continue
+			}
+			restored.active = true
+			restored.activeTurnID = strings.TrimSpace(record.TurnID)
+			if restored.session.Status == session.StatusActive {
+				_ = restored.session.Transition(session.StatusRunning)
+			}
+		case journal.EventAgentInteraction, journal.EventAgentPermission:
+			if restored == nil {
+				continue
+			}
+			interaction := interactionFromRecord(record)
+			if interaction == nil {
+				continue
+			}
+			restored.pendingInteraction = interaction
+			if restored.session.Status == session.StatusRunning {
+				_ = restored.session.Transition(session.StatusWaitingInput)
+			}
+		case journal.EventUserRequestResolved:
+			if restored == nil || restored.pendingInteraction == nil {
+				continue
+			}
+			response := interactionResponseFromRecord(record)
+			if response != nil && (response.RequestID == "" || response.RequestID == restored.pendingInteraction.ID) {
+				restored.pendingInteraction = nil
+				if restored.session.Status == session.StatusWaitingInput {
+					_ = restored.session.Transition(session.StatusRunning)
+				}
+			}
+		case journal.EventAgentYielded, journal.EventAgentInterrupted, journal.EventAgentTurnFailed, journal.EventAgentProcessExited:
+			if restored == nil {
+				continue
+			}
+			if record.Event == journal.EventAgentProcessExited || record.TurnID == "" || restored.activeTurnID == "" || record.TurnID == restored.activeTurnID {
+				restored.active = false
+				restored.activeTurnID = ""
+				restored.pendingInteraction = nil
+				if restored.session.Status == session.StatusRunning || restored.session.Status == session.StatusWaitingInput {
+					_ = restored.session.Transition(session.StatusActive)
+				}
+			}
 		}
 	}
 	if restored == nil {
 		return State{}, fmt.Errorf("runtime: no session lifecycle found for %q", id)
 	}
 	r.mu.Lock()
-	if existing := r.sessions[id]; existing != nil {
-		restored = existing
-	} else {
+	inserted := false
+	if r.sessions[id] == nil {
 		r.sessions[id] = restored
+		inserted = true
 	}
-	state := stateLocked(restored)
 	r.mu.Unlock()
-	return state, nil
+	if inserted {
+		r.reconcileRecoveredTurn(id)
+	}
+	return r.State(id)
+}
+
+func restoredEventSequence(sequence uint64) int {
+	maxInt := int(^uint(0) >> 1)
+	if sequence > uint64(maxInt) {
+		return maxInt
+	}
+	return int(sequence) //nolint:gosec // The platform maximum is checked above.
+}
+
+func (r *Runtime) reconcileRecoveredTurn(sessionID string) bool {
+	if r == nil {
+		return false
+	}
+	id := strings.TrimSpace(sessionID)
+	r.mu.Lock()
+	managed := r.sessions[id]
+	if managed == nil || !managed.active {
+		r.mu.Unlock()
+		return false
+	}
+	backend := managed.session.Backend
+	backendSession := managed.session.BackendSession
+	turnID := managed.activeTurnID
+	pending := cloneInteractionRequest(managed.pendingInteraction)
+	r.mu.Unlock()
+	if pending != nil {
+		r.deliver(id, host.Event{
+			Type:             host.EventInteractionResolved,
+			Backend:          backend,
+			BackendSessionID: backendSession.ID,
+			BackendThreadID:  backendSession.ThreadID,
+			BackendTurnID:    turnID,
+			InteractionResponse: &host.InteractionResponse{
+				RequestID: pending.ID,
+				Action:    "cancel",
+				Message:   "Interaction cancelled because the host runtime restarted.",
+			},
+			Data: map[string]any{"reason": "host_runtime_restarted", "recovered": true},
+		})
+	}
+	r.deliver(id, host.Event{
+		Type:             host.EventTurnFailed,
+		Backend:          backend,
+		BackendSessionID: backendSession.ID,
+		BackendThreadID:  backendSession.ThreadID,
+		BackendTurnID:    turnID,
+		Message:          string(backend) + " turn interrupted during host runtime restart",
+		Data: map[string]any{
+			"interrupted": true,
+			"reason":      "host_runtime_restarted",
+			"recovered":   true,
+			"retryable":   true,
+		},
+	})
+	return true
+}
+
+func interactionFromRecord(record journal.Record) *host.InteractionRequest {
+	var data struct {
+		Interaction *host.InteractionRequest `json:"interaction"`
+	}
+	if json.Unmarshal(record.Data, &data) != nil || data.Interaction == nil || strings.TrimSpace(data.Interaction.ID) == "" {
+		return nil
+	}
+	return cloneInteractionRequest(data.Interaction)
+}
+
+func interactionResponseFromRecord(record journal.Record) *host.InteractionResponse {
+	var data struct {
+		Response *host.InteractionResponse `json:"interaction_response"`
+	}
+	if json.Unmarshal(record.Data, &data) != nil || data.Response == nil {
+		return nil
+	}
+	response := *data.Response
+	response.Values = maps.Clone(data.Response.Values)
+	return &response
 }
 
 // Detect returns every registered backend in deterministic order.
@@ -1171,6 +1320,9 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 	}
 	emit := r.emit
 	store := r.journal
+	if !r.journalWrites {
+		store = nil
+	}
 	r.mu.Unlock()
 	if suppressReplay {
 		return
@@ -1336,7 +1488,7 @@ func (r *Runtime) interruptActive(ctx context.Context, sessionID string, adapter
 }
 
 func (r *Runtime) appendLifecycle(sessionID, name string, data map[string]any) error {
-	if r.journal == nil {
+	if r.journal == nil || !r.journalWrites {
 		return nil
 	}
 	raw, err := json.Marshal(data)
