@@ -623,11 +623,10 @@ func TestRuntimeCoalescesAssistantDeltas(t *testing.T) {
 	}
 }
 
-//nolint:govet // Tests use scoped assertions for clearer failure locations.
 func TestRuntimeRestoresLifecycleFromJournal(t *testing.T) {
-	store, err := journal.NewStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	store, storeErr := journal.NewStore(t.TempDir())
+	if storeErr != nil {
+		t.Fatal(storeErr)
 	}
 	adapter := &testAdapter{backend: "test"}
 	runtime := New(Config{Journal: store}, adapter)
@@ -641,12 +640,57 @@ func TestRuntimeRestoresLifecycleFromJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	restored, err := New(Config{Journal: store}, adapter).Restore("session-1")
+	restored, err := New(Config{Journal: store}, adapter).Restore(RestoreRequest{ID: "session-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if restored.Session.Status != session.StatusClosed || restored.Session.Backend != "test" {
 		t.Fatalf("restored = %+v", restored)
+	}
+}
+
+func TestRuntimeReconcilesRecoveredInteractionAndTurn(t *testing.T) {
+	store, storeErr := journal.NewStore(t.TempDir())
+	if storeErr != nil {
+		t.Fatal(storeErr)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	adapter := &testAdapter{backend: "test"}
+	first := New(Config{Journal: store, DisableCoalescing: true}, adapter)
+	if _, createErr := first.Create(context.Background(), CreateRequest{ID: "session-1", Backend: "test", Worktree: t.TempDir()}); createErr != nil {
+		t.Fatal(createErr)
+	}
+	if _, startErr := first.Start(context.Background(), host.StartSessionRequest{SessionID: "session-1"}); startErr != nil {
+		t.Fatal(startErr)
+	}
+	if _, sendErr := first.Send(context.Background(), host.SendTurnRequest{SessionID: "session-1", Prompt: "wait"}); sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	adapter.emit(host.Event{Type: host.EventInteractionRequested, BackendTurnID: "turn-1", Interaction: &host.InteractionRequest{ID: "choice", Kind: host.InteractionChoice}})
+	if _, appendErr := store.Append(journal.Record{SessionID: "session-1", Event: journal.EventUserRequestResolved, Data: json.RawMessage(`{"request_id":"managed-wrapper"}`)}); appendErr != nil {
+		t.Fatal(appendErr)
+	}
+
+	events := make([]host.Event, 0, 2)
+	restoredRuntime := New(Config{Journal: store, DisableCoalescing: true, EventSink: func(event host.Event) {
+		events = append(events, event)
+	}}, adapter)
+	restored, err := restoredRuntime.Restore(RestoreRequest{ID: "session-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.TurnActive || restored.PendingInteraction != nil || restored.Session.Status != session.StatusActive {
+		t.Fatalf("restored = %+v", restored)
+	}
+	state, err := restoredRuntime.State("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.TurnActive || state.PendingInteraction != nil || state.Session.Status != session.StatusActive {
+		t.Fatalf("reconciled state = %+v", state)
+	}
+	if len(events) < 2 || events[0].Type != host.EventInteractionResolved || events[0].InteractionResponse == nil || events[0].InteractionResponse.Action != "cancel" || events[1].Type != host.EventTurnFailed || events[1].Data["interrupted"] != true {
+		t.Fatalf("recovery events = %+v", events)
 	}
 }
 
@@ -925,14 +969,14 @@ func TestRuntimeInteractionFallbackAndRestoreFailures(t *testing.T) {
 	} else if !errors.Is(err, ErrUnsupportedOperation) {
 		t.Fatalf("RespondInteraction error = %T %v", err, err)
 	}
-	if _, err := (*Runtime)(nil).Restore("s"); err == nil {
+	if _, err := (*Runtime)(nil).Restore(RestoreRequest{ID: "s"}); err == nil {
 		t.Fatal("nil runtime restored a session")
 	}
 	store, err := journal.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(Config{Journal: store}, plain).Restore("missing"); err == nil {
+	if _, err := New(Config{Journal: store}, plain).Restore(RestoreRequest{ID: "missing"}); err == nil {
 		t.Fatal("Restore accepted a missing lifecycle")
 	}
 }

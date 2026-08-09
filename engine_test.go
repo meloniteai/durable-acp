@@ -125,6 +125,76 @@ func TestEngineResumeReplayIsIdempotentWithDifferentProviderIDs(t *testing.T) {
 	}
 }
 
+func TestEngineResumeReconcilesOrphanedInteraction(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	worktree := engineRepo(t)
+	store, storeErr := journal.NewStore(filepath.Join(home, "conversations"))
+	if storeErr != nil {
+		t.Fatal(storeErr)
+	}
+	defer func() { _ = store.Close() }()
+	persist := func(event host.Event) {
+		if record, ok := journal.Translate(event); ok {
+			_, _ = store.Append(record)
+		}
+	}
+	firstAdapter := &advancedEngineAdapter{}
+	first, openErr := Open(ctx, home,
+		WithAdapters(firstAdapter),
+		WithEventSink(persist),
+		WithJournalConfiguration(JournalConfiguration{Store: store, DisableRuntimeJournalWrites: true}),
+		WithRuntimeConfiguration(runtime.Config{DisableCoalescing: true}),
+	)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	started, startErr := first.Start(ctx, StartRequest{ID: "recovery", Backend: "advanced", WorkspaceMode: WorkspaceExisting, Worktree: worktree})
+	if startErr != nil {
+		t.Fatal(startErr)
+	}
+	if _, sendErr := first.Send(ctx, host.SendTurnRequest{SessionID: started.ID, Prompt: "wait"}); sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	firstAdapter.emit(host.Event{Type: host.EventInteractionRequested, BackendTurnID: "turn", Interaction: &host.InteractionRequest{ID: "choice", Kind: host.InteractionChoice}})
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	events := make([]host.Event, 0, 2)
+	second, secondOpenErr := Open(ctx, home,
+		WithAdapters(&advancedEngineAdapter{}),
+		WithEventSink(func(event host.Event) {
+			events = append(events, event)
+			persist(event)
+		}),
+		WithJournalConfiguration(JournalConfiguration{Store: store, DisableRuntimeJournalWrites: true}),
+		WithRuntimeConfiguration(runtime.Config{DisableCoalescing: true}),
+	)
+	if secondOpenErr != nil {
+		t.Fatal(secondOpenErr)
+	}
+	defer func() { _ = second.Close() }()
+	if _, resumeErr := second.Resume(ctx, started.ID); resumeErr != nil {
+		t.Fatal(resumeErr)
+	}
+	snapshot, snapshotErr := second.Snapshot(started.ID)
+	if snapshotErr != nil {
+		t.Fatal(snapshotErr)
+	}
+	if snapshot.ActiveTurn.Active || snapshot.PendingInteraction != nil || snapshot.Lifecycle.Status != "active" {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+	var resolved, interrupted bool
+	for _, event := range events {
+		resolved = resolved || event.Type == host.EventInteractionResolved && event.InteractionResponse != nil && event.InteractionResponse.RequestID == "choice" && event.InteractionResponse.Action == "cancel"
+		interrupted = interrupted || event.Type == host.EventTurnFailed && event.Data["interrupted"] == true && event.Data["reason"] == "host_runtime_restarted"
+	}
+	if !resolved || !interrupted {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
 type replayEngineProvider struct {
 	mu      sync.Mutex
 	turns   int
@@ -462,7 +532,7 @@ func TestEngineHostJournalManifestAndSnapshot(t *testing.T) {
 	engine, err := Open(
 		context.Background(), home,
 		WithAdapters(adapter),
-		WithJournalConfiguration(JournalConfiguration{Store: store, DisableRuntimeJournal: true}),
+		WithJournalConfiguration(JournalConfiguration{Store: store, DisableRuntimeJournalWrites: true}),
 		WithRuntimeConfiguration(runtime.Config{MaxQueuedTurns: 3, DisableCoalescing: true}),
 	)
 	if err != nil {
