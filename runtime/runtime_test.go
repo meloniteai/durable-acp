@@ -994,16 +994,33 @@ func TestRuntimeSuppressesProviderReplayHistory(t *testing.T) {
 	if err := runtime.SetReplayHistory("replay", []journal.Record{{SessionID: "replay", Event: journal.EventAgentMessage, Data: json.RawMessage(`{"message":"existing"}`)}}); err != nil {
 		t.Fatal(err)
 	}
-	adapter.emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "existing", Local: map[string]any{host.EventLocalReplay: true, host.EventLocalReplayStart: true}})
+	adapter.emit(host.Event{Type: host.EventThinking, Message: "old thinking", Local: map[string]any{host.EventLocalReplay: true, host.EventLocalReplayStart: true}})
+	adapter.emit(host.Event{Type: host.EventToolStarted, Local: map[string]any{host.EventLocalReplay: true}})
+	adapter.emit(host.Event{Type: host.EventToolOutput, Message: "old output", Local: map[string]any{host.EventLocalReplay: true}})
+	adapter.emit(host.Event{Type: host.EventAvailableCommands, Local: map[string]any{host.EventLocalReplay: true}})
+	adapter.emit(host.Event{Type: host.EventTraceUpdated, Local: map[string]any{host.EventLocalReplay: true}})
+	adapter.emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "existing", Local: map[string]any{host.EventLocalReplay: true}})
 	adapter.emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "new", Local: map[string]any{host.EventLocalReplay: true}})
 	messages := make([]string, 0, 2)
+	forwarded := map[host.EventType]int{}
 	for _, event := range events {
+		forwarded[event.Type]++
 		if event.Type == host.EventMessage {
 			messages = append(messages, event.Message)
 		}
 	}
 	if len(messages) != 1 || messages[0] != "new" {
 		t.Fatalf("replay messages = %#v", messages)
+	}
+	for _, eventType := range []host.EventType{host.EventThinking, host.EventToolStarted, host.EventToolOutput} {
+		if forwarded[eventType] != 0 {
+			t.Fatalf("replayed %s was forwarded", eventType)
+		}
+	}
+	for _, eventType := range []host.EventType{host.EventAvailableCommands, host.EventTraceUpdated} {
+		if forwarded[eventType] != 1 {
+			t.Fatalf("current %s count = %d", eventType, forwarded[eventType])
+		}
 	}
 }
 

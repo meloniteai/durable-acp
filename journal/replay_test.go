@@ -5,89 +5,85 @@ import (
 	"testing"
 )
 
-func TestReplayMatcherUsesOrderedTurnOccurrences(t *testing.T) {
-	existing := []Record{
-		replayMessage(EventUserMessage, "", "msg-user-1", "same"),
-		replayMessage(EventAgentMessage, "thread:1", "msg-agent-1", "same"),
-		replayMessage(EventUserMessage, "thread:1", "msg-user-2", "same"),
-		replayMessage(EventAgentMessage, "thread:2", "msg-agent-2", "same"),
-	}
-	matcher := NewReplayMatcher(existing)
-	replayed := []Record{
-		replayMessage(EventUserMessage, "replay-turn-a", "item-1", "same"),
-		replayMessage(EventAgentMessage, "replay-turn-a", "item-2", "same"),
-		replayMessage(EventUserMessage, "replay-turn-b", "item-3", "same"),
-		replayMessage(EventAgentMessage, "replay-turn-b", "item-4", "same"),
-	}
-	for index, record := range replayed {
-		if !matcher.Match(record) {
-			t.Fatalf("replay record %d did not match", index)
-		}
-	}
-	third := []Record{
-		replayMessage(EventUserMessage, "replay-turn-c", "item-5", "same"),
-		replayMessage(EventAgentMessage, "replay-turn-c", "item-6", "same"),
-	}
-	for _, record := range third {
-		if matcher.Match(record) {
-			t.Fatal("new turn matched exhausted history")
-		}
-		matcher.Record(record)
-	}
-	matcher.Reset()
-	for index, record := range append(replayed, third...) {
-		if !matcher.Match(record) {
-			t.Fatalf("record %d did not match after a second replay", index)
-		}
-	}
-	if matcher.Match(replayMessage(EventUserMessage, "replay-turn-d", "item-7", "same")) {
-		t.Fatal("new turn matched exhausted history")
-	}
-}
-
-func TestReplayMatcherIdentityDoesNotDependOnProviderIDOrContent(t *testing.T) {
-	existing := []Record{
-		replayMessage(EventUserMessage, "live-turn", "msg-user", "original question"),
-		replayMessage(EventAgentMessage, "live-turn", "msg-agent", "original answer"),
-	}
-	matcher := NewReplayMatcher(existing)
+func TestReplayMatcherMatchesPartialSuffixByProviderID(t *testing.T) {
+	matcher := NewReplayMatcher([]Record{
+		replayMessage(EventUserMessage, "turn-1", "user-1", "first question"),
+		replayMessage(EventAgentMessage, "turn-1", "agent-1", "first answer"),
+		replayMessage(EventUserMessage, "turn-2", "user-2", "second question"),
+		replayMessage(EventAgentMessage, "turn-2", "agent-2", "second answer"),
+	})
 	for index, record := range []Record{
-		replayMessage(EventUserMessage, "replay-turn", "item-user", "reformatted question"),
-		replayMessage(EventAgentMessage, "replay-turn", "item-agent", "reformatted answer"),
+		replayMessage(EventUserMessage, "replay-2", "user-2", "reformatted question"),
+		replayMessage(EventAgentMessage, "replay-2", "agent-2", "reformatted answer"),
 	} {
 		if !matcher.Match(record) {
-			t.Fatalf("replay record %d depended on provider ID or content", index)
+			t.Fatalf("suffix record %d did not match", index)
 		}
 	}
 }
 
-func TestReplayMatcherMissDoesNotDiscardRemainingHistory(t *testing.T) {
-	existing := []Record{
-		replayMessage(EventAgentMessage, "thread:1", "msg-1", "first"),
-		replayMessage(EventAgentPlanProposed, "thread:1", "plan-1", "plan"),
-		replayMessage(EventAgentMessage, "thread:1", "msg-2", "second"),
-	}
-	matcher := NewReplayMatcher(existing)
-	if !matcher.Match(replayMessage(EventAgentMessage, "replay-turn", "item-1", "first")) {
-		t.Fatal("first replay event did not match")
-	}
-	miss := replayMessage(EventAgentTodoUpdated, "replay-turn", "item-new", "new")
-	if matcher.Match(miss) {
-		t.Fatal("new event kind matched existing history")
-	}
-	matcher.Record(miss)
-	if !matcher.Match(replayMessage(EventAgentPlanProposed, "replay-turn", "item-plan", "changed plan")) {
-		t.Fatal("a miss discarded the remaining persisted plan")
-	}
-	if !matcher.Match(replayMessage(EventAgentMessage, "replay-turn", "item-2", "second")) {
-		t.Fatal("a miss discarded the remaining persisted message")
+func TestReplayMatcherFallsBackToContent(t *testing.T) {
+	matcher := NewReplayMatcher([]Record{
+		replayMessage(EventUserMessage, "live", "user-live", "question"),
+		replayMessage(EventAgentMessage, "live", "agent-live", "answer"),
+		replayMessage(EventAgentTodoUpdated, "live", "todo-live", "next step"),
+	})
+	for index, record := range []Record{
+		replayMessage(EventUserMessage, "replay", "user-replay", "question"),
+		replayMessage(EventAgentMessage, "replay", "agent-replay", "answer"),
+		replayMessage(EventAgentTodoUpdated, "replay", "todo-replay", "next step"),
+	} {
+		if !matcher.Match(record) {
+			t.Fatalf("content record %d did not match", index)
+		}
 	}
 }
 
-func TestReplayMatcherScopesOccurrenceIdentity(t *testing.T) {
-	existing := []Record{replayMessage(EventAgentMessage, "thread:1", "msg-1", "same")}
+func TestReplayMatcherTreatsDifferentIdentityAndContentAsNew(t *testing.T) {
+	existing := []Record{
+		replayMessage(EventAgentMessage, "turn", "message-1", "first"),
+		replayMessage(EventAgentPlanProposed, "turn", "plan-1", "plan"),
+		replayMessage(EventAgentMessage, "turn", "message-2", "second"),
+	}
 	matcher := NewReplayMatcher(existing)
-	replay := replayMessage(EventAgentMessage, "thread:1", "item-1", "same")
+	if !matcher.Match(replayMessage(EventAgentMessage, "replay", "message-1", "changed first")) {
+		t.Fatal("stable provider ID did not match changed content")
+	}
+	newRecord := replayMessage(EventAgentMessage, "replay", "message-new", "new")
+	if matcher.Match(newRecord) {
+		t.Fatal("different identity and content matched")
+	}
+	matcher.Record(newRecord)
+	if !matcher.Match(replayMessage(EventAgentPlanProposed, "replay", "plan-1", "changed plan")) {
+		t.Fatal("a miss discarded the remaining persisted plan")
+	}
+	if !matcher.Match(replayMessage(EventAgentMessage, "replay", "replacement-id", "second")) {
+		t.Fatal("a miss discarded the remaining persisted message")
+	}
+	matcher.Reset()
+	if !matcher.Match(newRecord) {
+		t.Fatal("recorded miss was unavailable on the next replay")
+	}
+}
+
+func TestReplayMatcherPreservesRepeatedContent(t *testing.T) {
+	matcher := NewReplayMatcher([]Record{
+		replayMessage(EventAgentMessage, "turn-1", "message-1", "same"),
+		replayMessage(EventAgentMessage, "turn-2", "message-2", "same"),
+	})
+	for index := range 2 {
+		if !matcher.Match(replayMessage(EventAgentMessage, "replay", "new-id", "same")) {
+			t.Fatalf("repeated record %d did not match", index)
+		}
+	}
+	if matcher.Match(replayMessage(EventAgentMessage, "replay", "new-id", "same")) {
+		t.Fatal("content matched beyond its persisted occurrences")
+	}
+}
+
+func TestReplayMatcherScopesIdentity(t *testing.T) {
+	matcher := NewReplayMatcher([]Record{replayMessage(EventAgentMessage, "turn", "message", "same")})
+	replay := replayMessage(EventAgentMessage, "replay", "message", "same")
 	var data map[string]any
 	if err := json.Unmarshal(replay.Data, &data); err != nil {
 		t.Fatal(err)
@@ -108,17 +104,17 @@ func TestReplayMatcherScopesOccurrenceIdentity(t *testing.T) {
 }
 
 func TestReplayMatcherGroupsCumulativeSourceSnapshots(t *testing.T) {
-	first := replayMessage(EventAgentMessage, "thread:1", "msg-1", "a")
+	first := replayMessage(EventAgentMessage, "turn", "message-1", "a")
 	first.SourceEventID = "stream-1"
-	snapshot := replayMessage(EventAgentMessage, "thread:1", "msg-1", "ab")
+	snapshot := replayMessage(EventAgentMessage, "turn", "message-1", "ab")
 	snapshot.SourceEventID = "stream-1"
-	second := replayMessage(EventAgentMessage, "thread:1", "msg-2", "second")
+	second := replayMessage(EventAgentMessage, "turn", "message-2", "second")
 	second.SourceEventID = "stream-2"
 	matcher := NewReplayMatcher([]Record{first, snapshot, second})
-	if !matcher.Match(replayMessage(EventAgentMessage, "replay-turn", "item-1", "ab")) {
-		t.Fatal("replayed stream did not match cumulative snapshots")
+	if !matcher.Match(replayMessage(EventAgentMessage, "replay", "replayed-1", "ab")) {
+		t.Fatal("replayed stream did not match its final snapshot")
 	}
-	if !matcher.Match(replayMessage(EventAgentMessage, "replay-turn", "item-2", "second")) {
+	if !matcher.Match(replayMessage(EventAgentMessage, "replay", "replayed-2", "second")) {
 		t.Fatal("event after cumulative snapshots did not match")
 	}
 }

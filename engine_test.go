@@ -71,7 +71,7 @@ func TestEngineManagedSessionLifecycle(t *testing.T) {
 	}
 }
 
-func TestEngineResumeReplayIsIdempotentWithDifferentProviderIDs(t *testing.T) {
+func TestEngineResumeBackfillsPartialProviderReplayOnce(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	worktree := t.TempDir()
@@ -96,20 +96,18 @@ func TestEngineResumeReplayIsIdempotentWithDifferentProviderIDs(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
+	provider.addUnjournaledTurn(2)
 
 	second := openReplayEngine(t, ctx, home, provider)
 	if _, err := second.Resume(ctx, started.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got := replayConversationRecords(t, second, started.ID); !reflect.DeepEqual(got, want) {
-		t.Fatalf("first resume changed canonical history\ngot:  %#v\nwant: %#v", got, want)
+	wantAfterBackfill := replayConversationRecords(t, second, started.ID)
+	if len(wantAfterBackfill) != 6 {
+		t.Fatalf("post-resume conversation records = %d, want 6", len(wantAfterBackfill))
 	}
-	if _, err := second.Send(ctx, host.SendTurnRequest{SessionID: started.ID, Prompt: "same"}); err != nil {
-		t.Fatal(err)
-	}
-	wantAfterNewTurn := replayConversationRecords(t, second, started.ID)
-	if len(wantAfterNewTurn) != 6 {
-		t.Fatalf("post-resume conversation records = %d, want 6", len(wantAfterNewTurn))
+	if !reflect.DeepEqual(wantAfterBackfill[:len(want)], want) {
+		t.Fatalf("resume changed canonical history\ngot:  %#v\nwant: %#v", wantAfterBackfill[:len(want)], want)
 	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
@@ -120,8 +118,8 @@ func TestEngineResumeReplayIsIdempotentWithDifferentProviderIDs(t *testing.T) {
 	if _, err := third.Resume(ctx, started.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got := replayConversationRecords(t, third, started.ID); !reflect.DeepEqual(got, wantAfterNewTurn) {
-		t.Fatalf("second resume changed canonical history\ngot:  %#v\nwant: %#v", got, wantAfterNewTurn)
+	if got := replayConversationRecords(t, third, started.ID); !reflect.DeepEqual(got, wantAfterBackfill) {
+		t.Fatalf("second resume changed canonical history\ngot:  %#v\nwant: %#v", got, wantAfterBackfill)
 	}
 }
 
@@ -196,9 +194,9 @@ func TestEngineResumeReconcilesOrphanedInteraction(t *testing.T) {
 }
 
 type replayEngineProvider struct {
-	mu      sync.Mutex
-	turns   int
-	resumes int
+	mu         sync.Mutex
+	turns      int
+	replayFrom int
 }
 
 func (*replayEngineProvider) Backend() host.Backend { return "replay" }
@@ -207,20 +205,19 @@ func (*replayEngineProvider) Detect(context.Context) host.BackendStatus {
 	return host.BackendStatus{Backend: "replay", Available: true}
 }
 
-func (p *replayEngineProvider) StartSession(_ context.Context, _ string, request host.StartSessionRequest, emit host.EventSink) (host.BackendSession, error) {
+func (p *replayEngineProvider) StartSession(_ context.Context, _ string, _ host.StartSessionRequest, emit host.EventSink) (host.BackendSession, error) {
 	p.mu.Lock()
 	turns := p.turns
-	if request.ResumeBackendSessionID != "" {
-		p.resumes++
-		generation := p.resumes
-		for turn := 1; turn <= turns; turn++ {
+	if turns > 0 {
+		from := max(p.replayFrom, 1)
+		for turn := from; turn <= turns; turn++ {
 			local := map[string]any{host.EventLocalReplay: true}
-			if turn == 1 {
+			if turn == from {
 				local[host.EventLocalReplayStart] = true
 			}
 			turnID := fmt.Sprintf("provider-thread:%d", turn)
-			emit(host.Event{Type: host.EventMessage, Role: "user", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("item-%d-%d-user", generation, turn)}, Local: local})
-			emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("item-%d-%d-agent", generation, turn)}, Local: map[string]any{host.EventLocalReplay: true}})
+			emit(host.Event{Type: host.EventMessage, Role: "user", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("msg-%d-user", turn)}, Local: local})
+			emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("msg-%d-agent", turn)}, Local: map[string]any{host.EventLocalReplay: true}})
 		}
 	}
 	p.mu.Unlock()
@@ -238,6 +235,13 @@ func (p *replayEngineProvider) SendTurn(_ context.Context, _ string, _ host.Send
 	emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "same", BackendTurnID: turnID, Data: map[string]any{"provider_event_id": fmt.Sprintf("msg-%d-agent", turn)}})
 	emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: turnID})
 	return host.BackendSession{ID: "provider-thread", ThreadID: "provider-thread", TurnID: turnID}, nil
+}
+
+func (p *replayEngineProvider) addUnjournaledTurn(replayFrom int) {
+	p.mu.Lock()
+	p.turns++
+	p.replayFrom = replayFrom
+	p.mu.Unlock()
 }
 
 func (*replayEngineProvider) Interrupt(context.Context, string, host.EventSink) error { return nil }

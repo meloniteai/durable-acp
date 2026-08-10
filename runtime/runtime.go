@@ -1316,6 +1316,8 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 			if !suppressReplay {
 				managed.replay.Record(record)
 			}
+		} else {
+			suppressReplay = suppressReplayActivity(event.Type)
 		}
 	}
 	emit := r.emit
@@ -1348,6 +1350,10 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 	if queueChanged {
 		r.emitQueue(sessionID)
 	}
+}
+
+func suppressReplayActivity(eventType host.EventType) bool {
+	return eventType == host.EventThinking || eventType == host.EventToolStarted || eventType == host.EventToolOutput
 }
 
 func (r *Runtime) dispatchQueued(sessionID string) {
