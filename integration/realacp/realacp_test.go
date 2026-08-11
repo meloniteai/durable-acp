@@ -705,18 +705,15 @@ func runPlanSteerRevisionAndApproval(t *testing.T) {
 	if !revised.Queued || revised.QueueDepth != 1 {
 		t.Fatalf("revised plan result = %+v", revised)
 	}
-	if err := engine.RespondInteraction(ctx, session.ID, host.InteractionResponse{
-		RequestID: steeredGate.Interaction.ID,
-		Action:    "deny",
-	}); err != nil {
-		t.Fatalf("reject superseded plan: %v", err)
+	if err := engine.InterruptActive(ctx, session.ID); err != nil {
+		t.Fatalf("interrupt superseded plan: %v", err)
 	}
 	if err := engine.UnblockDispatch(session.ID); err != nil {
 		t.Fatalf("unblock revised plan: %v", err)
 	}
 	revisedGate := waitForPlanGate(t, ctx, planGates, "revised plan")
-	if revisedGate.Interaction.ID == steeredGate.Interaction.ID {
-		t.Fatal("revised plan reused the superseded interaction")
+	if revisedGate.Interaction.ID == steeredGate.Interaction.ID || revisedGate.BackendTurnID == steeredGate.BackendTurnID {
+		t.Fatal("revised plan reused the superseded turn or interaction")
 	}
 	assertFileMissing(t, filepath.Join(session.Worktree.Path, "durable-acp-plan-steer.txt"))
 	if err := engine.RespondInteraction(ctx, session.ID, host.InteractionResponse{
@@ -726,15 +723,15 @@ func runPlanSteerRevisionAndApproval(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("approve revised plan: %v", err)
 	}
-	assertTurnCompleted(t, ctx, live.events, revisedGate.BackendTurnID)
+	waitForFileText(t, ctx, filepath.Join(session.Worktree.Path, "durable-acp-plan-steer.txt"), "revised")
 	assertFileText(t, filepath.Join(session.Worktree.Path, "durable-acp-plan-steer.txt"), "revised")
 	assertFileMissing(t, filepath.Join(session.Worktree.Path, "obsolete-plan.txt"))
 	state, err := engine.Runtime().State(session.ID)
 	if err != nil {
-		t.Fatalf("read completed plan state: %v", err)
+		t.Fatalf("read approved plan state: %v", err)
 	}
-	if state.TurnActive || state.QueueDepth != 0 || state.DispatchBlocked {
-		t.Fatalf("completed plan state = %+v", state)
+	if state.Configuration.PermissionMode != "acceptEdits" || state.QueueDepth != 0 || state.DispatchBlocked || state.PendingInteraction != nil {
+		t.Fatalf("approved plan state = %+v", state)
 	}
 	closeAndRemove(t, ctx, engine, session)
 }
@@ -1181,21 +1178,25 @@ func assertTurnSucceeded(t *testing.T, ctx context.Context, recorder *eventRecor
 	}
 }
 
-func assertTurnCompleted(t *testing.T, ctx context.Context, recorder *eventRecorder, turnID string) {
+func waitForFileText(t *testing.T, ctx context.Context, path, want string) {
 	t.Helper()
-	if err := recorder.wait(ctx, "completed live turn "+turnID, func(events []host.Event) bool {
-		for _, event := range events {
-			if event.BackendTurnID == turnID && (event.Type == host.EventTurnComplete || event.Type == host.EventTurnFailed) {
-				return true
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		raw, err := os.ReadFile(path) //nolint:gosec // The test owns the isolated workspace path.
+		if err == nil {
+			if strings.TrimSpace(string(raw)) != want {
+				t.Fatalf("file %s = %q, want %q", path, strings.TrimSpace(string(raw)), want)
 			}
+			return
 		}
-		return false
-	}); err != nil {
-		t.Fatal(err)
-	}
-	for _, event := range recorder.snapshot() {
-		if event.BackendTurnID == turnID && event.Type == host.EventTurnFailed {
-			t.Fatalf("live turn %s failed: %s", turnID, event.Message)
+		if !os.IsNotExist(err) {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %s: %v", path, ctx.Err())
+		case <-ticker.C:
 		}
 	}
 }
