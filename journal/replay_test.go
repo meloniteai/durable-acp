@@ -66,6 +66,19 @@ func TestReplayMatcherTreatsDifferentIdentityAndContentAsNew(t *testing.T) {
 	}
 }
 
+func TestReplayMatcherRecognizesCompletedPersistedTurn(t *testing.T) {
+	matcher := NewReplayMatcher([]Record{
+		replayMessage(EventAgentMessage, "turn-1", "message-1", "answer"),
+		replayMessage(EventAgentYielded, "turn-1", "", ""),
+	})
+	if !matcher.MatchesCompletedTurn(replayMessage(EventUserMessage, "turn-1", "missing", "old prompt")) {
+		t.Fatal("unmatched replay in a completed turn was not recognized")
+	}
+	if matcher.MatchesCompletedTurn(replayMessage(EventUserMessage, "turn-2", "new", "new prompt")) {
+		t.Fatal("new replay turn matched a completed durable turn")
+	}
+}
+
 func TestReplayMatcherPreservesRepeatedContent(t *testing.T) {
 	matcher := NewReplayMatcher([]Record{
 		replayMessage(EventAgentMessage, "turn-1", "message-1", "same"),

@@ -1024,6 +1024,40 @@ func TestRuntimeSuppressesProviderReplayHistory(t *testing.T) {
 	}
 }
 
+func TestRuntimeSuppressesUnmatchedReplayBeforeDurableTail(t *testing.T) {
+	adapter := &testAdapter{backend: "replay"}
+	var events []host.Event
+	runtime := New(Config{DisableCoalescing: true, EventSink: func(event host.Event) { events = append(events, event) }}, adapter)
+	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "replay", Backend: "replay", Worktree: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{SessionID: "replay"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SetReplayHistory("replay", []journal.Record{
+		replayRuntimeRecord(journal.EventUserMessage, "turn-5", "create draft PR"),
+		replayRuntimeRecord(journal.EventAgentMessage, "turn-6", "draft PR created"),
+		replayRuntimeRecord(journal.EventAgentYielded, "turn-6", ""),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.emit(host.Event{Type: host.EventMessage, Role: "assistant", Message: "old proposed plan", BackendTurnID: "turn-6", Local: map[string]any{host.EventLocalReplay: true, host.EventLocalReplayStart: true}})
+	adapter.emit(host.Event{Type: host.EventMessage, Role: "user", Message: "Plan accepted. Implement the approved plan now.", BackendTurnID: "turn-6", Local: map[string]any{host.EventLocalReplay: true}})
+	for _, event := range events {
+		if event.Type == host.EventMessage {
+			t.Fatalf("unmatched historical replay was forwarded: %#v", event)
+		}
+	}
+}
+
+func replayRuntimeRecord(event, turnID, message string) journal.Record {
+	data, err := json.Marshal(map[string]any{"message": message})
+	if err != nil {
+		panic(err)
+	}
+	return journal.Record{SessionID: "replay", Event: event, TurnID: turnID, Data: data}
+}
+
 func TestRuntimeStartStateAndQueuedFailurePaths(t *testing.T) {
 	adapter := &testAdapter{backend: "test", startErr: errors.New("start failed")}
 	runtime := New(Config{}, adapter, adapter, nil)

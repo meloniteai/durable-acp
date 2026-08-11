@@ -1312,7 +1312,7 @@ func (r *Runtime) deliverNow(sessionID string, event host.Event) {
 			managed.replay.Reset()
 		}
 		if record, ok := journal.Translate(event); ok {
-			suppressReplay = managed.replay.Match(record)
+			suppressReplay = managed.replay.Match(record) || managed.replay.MatchesCompletedTurn(record)
 			if !suppressReplay {
 				managed.replay.Record(record)
 			}

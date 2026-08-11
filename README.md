@@ -314,14 +314,16 @@ When a bundled ACP adapter reloads provider history during `Resume`, the
 runtime matches replayed semantic events against the durable journal and
 suppresses duplicates. Replayed thinking and tool activity is discarded, while
 current capability, configuration, and trace events remain live. Unmatched
-semantic events continue through the normal event and journal paths.
+semantic events from new or incomplete turns continue through the normal event
+and journal paths. Unmatched history from a durably completed turn is suppressed
+because an append-only journal cannot insert it without reordering newer events.
 
 Replay matching is ordered within session, conversation, backend thread, and
 event kind. Provider event ID is preferred; normalized semantic content is the
 fallback. A replay may begin at any persisted suffix. If both identity and
-content differ, the event is treated as new without making later persisted
-events unmatchable. Adjacent cumulative snapshots with one source event ID are
-treated as one event.
+content differ, the event is treated as new unless its turn already has a
+durable terminal event. A miss does not make later persisted events unmatchable.
+Adjacent cumulative snapshots with one source event ID are treated as one event.
 
 Hosts with an existing journal can pass a caller-owned store with
 `WithJournalStore`, or configure an Engine-owned directory with
