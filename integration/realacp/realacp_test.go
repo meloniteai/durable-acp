@@ -86,6 +86,14 @@ func TestRealACPAntigravityPermissionMode(t *testing.T) {
 	runNativePlanMode(t, antigravity.Backend)
 }
 
+func TestRealACPCodexForkWhileParentTurnActive(t *testing.T) {
+	runForkWhileParentTurnActive(t)
+}
+
+func TestRealACPClaudePlanSteerRevisionAndApproval(t *testing.T) {
+	runPlanSteerRevisionAndApproval(t)
+}
+
 // runManagedLifecycle covers the state which only a real provider can prove:
 // setup/configuration, live model file edits, normalized stream/journal data,
 // worktree repair, process restart + provider resume, and owned cleanup.
@@ -551,6 +559,186 @@ func runNativePlanMode(t *testing.T, backend host.Backend) {
 	closeAndRemove(t, ctx, live.engineValue(t), session)
 }
 
+func runForkWhileParentTurnActive(t *testing.T) {
+	t.Helper()
+	ctx, cancel := realContext(t)
+	defer cancel()
+	live := newLiveEngine(t, ctx, codex.Backend)
+	session := live.start(t, ctx, durableacp.StartRequest{
+		ID:             "fork-active-parent",
+		Backend:        codex.Backend,
+		WorkspaceMode:  durableacp.WorkspaceManaged,
+		Source:         newGitRepository(t),
+		Model:          modelFor(codex.Backend),
+		Reasoning:      reasoningFor(codex.Backend),
+		PermissionMode: "agent-full-access",
+	})
+
+	toolsBefore := live.events.count(host.EventToolStarted)
+	if _, err := live.send(ctx, host.SendTurnRequest{
+		SessionID: session.ID,
+		Prompt:    "Use the command tool immediately to run `sleep 15`. Do not answer until it exits. Do not modify files.",
+	}); err != nil {
+		t.Fatalf("start active parent turn: %v", err)
+	}
+	if err := live.events.wait(ctx, "active parent tool call", func(events []host.Event) bool {
+		return countEvents(events, host.EventToolStarted) > toolsBefore
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine := live.engineValue(t)
+	beforeState, err := engine.Runtime().State(session.ID)
+	if err != nil {
+		t.Fatalf("read parent state before fork: %v", err)
+	}
+	if !beforeState.TurnActive || beforeState.ActiveTurnID == "" {
+		t.Fatalf("parent state before fork = %+v", beforeState)
+	}
+	eventsBefore := live.events.len()
+	recordsBefore, err := engine.Journal().Read(session.ID, 0, 0)
+	if err != nil {
+		t.Fatalf("read parent journal before fork: %v", err)
+	}
+	response, err := engine.ForkPrompt(ctx, host.ForkPromptRequest{
+		SessionID: session.ID,
+		Prompt:    "Reply exactly FORK-DONE. Do not use tools.",
+	})
+	if err != nil {
+		t.Fatalf("fork active parent: %v", err)
+	}
+	if !response.Accepted {
+		t.Fatalf("fork response = %+v", response)
+	}
+	afterState, err := engine.Runtime().State(session.ID)
+	if err != nil {
+		t.Fatalf("read parent state after fork: %v", err)
+	}
+	if !afterState.TurnActive || afterState.ActiveTurnID != beforeState.ActiveTurnID {
+		t.Fatalf("parent state after fork = %+v, want active turn %q", afterState, beforeState.ActiveTurnID)
+	}
+	if live.events.len() != eventsBefore {
+		t.Fatalf("fork emitted parent events: %s", eventSummary(live.events.after(eventsBefore)))
+	}
+	recordsAfter, err := engine.Journal().Read(session.ID, 0, 0)
+	if err != nil {
+		t.Fatalf("read parent journal after fork: %v", err)
+	}
+	if len(recordsAfter) != len(recordsBefore) {
+		t.Fatalf("fork changed parent journal length from %d to %d", len(recordsBefore), len(recordsAfter))
+	}
+	if err := engine.InterruptActive(ctx, session.ID); err != nil {
+		t.Fatalf("interrupt active parent: %v", err)
+	}
+	closeAndRemove(t, ctx, engine, session)
+}
+
+func runPlanSteerRevisionAndApproval(t *testing.T) {
+	t.Helper()
+	ctx, cancel := realContext(t)
+	defer cancel()
+	planGates := make(chan host.Event, 3)
+	live := newLiveEngineWithInteractions(t, ctx, claude.Backend, func(event host.Event) (host.InteractionResponse, bool) {
+		if isPlanGate(event.Interaction) {
+			planGates <- event
+			return host.InteractionResponse{}, false
+		}
+		return defaultInteractionResponse(event.Interaction), true
+	})
+	session := live.start(t, ctx, durableacp.StartRequest{
+		ID:             "plan-steer-revision-approval",
+		Backend:        claude.Backend,
+		WorkspaceMode:  durableacp.WorkspaceManaged,
+		Source:         newGitRepository(t),
+		Model:          modelFor(claude.Backend),
+		Reasoning:      reasoningFor(claude.Backend),
+		PermissionMode: "plan",
+	})
+	engine := live.engineValue(t)
+	if _, err := live.send(ctx, host.SendTurnRequest{
+		SessionID: session.ID,
+		Prompt: "Present a plan containing only this change: run Bash command `printf 'obsolete\\n' > obsolete-plan.txt`. " +
+			"Do not modify files. Use the native plan approval gate and wait.",
+	}); err != nil {
+		t.Fatalf("send initial plan: %v", err)
+	}
+	initial := waitForPlanGate(t, ctx, planGates, "initial plan")
+	if err := engine.BlockDispatch(session.ID); err != nil {
+		t.Fatalf("block dispatch for steer: %v", err)
+	}
+	steered, err := engine.SendNext(ctx, host.SendTurnRequest{
+		SessionID: session.ID,
+		Prompt: "Discard the prior task. Present a complete plan containing only this change: run Bash command " +
+			"`printf 'revised\\n' > durable-acp-plan-steer.txt`. Do not modify files. Use the native plan approval gate and wait.",
+		PermissionMode: "plan",
+	})
+	if err != nil {
+		t.Fatalf("queue steered plan: %v", err)
+	}
+	if !steered.Queued || steered.QueueDepth != 1 {
+		t.Fatalf("steered plan result = %+v", steered)
+	}
+	if err := engine.InterruptActive(ctx, session.ID); err != nil {
+		t.Fatalf("interrupt initial plan: %v", err)
+	}
+	if err := engine.UnblockDispatch(session.ID); err != nil {
+		t.Fatalf("unblock steered plan: %v", err)
+	}
+	steeredGate := waitForPlanGate(t, ctx, planGates, "steered plan")
+	if steeredGate.Interaction.ID == initial.Interaction.ID {
+		t.Fatal("steered plan reused the initial interaction")
+	}
+	assertFileMissing(t, filepath.Join(session.Worktree.Path, "obsolete-plan.txt"))
+	assertFileMissing(t, filepath.Join(session.Worktree.Path, "durable-acp-plan-steer.txt"))
+
+	if err := engine.BlockDispatch(session.ID); err != nil {
+		t.Fatalf("block dispatch for revision: %v", err)
+	}
+	revised, err := engine.SendNext(ctx, host.SendTurnRequest{
+		SessionID: session.ID,
+		Prompt: "Revise and present the complete plan again. It must still contain only this change: run Bash command " +
+			"`printf 'revised\\n' > durable-acp-plan-steer.txt`. Do not modify files. Use the native plan approval gate and wait.",
+		PermissionMode: "plan",
+	})
+	if err != nil {
+		t.Fatalf("queue revised plan: %v", err)
+	}
+	if !revised.Queued || revised.QueueDepth != 1 {
+		t.Fatalf("revised plan result = %+v", revised)
+	}
+	if err := engine.RespondInteraction(ctx, session.ID, host.InteractionResponse{
+		RequestID: steeredGate.Interaction.ID,
+		Action:    "deny",
+	}); err != nil {
+		t.Fatalf("reject superseded plan: %v", err)
+	}
+	if err := engine.UnblockDispatch(session.ID); err != nil {
+		t.Fatalf("unblock revised plan: %v", err)
+	}
+	revisedGate := waitForPlanGate(t, ctx, planGates, "revised plan")
+	if revisedGate.Interaction.ID == steeredGate.Interaction.ID {
+		t.Fatal("revised plan reused the superseded interaction")
+	}
+	assertFileMissing(t, filepath.Join(session.Worktree.Path, "durable-acp-plan-steer.txt"))
+	if err := engine.RespondInteraction(ctx, session.ID, host.InteractionResponse{
+		RequestID: revisedGate.Interaction.ID,
+		Action:    "approve",
+		OptionID:  "acceptEdits",
+	}); err != nil {
+		t.Fatalf("approve revised plan: %v", err)
+	}
+	assertTurnCompleted(t, ctx, live.events, revisedGate.BackendTurnID)
+	assertFileText(t, filepath.Join(session.Worktree.Path, "durable-acp-plan-steer.txt"), "revised")
+	assertFileMissing(t, filepath.Join(session.Worktree.Path, "obsolete-plan.txt"))
+	state, err := engine.Runtime().State(session.ID)
+	if err != nil {
+		t.Fatalf("read completed plan state: %v", err)
+	}
+	if state.TurnActive || state.QueueDepth != 0 || state.DispatchBlocked {
+		t.Fatalf("completed plan state = %+v", state)
+	}
+	closeAndRemove(t, ctx, engine, session)
+}
+
 type sendOutcome struct {
 	result runtime.SendResult
 	err    error
@@ -602,6 +790,7 @@ type liveEngine struct {
 	ctx      context.Context
 	provider liveProvider
 	events   *eventRecorder
+	respond  func(host.Event) (host.InteractionResponse, bool)
 
 	mu     sync.RWMutex
 	engine *durableacp.Engine
@@ -610,7 +799,12 @@ type liveEngine struct {
 
 func newLiveEngine(t *testing.T, ctx context.Context, backend host.Backend) *liveEngine {
 	t.Helper()
-	live := &liveEngine{t: t, ctx: ctx, provider: requireProvider(t, backend), events: newEventRecorder(), home: filepath.Join(t.TempDir(), "state")}
+	return newLiveEngineWithInteractions(t, ctx, backend, nil)
+}
+
+func newLiveEngineWithInteractions(t *testing.T, ctx context.Context, backend host.Backend, respond func(host.Event) (host.InteractionResponse, bool)) *liveEngine {
+	t.Helper()
+	live := &liveEngine{t: t, ctx: ctx, provider: requireProvider(t, backend), events: newEventRecorder(), respond: respond, home: filepath.Join(t.TempDir(), "state")}
 	live.open(t, ctx)
 	t.Cleanup(func() { live.close() })
 	return live
@@ -681,13 +875,29 @@ func (l *liveEngine) onEvent(event host.Event) {
 	if event.Type != host.EventInteractionRequested || event.Interaction == nil {
 		return
 	}
-	response := host.InteractionResponse{RequestID: event.Interaction.ID, Action: "cancel"}
-	switch event.Interaction.Kind {
+	response := defaultInteractionResponse(event.Interaction)
+	if l.respond != nil {
+		var ok bool
+		response, ok = l.respond(event)
+		if !ok {
+			return
+		}
+	}
+	l.respondInteraction(event, response)
+}
+
+func defaultInteractionResponse(interaction *host.InteractionRequest) host.InteractionResponse {
+	response := host.InteractionResponse{RequestID: interaction.ID, Action: "cancel"}
+	switch interaction.Kind {
 	case host.InteractionPermission:
 		response.Action = "approve"
 	case host.InteractionChoice, host.InteractionForm, host.InteractionPlan:
 		response.Action = "submit"
 	}
+	return response
+}
+
+func (l *liveEngine) respondInteraction(event host.Event, response host.InteractionResponse) {
 	go func(sessionID string, response host.InteractionResponse) {
 		l.mu.RLock()
 		engine := l.engine
@@ -822,6 +1032,39 @@ func closeAndRemove(t *testing.T, ctx context.Context, engine *durableacp.Engine
 	}
 }
 
+func waitForPlanGate(t *testing.T, ctx context.Context, gates <-chan host.Event, description string) host.Event {
+	t.Helper()
+	select {
+	case event := <-gates:
+		return event
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", description, ctx.Err())
+		return host.Event{}
+	}
+}
+
+func isPlanGate(interaction *host.InteractionRequest) bool {
+	if interaction == nil {
+		return false
+	}
+	if interaction.Kind == host.InteractionPlan {
+		return true
+	}
+	for _, option := range interaction.Options {
+		if option.ID == "acceptEdits" {
+			return true
+		}
+	}
+	return false
+}
+
+func assertFileMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("file %q exists unexpectedly: %v", path, err)
+	}
+}
+
 func assertSameDirectory(t *testing.T, actual, expected string) {
 	t.Helper()
 	actualInfo, err := os.Stat(actual)
@@ -935,6 +1178,25 @@ func assertTurnSucceeded(t *testing.T, ctx context.Context, recorder *eventRecor
 	}
 	if errors := recorder.errors(); len(errors) > 0 {
 		t.Fatalf("interaction response errors: %v", errors)
+	}
+}
+
+func assertTurnCompleted(t *testing.T, ctx context.Context, recorder *eventRecorder, turnID string) {
+	t.Helper()
+	if err := recorder.wait(ctx, "completed live turn "+turnID, func(events []host.Event) bool {
+		for _, event := range events {
+			if event.BackendTurnID == turnID && (event.Type == host.EventTurnComplete || event.Type == host.EventTurnFailed) {
+				return true
+			}
+		}
+		return false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range recorder.snapshot() {
+		if event.BackendTurnID == turnID && event.Type == host.EventTurnFailed {
+			t.Fatalf("live turn %s failed: %s", turnID, event.Message)
+		}
 	}
 }
 

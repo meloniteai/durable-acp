@@ -7,11 +7,11 @@ source "$script_dir/realacp-helpers.sh"
 caller_codex_home="$(realacp_codex_source_home "${CODEX_HOME:-}" "${HOME:-}")"
 provider="openrouter"
 agents="codex,claude"
-journeys="${DURABLE_ACP_REAL_JOURNEYS:-managed,existing,queued,interrupt,permission}"
+journeys="${DURABLE_ACP_REAL_JOURNEYS:-managed,existing,queued,interrupt,permission,fork,plan}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run-realacp.sh [--provider openrouter|vanilla] [--agents codex,claude,cursor,antigravity|all] [--journeys managed,existing,queued,interrupt,permission|all]
+Usage: scripts/run-realacp.sh [--provider openrouter|vanilla] [--agents codex,claude,cursor,antigravity|all] [--journeys managed,existing,queued,interrupt,permission,fork,plan|all]
 
 The runner installs the selected public Codex/Claude ACPs and coding CLIs once,
 installs Cursor CLI into its temporary home when needed, and builds the pinned
@@ -24,7 +24,8 @@ remain isolated, and copied credentials are removed from retained artifacts.
 
 Journeys: managed (worktree, journal, restart/resume, cleanup), existing
 (caller-owned workspace plus attachment), queued (serial turn queue), interrupt
-(cancel + recovery), and permission (standard ACP permission callback).
+(cancel + recovery), permission (standard ACP permission callback), fork
+(Codex fork while its parent turn runs), and plan (Claude steer, revise, approve).
 EOF
 }
 
@@ -67,7 +68,7 @@ if [ "$agents" = "all" ]; then
 fi
 
 if [ "$journeys" = "all" ]; then
-  journeys="managed,existing,queued,interrupt,permission"
+  journeys="managed,existing,queued,interrupt,permission,fork,plan"
 fi
 
 case ",$agents," in
@@ -85,7 +86,7 @@ case ",$journeys," in
 esac
 for journey in ${journeys//,/ }; do
   case "$journey" in
-    managed|existing|queued|interrupt|permission) ;;
+    managed|existing|queued|interrupt|permission|fork|plan) ;;
     *) echo "unsupported journey: $journey" >&2; exit 2 ;;
   esac
 done
@@ -139,7 +140,7 @@ deps="$run_root/deps"
 mkdir -p "$deps"
 packages=()
 if contains_agent codex; then
-  packages+=("@agentclientprotocol/codex-acp@1.1.9" "@openai/codex@0.146.0")
+  packages+=("@melonite/codex-acp@1.1.8-melonite.26.7.29.0" "@openai/codex@0.145.0-alpha.4")
 fi
 if contains_agent claude; then
   packages+=("@agentclientprotocol/claude-agent-acp@0.55.0" "@anthropic-ai/claude-code@2.1.220")
@@ -223,6 +224,14 @@ for journey in ${journeys//,/ }; do
         else
           journey_name="PermissionRoundTrip"
         fi
+        ;;
+      fork)
+        [ "$agent" = "codex" ] || continue
+        journey_name="ForkWhileParentTurnActive"
+        ;;
+      plan)
+        [ "$agent" = "claude" ] || continue
+        journey_name="PlanSteerRevisionAndApproval"
         ;;
     esac
     case "$agent" in

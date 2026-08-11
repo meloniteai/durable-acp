@@ -176,6 +176,19 @@ func TestClose(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestCloseWaitsForGracefulProcessExit(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "closed")
+	proc, err := Start(context.Background(), Spec{
+		Command: fixtureBinary,
+		Env:     append(os.Environ(), "DURABLE_ACP_GRACEFUL_EXIT_TRACE="+trace),
+	})
+	require.NoError(t, err)
+	require.NoError(t, proc.Close())
+	raw, err := os.ReadFile(trace) //nolint:gosec // The test owns the isolated trace path.
+	require.NoError(t, err)
+	assert.Equal(t, "closed\n", string(raw))
+}
+
 func TestChildExit(t *testing.T) {
 	proc := startFixture(t, Spec{})
 	_, err := proc.Call(context.Background(), "exit", nil)

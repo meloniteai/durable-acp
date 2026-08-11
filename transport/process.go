@@ -38,6 +38,8 @@ type Process struct {
 	nextID          atomic.Uint64
 	done            chan struct{}
 	doneOnce        sync.Once
+	closeOnce       sync.Once
+	closeDone       chan struct{}
 	serverRequestMu sync.RWMutex
 	serverRequest   func(Message) (any, error)
 	request         func(context.Context, Message) (any, error)
@@ -87,6 +89,7 @@ const (
 	CodeInternalError    = -32603
 	CodeRequestCancelled = -32800
 	MethodCancelRequest  = "$/cancel_request"
+	processCloseGrace    = time.Second
 )
 
 type boundedBuffer struct {
@@ -149,6 +152,7 @@ func Start(ctx context.Context, spec Spec) (*Process, error) {
 		pending:       map[string]chan processResponse{},
 		inbound:       map[string]context.CancelFunc{},
 		done:          make(chan struct{}),
+		closeDone:     make(chan struct{}),
 		serverRequest: spec.OnServerRequest,
 		request:       spec.OnRequest,
 		observe:       spec.Observe,
@@ -265,13 +269,27 @@ func (p *Process) writeMessage(ctx context.Context, message Message) error {
 
 func (p *Process) Close() error {
 	p.intentional.Store(true)
-	p.doneOnce.Do(func() {
+	p.closeOnce.Do(func() {
+		defer close(p.closeDone)
 		_ = p.stdin.Close()
-		if p.cmd.Process != nil {
-			_ = p.cmd.Process.Kill()
+		timer := time.NewTimer(processCloseGrace)
+		select {
+		case <-p.stderrDone:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			if p.cmd.Process != nil {
+				_ = p.cmd.Process.Kill()
+			}
+			<-p.stderrDone
 		}
-		close(p.done)
+		p.closePending(nil)
 	})
+	<-p.closeDone
 	return nil
 }
 

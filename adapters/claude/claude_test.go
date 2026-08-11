@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,6 +60,55 @@ func TestForkPrompt(t *testing.T) {
 	}
 }
 
+func TestPlanSteerRevisionAndApproval(t *testing.T) {
+	adapter := New(
+		acpx.WithCommand(os.Args[0]),
+		acpx.WithArgs("-test.run=TestClaudeForkChild", "--"),
+		acpx.WithEnvironment(append(os.Environ(), "DURABLE_CLAUDE_FORK_CHILD=1")),
+		acpx.WithStderr(os.Stderr),
+	)
+	events := make(chan host.Event, 32)
+	if _, err := adapter.StartSession(context.Background(), "plan", host.StartSessionRequest{Worktree: t.TempDir()}, func(event host.Event) { events <- event }); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.CloseSession("plan") }()
+	if _, err := adapter.SendTurn(context.Background(), "plan", host.SendTurnRequest{Prompt: "hang-until-cancel"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitClaudeEvent(t, events, func(event host.Event) bool { return event.Message == "claude waiting for cancel" })
+	if err := adapter.Interrupt(context.Background(), "plan", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.SendTurn(context.Background(), "plan", host.SendTurnRequest{Prompt: "plan-v1"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	first := nextClaudeEvent(t, events, func(event host.Event) bool {
+		return event.Type == host.EventInteractionRequested && event.Interaction != nil && event.Interaction.Kind == host.InteractionPlan
+	})
+	if err := adapter.RespondInteraction(context.Background(), "plan", host.InteractionResponse{
+		RequestID: first.Interaction.ID, Action: "revise", Message: "replace version one",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitClaudeEvent(t, events, func(event host.Event) bool {
+		return event.Message == "claude plan response revise  replace version one"
+	})
+	waitClaudeEvent(t, events, func(event host.Event) bool { return event.Type == host.EventTurnComplete })
+	if _, err := adapter.SendTurn(context.Background(), "plan", host.SendTurnRequest{Prompt: "plan-v2"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	second := nextClaudeEvent(t, events, func(event host.Event) bool {
+		return event.Type == host.EventInteractionRequested && event.Interaction != nil && event.Interaction.Kind == host.InteractionPlan
+	})
+	if err := adapter.RespondInteraction(context.Background(), "plan", host.InteractionResponse{
+		RequestID: second.Interaction.ID, Action: "approve", OptionID: "acceptEdits",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitClaudeEvent(t, events, func(event host.Event) bool { return event.Message == "claude plan response approve acceptEdits " })
+	waitClaudeEvent(t, events, func(event host.Event) bool { return event.Type == host.EventTurnComplete })
+}
+
 func TestInterruptPreservesProcessStateBeforeNextTurn(t *testing.T) {
 	adapter := New(
 		acpx.WithCommand(os.Args[0]),
@@ -95,13 +145,18 @@ func TestInterruptPreservesProcessStateBeforeNextTurn(t *testing.T) {
 
 func waitClaudeEvent(t *testing.T, events <-chan host.Event, match func(host.Event) bool) {
 	t.Helper()
+	_ = nextClaudeEvent(t, events, match)
+}
+
+func nextClaudeEvent(t *testing.T, events <-chan host.Event, match func(host.Event) bool) host.Event {
+	t.Helper()
 	timer := time.NewTimer(3 * time.Second)
 	defer timer.Stop()
 	for {
 		select {
 		case event := <-events:
 			if match(event) {
-				return
+				return event
 			}
 		case <-timer.C:
 			t.Fatal("timed out waiting for Claude event")
@@ -151,6 +206,10 @@ func TestClaudeForkChild(t *testing.T) {
 					text = "claude background running"
 				}
 				writeClaudeUpdate(t, encoder, "agent_message_chunk", text)
+			case "plan-v1", "plan-v2":
+				response := requestClaudePlan(t, decoder, encoder, prompt)
+				writeClaudeUpdate(t, encoder, "agent_message_chunk", fmt.Sprintf("claude plan response %s %s %s",
+					stringValue(response, "action"), stringValue(response, "optionId"), stringValue(response, "message")))
 			default:
 				appendClaudeTrace(t, "prompt:"+claudeSessionID(message.Params))
 			}
@@ -188,6 +247,31 @@ type claudeRPCMessage struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params"`
+	Result json.RawMessage `json:"result"`
+}
+
+func requestClaudePlan(t *testing.T, decoder *json.Decoder, encoder *json.Encoder, plan string) map[string]any {
+	t.Helper()
+	if err := encoder.Encode(map[string]any{
+		"jsonrpc": "2.0", "id": "plan-" + plan, "method": "claude/plan",
+		"params": map[string]any{"sessionId": "provider-parent", "plan": plan},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var response claudeRPCMessage
+	if err := decoder.Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func stringValue(values map[string]any, key string) string {
+	value, _ := values[key].(string)
+	return value
 }
 
 func writeClaudeRPC(t *testing.T, encoder *json.Encoder, id json.RawMessage, result any) {
