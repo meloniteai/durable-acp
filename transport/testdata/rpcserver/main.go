@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 )
 
 type message struct {
@@ -28,6 +29,12 @@ func main() {
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
+			if trace := os.Getenv("DURABLE_ACP_GRACEFUL_EXIT_TRACE"); trace != "" {
+				time.Sleep(50 * time.Millisecond)
+				if writeErr := os.WriteFile(trace, []byte("closed\n"), 0o600); writeErr != nil {
+					os.Exit(14)
+				}
+			}
 			return
 		}
 		var msg message

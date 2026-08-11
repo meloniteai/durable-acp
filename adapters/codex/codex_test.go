@@ -64,6 +64,40 @@ func TestForkPrompt(t *testing.T) {
 	}
 }
 
+func TestForkPromptWhileParentTurnActive(t *testing.T) {
+	adapter := New(
+		acpx.WithCommand(os.Args[0]),
+		acpx.WithArgs("-test.run=TestCodexForkChild", "--"),
+		acpx.WithEnvironment(append(os.Environ(), "DURABLE_CODEX_FORK_CHILD=1")),
+	)
+	events := make(chan host.Event, 32)
+	if _, err := adapter.StartSession(context.Background(), "host", host.StartSessionRequest{Worktree: t.TempDir()}, func(event host.Event) { events <- event }); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.CloseSession("host") }()
+	if _, err := adapter.SendTurn(context.Background(), "host", host.SendTurnRequest{Prompt: "hang-until-cancel"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitCodexEvent(t, events, func(event host.Event) bool { return event.Message == "codex waiting for cancel" })
+	before, err := adapter.ActiveTurnID("host")
+	if err != nil || before == "" {
+		t.Fatalf("active parent turn = %q, %v", before, err)
+	}
+	response, err := adapter.ForkPrompt(context.Background(), host.ForkPromptRequest{SessionID: "host", Prompt: "review"})
+	if err != nil || !response.Accepted {
+		t.Fatalf("fork response = %#v, %v", response, err)
+	}
+	after, err := adapter.ActiveTurnID("host")
+	if err != nil || after != before {
+		t.Fatalf("parent turn after fork = %q, %v; want %q", after, err, before)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := adapter.Interrupt(ctx, "host", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInterruptPreservesProcessBeforeNextTurn(t *testing.T) {
 	adapter := New(
 		acpx.WithCommand(os.Args[0]),
@@ -209,6 +243,18 @@ func TestCodexForkChild(t *testing.T) {
 				writeCodexRPC(t, encoder, message.ID, map[string]any{"stopReason": "end_turn"})
 			}
 		case "codex/fork_prompt":
+			var params struct {
+				MCPServers json.RawMessage `json:"mcpServers"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			if len(params.MCPServers) == 0 || string(params.MCPServers) == "null" {
+				if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32602, "message": "Invalid params"}}); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
 			writeCodexRPC(t, encoder, message.ID, map[string]any{"accepted": true})
 		}
 	}

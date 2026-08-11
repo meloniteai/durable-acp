@@ -6,19 +6,28 @@ import (
 )
 
 type ReplayMatcher struct {
-	records []replayKey
-	next    int
-	limit   int
+	records        []replayKey
+	completedTurns []replayTurn
+	next           int
+	limit          int
 }
 
 type replayKey struct {
 	session      string
 	conversation string
 	thread       string
+	turn         string
 	event        string
 	providerID   string
 	content      string
 	source       string
+}
+
+type replayTurn struct {
+	session      string
+	conversation string
+	thread       string
+	turn         string
 }
 
 func NewReplayMatcher(records []Record) *ReplayMatcher {
@@ -59,6 +68,23 @@ func (m *ReplayMatcher) Match(record Record) bool {
 	return false
 }
 
+// MatchesCompletedTurn reports whether record belongs to a turn whose durable terminal event is already present.
+func (m *ReplayMatcher) MatchesCompletedTurn(record Record) bool {
+	if m == nil {
+		return false
+	}
+	key, ok := replayKeyFor(record)
+	if !ok || key.turn == "" {
+		return false
+	}
+	for _, completed := range m.completedTurns {
+		if completed.matches(key) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *ReplayMatcher) Reset() {
 	if m == nil {
 		return
@@ -86,6 +112,11 @@ func (m *ReplayMatcher) append(record Record) {
 		}
 	}
 	m.records = append(m.records, key)
+	if replayTerminal(key.event) && key.turn != "" {
+		m.completedTurns = append(m.completedTurns, replayTurn{
+			session: key.session, conversation: key.conversation, thread: key.thread, turn: key.turn,
+		})
+	}
 }
 
 func (a replayKey) sameStream(b replayKey) bool {
@@ -97,6 +128,11 @@ func replayScopeMatches(a, b string) bool {
 	return a == "" || b == "" || a == b
 }
 
+func (a replayTurn) matches(b replayKey) bool {
+	return a.turn == b.turn && replayScopeMatches(a.session, b.session) &&
+		replayScopeMatches(a.conversation, b.conversation) && replayScopeMatches(a.thread, b.thread)
+}
+
 func replayKeyFor(record Record) (replayKey, bool) {
 	var data map[string]any
 	if json.Unmarshal(record.Data, &data) != nil {
@@ -104,7 +140,7 @@ func replayKeyFor(record Record) (replayKey, bool) {
 	}
 	key := replayKey{
 		session: strings.TrimSpace(record.SessionID), conversation: strings.TrimSpace(record.Conversation),
-		thread: replayAgentString(data, "backend_thread_id"), event: strings.TrimSpace(record.Event),
+		thread: replayAgentString(data, "backend_thread_id"), turn: strings.TrimSpace(record.TurnID), event: strings.TrimSpace(record.Event),
 		providerID: replayString(data, "provider_event_id"), source: strings.TrimSpace(record.SourceEventID),
 	}
 	switch key.event {
@@ -140,4 +176,13 @@ func replayJSON(value any) string {
 func replayAgentString(data map[string]any, key string) string {
 	agent, _ := data["agent"].(map[string]any)
 	return replayString(agent, key)
+}
+
+func replayTerminal(event string) bool {
+	switch event {
+	case EventAgentYielded, EventAgentInterrupted, EventAgentTurnFailed, EventAgentProcessExited:
+		return true
+	default:
+		return false
+	}
 }

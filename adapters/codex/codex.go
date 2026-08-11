@@ -85,9 +85,13 @@ func (a *Adapter) ForkPrompt(ctx context.Context, request host.ForkPromptRequest
 	if strings.TrimSpace(request.Prompt) == "" {
 		return host.ForkPromptResponse{}, errors.New("codex: fork prompt is required")
 	}
+	servers := append([]host.ForkMCPServer(nil), request.MCPServers...)
+	if servers == nil {
+		servers = []host.ForkMCPServer{}
+	}
 	raw, err := a.CallSession(ctx, request.SessionID, forkPromptMethod, map[string]any{
 		"prompt":     request.Prompt,
-		"mcpServers": request.MCPServers,
+		"mcpServers": servers,
 	})
 	if err != nil {
 		return host.ForkPromptResponse{}, err
