@@ -171,6 +171,7 @@ type configurationEventVersions struct {
 	model      uint64
 	reasoning  uint64
 	permission uint64
+	options    uint64
 }
 
 // New creates a Runtime over the supplied adapters. Duplicate backend names
@@ -1581,10 +1582,21 @@ func cloneBackendCatalog(source host.BackendCatalog) host.BackendCatalog {
 	for index, model := range source.Models {
 		result.Models[index] = model
 		result.Models[index].Reasoning = append([]host.BackendReasoning(nil), model.Reasoning...)
+		result.Models[index].ConfigOptions = cloneBackendConfigOptions(model.ConfigOptions)
 	}
 	result.PermissionModes = append([]host.BackendPermissionMode(nil), source.PermissionModes...)
 	result.Reasoning = append([]host.BackendReasoning(nil), source.Reasoning...)
+	result.ConfigOptions = cloneBackendConfigOptions(source.ConfigOptions)
 	result.SlashCommands = append([]host.BackendSlashCommand(nil), source.SlashCommands...)
+	return result
+}
+
+func cloneBackendConfigOptions(source []host.BackendConfigOption) []host.BackendConfigOption {
+	result := make([]host.BackendConfigOption, len(source))
+	for index, option := range source {
+		result[index] = option
+		result[index].Options = append([]host.InteractionOption(nil), option.Options...)
+	}
 	return result
 }
 
@@ -1597,7 +1609,7 @@ func cloneData(data map[string]any) map[string]any {
 func stateLocked(managed *managedSession) State {
 	return State{
 		Session:            managed.session,
-		Configuration:      managed.configuration,
+		Configuration:      cloneConfiguration(managed.configuration),
 		QueueDepth:         len(managed.queue),
 		QueueEntries:       cloneQueueEntries(managed.queue),
 		TurnActive:         managed.active,
@@ -1609,13 +1621,13 @@ func stateLocked(managed *managedSession) State {
 
 func configurationFromStart(request host.StartSessionRequest) host.SessionConfiguration {
 	return normalizeConfiguration(host.SessionConfiguration{
-		Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode,
+		Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode, ConfigOptions: request.ConfigOptions,
 	})
 }
 
 func configurationFromTurn(request host.SendTurnRequest) host.SessionConfiguration {
 	return normalizeConfiguration(host.SessionConfiguration{
-		Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode,
+		Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode, ConfigOptions: request.ConfigOptions,
 	})
 }
 
@@ -1623,6 +1635,29 @@ func normalizeConfiguration(configuration host.SessionConfiguration) host.Sessio
 	configuration.Model = strings.TrimSpace(configuration.Model)
 	configuration.Reasoning = strings.TrimSpace(configuration.Reasoning)
 	configuration.PermissionMode = strings.TrimSpace(configuration.PermissionMode)
+	configuration.ConfigOptions = normalizeConfigOptions(configuration.ConfigOptions)
+	return configuration
+}
+
+func normalizeConfigOptions(options map[string]host.SessionConfigValue) map[string]host.SessionConfigValue {
+	if options == nil {
+		return nil
+	}
+	result := make(map[string]host.SessionConfigValue, len(options))
+	for rawID, rawValue := range options {
+		id := strings.TrimSpace(rawID)
+		value := rawValue
+		value.ValueID = strings.TrimSpace(value.ValueID)
+		if id == "" || value.Kind != host.SessionConfigValueBoolean && (value.Kind != host.SessionConfigValueSelect || value.ValueID == "") {
+			continue
+		}
+		result[id] = value
+	}
+	return result
+}
+
+func cloneConfiguration(configuration host.SessionConfiguration) host.SessionConfiguration {
+	configuration.ConfigOptions = normalizeConfigOptions(configuration.ConfigOptions)
 	return configuration
 }
 
@@ -1637,6 +1672,12 @@ func mergeConfiguration(current, update host.SessionConfiguration) host.SessionC
 	if update.PermissionMode != "" {
 		current.PermissionMode = update.PermissionMode
 	}
+	if update.ConfigOptions != nil {
+		if current.ConfigOptions == nil {
+			current.ConfigOptions = map[string]host.SessionConfigValue{}
+		}
+		maps.Copy(current.ConfigOptions, update.ConfigOptions)
+	}
 	return normalizeConfiguration(current)
 }
 
@@ -1650,6 +1691,7 @@ func fillStartConfiguration(request host.StartSessionRequest, configuration host
 	if strings.TrimSpace(request.PermissionMode) == "" {
 		request.PermissionMode = configuration.PermissionMode
 	}
+	request.ConfigOptions = mergeConfigOptions(configuration.ConfigOptions, request.ConfigOptions)
 	return request
 }
 
@@ -1663,7 +1705,20 @@ func fillTurnConfiguration(request host.SendTurnRequest, configuration host.Sess
 	if strings.TrimSpace(request.PermissionMode) == "" {
 		request.PermissionMode = configuration.PermissionMode
 	}
+	request.ConfigOptions = mergeConfigOptions(configuration.ConfigOptions, request.ConfigOptions)
 	return request
+}
+
+func mergeConfigOptions(current, update map[string]host.SessionConfigValue) map[string]host.SessionConfigValue {
+	if current == nil && update == nil {
+		return nil
+	}
+	result := normalizeConfigOptions(current)
+	if result == nil {
+		result = map[string]host.SessionConfigValue{}
+	}
+	maps.Copy(result, normalizeConfigOptions(update))
+	return result
 }
 
 func reconcileConfiguration(managed *managedSession, event host.Event) {
@@ -1682,9 +1737,23 @@ func reconcileConfiguration(managed *managedSession, event host.Event) {
 		reconcileConfigurationValue(managed, event.Data, "current_model", "model")
 		reconcileConfigurationValue(managed, event.Data, "current_reasoning", "reasoning")
 		reconcileConfigurationValue(managed, event.Data, "current_mode", "permission_mode")
+		reconcileConfigurationOptions(managed, event.Data)
 	default:
 		return
 	}
+}
+
+func reconcileConfigurationOptions(managed *managedSession, data map[string]any) {
+	raw, ok := data["current_config_options"]
+	if !ok {
+		return
+	}
+	values, ok := raw.(map[string]host.SessionConfigValue)
+	if !ok {
+		return
+	}
+	managed.configuration.ConfigOptions = normalizeConfigOptions(values)
+	managed.configurationEvent.options++
 }
 
 func reconcileConfigurationValue(managed *managedSession, data map[string]any, key, field string) {
@@ -1724,13 +1793,16 @@ func mergeUnreportedConfiguration(managed *managedSession, update host.SessionCo
 	if update.PermissionMode != "" && managed.configurationEvent.permission == before.permission {
 		managed.configuration.PermissionMode = update.PermissionMode
 	}
+	if update.ConfigOptions != nil && managed.configurationEvent.options == before.options {
+		managed.configuration.ConfigOptions = mergeConfigOptions(managed.configuration.ConfigOptions, update.ConfigOptions)
+	}
 }
 
 func managedConfiguration(r *Runtime, sessionID string) host.SessionConfiguration {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if managed := r.sessions[sessionID]; managed != nil {
-		return managed.configuration
+		return cloneConfiguration(managed.configuration)
 	}
 	return host.SessionConfiguration{}
 }
@@ -1754,6 +1826,7 @@ func cloneQueueEntry(entry QueueEntry) QueueEntry {
 func cloneSendTurnRequest(request host.SendTurnRequest) host.SendTurnRequest {
 	request.Ext = append(json.RawMessage(nil), request.Ext...)
 	request.Attachments = append([]host.Attachment(nil), request.Attachments...)
+	request.ConfigOptions = normalizeConfigOptions(request.ConfigOptions)
 	return request
 }
 

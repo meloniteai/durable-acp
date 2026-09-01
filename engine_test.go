@@ -614,11 +614,11 @@ func TestEngineHostJournalManifestAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if configured.Configuration != (Configuration{Model: "model-canonical", Reasoning: "medium", PermissionMode: "manual"}) {
+	if !reflect.DeepEqual(configured.Configuration, Configuration{Model: "model-canonical", Reasoning: "medium", PermissionMode: "manual"}) {
 		t.Fatalf("provider configuration = %#v", configured.Configuration)
 	}
 	persisted, err := engine.loadSession(created.ID)
-	if err != nil || persisted.Configuration != configured.Configuration {
+	if err != nil || !reflect.DeepEqual(persisted.Configuration, configured.Configuration) {
 		t.Fatalf("persisted provider configuration = %#v, %v", persisted.Configuration, err)
 	}
 	records, err := engine.History(created.ID, 0, 0)

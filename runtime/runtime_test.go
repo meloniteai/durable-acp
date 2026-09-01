@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -66,11 +67,13 @@ func TestRuntimeQueuesAndDispatchesTurns(t *testing.T) {
 func TestRuntimeOwnsEffectiveSessionConfiguration(t *testing.T) {
 	adapter := &testAdapter{backend: "test"}
 	runtime := New(Config{DisableCoalescing: true}, adapter)
+	standard := host.SessionConfigValue{Kind: host.SessionConfigValueBoolean}
+	fast := host.SessionConfigValue{Kind: host.SessionConfigValueBoolean, Boolean: true}
 	if _, err := runtime.Create(context.Background(), CreateRequest{ID: "configuration", Backend: "test", Worktree: t.TempDir()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.Start(context.Background(), host.StartSessionRequest{
-		SessionID: "configuration", Model: "model-a", Reasoning: "low", PermissionMode: "ask",
+		SessionID: "configuration", Model: "model-a", Reasoning: "low", PermissionMode: "ask", ConfigOptions: map[string]host.SessionConfigValue{"fast-mode": standard},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -78,17 +81,17 @@ func TestRuntimeOwnsEffectiveSessionConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Configuration != (host.SessionConfiguration{Model: "model-a", Reasoning: "low", PermissionMode: "ask"}) {
+	if !reflect.DeepEqual(state.Configuration, host.SessionConfiguration{Model: "model-a", Reasoning: "low", PermissionMode: "ask", ConfigOptions: map[string]host.SessionConfigValue{"fast-mode": standard}}) {
 		t.Fatalf("start configuration = %#v", state.Configuration)
 	}
-	if configErr := runtime.SetConfiguration("configuration", host.SessionConfiguration{Model: "model-b", Reasoning: "high", PermissionMode: "auto"}); configErr != nil {
+	if configErr := runtime.SetConfiguration("configuration", host.SessionConfiguration{Model: "model-b", Reasoning: "high", PermissionMode: "auto", ConfigOptions: map[string]host.SessionConfigValue{"fast-mode": fast}}); configErr != nil {
 		t.Fatal(configErr)
 	}
 	if _, sendErr := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "configuration", Prompt: "first"}); sendErr != nil {
 		t.Fatal(sendErr)
 	}
 	requests := adapter.requestsSnapshot()
-	if len(requests) != 1 || requests[0].Model != "model-b" || requests[0].Reasoning != "high" || requests[0].PermissionMode != "auto" {
+	if len(requests) != 1 || requests[0].Model != "model-b" || requests[0].Reasoning != "high" || requests[0].PermissionMode != "auto" || requests[0].ConfigOptions["fast-mode"] != fast {
 		t.Fatalf("first request = %#v", requests)
 	}
 	queued, err := runtime.Send(context.Background(), host.SendTurnRequest{SessionID: "configuration", Prompt: "second", Model: "model-c"})
@@ -99,8 +102,11 @@ func TestRuntimeOwnsEffectiveSessionConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Configuration.Model != "model-b" || len(state.QueueEntries) != 1 || state.QueueEntries[0].Request.Model != "model-c" || state.QueueEntries[0].Request.Reasoning != "high" {
+	if state.Configuration.Model != "model-b" || len(state.QueueEntries) != 1 || state.QueueEntries[0].Request.Model != "model-c" || state.QueueEntries[0].Request.Reasoning != "high" || state.QueueEntries[0].Request.ConfigOptions["fast-mode"] != fast {
 		t.Fatalf("queued configuration state = %#v", state)
+	}
+	if configErr := runtime.SetConfiguration("configuration", host.SessionConfiguration{Model: "model-b", Reasoning: "high", PermissionMode: "auto", ConfigOptions: map[string]host.SessionConfigValue{"fast-mode": standard}}); configErr != nil {
+		t.Fatal(configErr)
 	}
 	adapter.emit(host.Event{Type: host.EventTurnComplete, BackendTurnID: "turn-1"})
 	deadline := time.Now().Add(time.Second)
@@ -111,17 +117,17 @@ func TestRuntimeOwnsEffectiveSessionConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Configuration != (host.SessionConfiguration{Model: "model-c", Reasoning: "high", PermissionMode: "auto"}) {
+	if !reflect.DeepEqual(state.Configuration, host.SessionConfiguration{Model: "model-c", Reasoning: "high", PermissionMode: "auto", ConfigOptions: map[string]host.SessionConfigValue{"fast-mode": fast}}) {
 		t.Fatalf("dispatched configuration = %#v", state.Configuration)
 	}
 	adapter.emit(host.Event{Type: host.EventConfigCatalog, Data: map[string]any{
-		"current_model": "model-canonical", "current_reasoning": "medium", "current_mode": "manual",
+		"current_model": "model-canonical", "current_reasoning": "medium", "current_mode": "manual", "current_config_options": map[string]host.SessionConfigValue{"fast-mode": standard},
 	}})
 	state, err = runtime.State("configuration")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Configuration != (host.SessionConfiguration{Model: "model-canonical", Reasoning: "medium", PermissionMode: "manual"}) {
+	if !reflect.DeepEqual(state.Configuration, host.SessionConfiguration{Model: "model-canonical", Reasoning: "medium", PermissionMode: "manual", ConfigOptions: map[string]host.SessionConfigValue{"fast-mode": standard}}) {
 		t.Fatalf("provider configuration = %#v", state.Configuration)
 	}
 }

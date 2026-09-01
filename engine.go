@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -161,6 +162,7 @@ type StartRequest struct {
 	Model                  string
 	Reasoning              string
 	PermissionMode         string
+	ConfigOptions          map[string]host.SessionConfigValue
 	ResumeBackendSessionID string
 	Ext                    json.RawMessage
 }
@@ -512,6 +514,7 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (Session, erro
 		Model:                  request.Model,
 		Reasoning:              request.Reasoning,
 		PermissionMode:         request.PermissionMode,
+		ConfigOptions:          cloneConfigOptions(request.ConfigOptions),
 		ResumeBackendSessionID: request.ResumeBackendSessionID,
 		Ext:                    cloneRawMessage(request.Ext),
 	})
@@ -578,6 +581,7 @@ func (e *Engine) resumeStart(ctx context.Context, request StartRequest) (Session
 		Model:                  configuration.Model,
 		Reasoning:              configuration.Reasoning,
 		PermissionMode:         configuration.PermissionMode,
+		ConfigOptions:          cloneConfigOptions(configuration.ConfigOptions),
 		ResumeBackendSessionID: resumeBackendSessionID,
 		Ext:                    cloneRawMessage(request.Ext),
 	})
@@ -724,7 +728,7 @@ func (e *Engine) Snapshot(sessionID string) (Snapshot, error) {
 		Lifecycle:           LifecycleSnapshot{Status: status, CreatedAt: entry.CreatedAt, UpdatedAt: updatedAt, ClosedAt: entry.ClosedAt},
 		Workspace:           WorkspaceSnapshot{Mode: entry.WorkspaceMode, Workspace: entry.Worktree},
 		Backend:             BackendSnapshot{Backend: entry.Backend, Session: backendSession},
-		Configuration:       entry.Configuration,
+		Configuration:       cloneConfiguration(entry.Configuration),
 		LastJournalSequence: lastSequence,
 		Ext:                 cloneRawMessage(entry.Ext),
 	}
@@ -1146,13 +1150,14 @@ func (e *Engine) updateSession(sessionID string, update func(*Session)) error {
 }
 
 func configurationFromStart(request StartRequest) Configuration {
-	return normalizeConfiguration(Configuration{Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode})
+	return normalizeConfiguration(Configuration{Model: request.Model, Reasoning: request.Reasoning, PermissionMode: request.PermissionMode, ConfigOptions: request.ConfigOptions})
 }
 
 func normalizeConfiguration(configuration Configuration) Configuration {
 	configuration.Model = strings.TrimSpace(configuration.Model)
 	configuration.Reasoning = strings.TrimSpace(configuration.Reasoning)
 	configuration.PermissionMode = strings.TrimSpace(configuration.PermissionMode)
+	configuration.ConfigOptions = cloneConfigOptions(configuration.ConfigOptions)
 	return configuration
 }
 
@@ -1167,7 +1172,27 @@ func mergeConfiguration(target *Configuration, update Configuration) {
 	if update.PermissionMode != "" {
 		target.PermissionMode = update.PermissionMode
 	}
+	if update.ConfigOptions != nil {
+		if target.ConfigOptions == nil {
+			target.ConfigOptions = map[string]host.SessionConfigValue{}
+		}
+		maps.Copy(target.ConfigOptions, update.ConfigOptions)
+	}
 	*target = normalizeConfiguration(*target)
+}
+
+func cloneConfiguration(configuration Configuration) Configuration {
+	configuration.ConfigOptions = cloneConfigOptions(configuration.ConfigOptions)
+	return configuration
+}
+
+func cloneConfigOptions(options map[string]host.SessionConfigValue) map[string]host.SessionConfigValue {
+	if options == nil {
+		return nil
+	}
+	cloned := make(map[string]host.SessionConfigValue, len(options))
+	maps.Copy(cloned, options)
+	return cloned
 }
 
 func cloneRawMessage(raw json.RawMessage) json.RawMessage {

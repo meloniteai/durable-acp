@@ -213,6 +213,15 @@ func adapterInitialize(config Config) acp.InitializeRequest {
 	if config.ClientCapabilities != nil {
 		capabilities = *config.ClientCapabilities
 	}
+	if capabilities.Session == nil {
+		capabilities.Session = &acp.ClientSessionCapabilities{}
+	}
+	if capabilities.Session.ConfigOptions == nil {
+		capabilities.Session.ConfigOptions = &acp.SessionConfigOptionsCapabilities{}
+	}
+	if capabilities.Session.ConfigOptions.Boolean == nil {
+		capabilities.Session.ConfigOptions.Boolean = &acp.BooleanConfigOptionCapabilities{}
+	}
 	var title *string
 	if config.ClientTitle != "" {
 		value := config.ClientTitle
@@ -317,6 +326,7 @@ func (a *Adapter) StartSession(ctx context.Context, sessionID string, request ho
 			Model:          request.Model,
 			Reasoning:      request.Reasoning,
 			PermissionMode: request.PermissionMode,
+			ConfigOptions:  request.ConfigOptions,
 		}, nil)
 		if turnErr != nil {
 			_ = a.CloseSession(sessionID)
@@ -412,7 +422,7 @@ func (a *Adapter) openSession(ctx context.Context, sessionID string, request hos
 	if forceSelections && strings.TrimSpace(request.PermissionMode) != "" {
 		managed.setSelected("mode", "")
 	}
-	if err := managed.applySelections(ctx, request.Model, request.Reasoning, request.PermissionMode); err != nil {
+	if err := managed.applySelections(ctx, request.Model, request.ConfigOptions, request.Reasoning, request.PermissionMode); err != nil {
 		managed.stop()
 		_ = connection.Close()
 		return nil, host.BackendSession{}, err
@@ -443,7 +453,7 @@ func (a *Adapter) SendTurn(ctx context.Context, sessionID string, request host.S
 	if !managed.promptMu.TryLock() {
 		return host.BackendSession{}, fmt.Errorf("acpx: session %q already has an active turn", sessionID)
 	}
-	if configErr := managed.applySelections(ctx, request.Model, request.Reasoning, request.PermissionMode); configErr != nil {
+	if configErr := managed.applySelections(ctx, request.Model, request.ConfigOptions, request.Reasoning, request.PermissionMode); configErr != nil {
 		managed.promptMu.Unlock()
 		return host.BackendSession{}, configErr
 	}
@@ -556,6 +566,7 @@ func (a *Adapter) replaceSession(ctx context.Context, sessionID string, managed 
 		Model:                  managed.selected("model"),
 		Reasoning:              managed.selected("reasoning"),
 		PermissionMode:         managed.selected("mode"),
+		ConfigOptions:          currentConfigValues(managed.configOptions()),
 	}, emit, false, false)
 	if err != nil {
 		return nil, host.BackendSession{}, err
@@ -666,7 +677,9 @@ func (a *Adapter) Catalog(ctx context.Context) (host.BackendCatalog, error) {
 			if setErr != nil {
 				continue
 			}
-			catalog.Models[index].Reasoning = catalogFromConfig(response.ConfigOptions, nil).Reasoning
+			modelCatalog := catalogFromConfig(response.ConfigOptions, nil)
+			catalog.Models[index].Reasoning = modelCatalog.Reasoning
+			catalog.Models[index].ConfigOptions = modelCatalog.ConfigOptions
 		}
 	}
 	catalog.SlashCommands = collector.commands()
@@ -1415,7 +1428,7 @@ func toolContentText(content []acp.ToolCallContent, rawOutput any) string {
 func (s *managedSession) emitConfig(options []acp.SessionConfigOption, modes *acp.SessionModeState) {
 	s.updateControls(options, modes)
 	catalog := catalogFromConfig(options, modes)
-	data := map[string]any{"catalog": catalog, "config_options": valueMap(options)}
+	data := map[string]any{"catalog": catalog, "config_options": catalog.ConfigOptions, "current_config_options": currentConfigValues(options)}
 	model, reasoning, configMode := currentSelections(options)
 	if model != "" {
 		data["current_model"] = model
@@ -1445,36 +1458,16 @@ func (s *managedSession) emitConfig(options []acp.SessionConfigOption, modes *ac
 	}
 }
 
-func (s *managedSession) applySelections(ctx context.Context, model, reasoning, mode string) error {
-	selections := []struct {
-		kind  string
-		value string
-		keys  []string
-	}{
-		{kind: "model", value: strings.TrimSpace(model), keys: []string{"model"}},
-		{kind: "reasoning", value: strings.TrimSpace(reasoning), keys: []string{"thought_level", "reasoning", "reasoning_effort", "effort"}},
-	}
+func (s *managedSession) applySelections(ctx context.Context, model string, configOptions map[string]host.SessionConfigValue, reasoning, mode string) error {
 	var joined error
-	for _, selection := range selections {
-		if selection.value == "" || selection.value == s.selected(selection.kind) {
-			continue
-		}
-		optionID := findOption(s.configOptions(), selection.keys...)
-		if optionID == "" {
-			s.setSelected(selection.kind, selection.value)
-			continue
-		}
-		response, err := s.conn.SetSessionConfigOption(ctx, &acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
-			ConfigId:  acp.SessionConfigId(optionID),
-			SessionId: acp.SessionId(s.backendID),
-			Value:     acp.SessionConfigValueId(selection.value),
-		}})
-		if err != nil {
-			joined = errors.Join(joined, fmt.Errorf("acpx: set %s: %w", selection.kind, err))
-			continue
-		}
-		s.setSelected(selection.kind, selection.value)
-		s.emitAppliedSelection(selection.kind, selection.value, response.ConfigOptions)
+	if err := s.applySelect(ctx, "model", strings.TrimSpace(model), "model"); err != nil {
+		joined = errors.Join(joined, err)
+	}
+	if err := s.applyConfigOptions(ctx, configOptions); err != nil {
+		joined = errors.Join(joined, err)
+	}
+	if err := s.applySelect(ctx, "reasoning", strings.TrimSpace(reasoning), "thought_level", "reasoning", "reasoning_effort", "effort"); err != nil {
+		joined = errors.Join(joined, err)
 	}
 	mode = strings.TrimSpace(mode)
 	if mode == "" || mode == s.selected("mode") {
@@ -1503,6 +1496,109 @@ func (s *managedSession) applySelections(ctx context.Context, model, reasoning, 
 	s.setSelected("mode", mode)
 	s.emitAppliedSelection("mode", mode, response.ConfigOptions)
 	return s.configurationResult(joined)
+}
+
+func (s *managedSession) applySelect(ctx context.Context, kind, value string, keys ...string) error {
+	if value == "" || value == s.selected(kind) {
+		return nil
+	}
+	optionID := findOption(s.configOptions(), keys...)
+	if optionID == "" {
+		s.setSelected(kind, value)
+		return nil
+	}
+	response, err := s.conn.SetSessionConfigOption(ctx, &acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+		ConfigId: acp.SessionConfigId(optionID), SessionId: acp.SessionId(s.backendID), Value: acp.SessionConfigValueId(value),
+	}})
+	if err != nil {
+		return fmt.Errorf("acpx: set %s: %w", kind, err)
+	}
+	s.setSelected(kind, value)
+	s.emitAppliedSelection(kind, value, response.ConfigOptions)
+	return nil
+}
+
+func (s *managedSession) applyConfigOptions(ctx context.Context, values map[string]host.SessionConfigValue) error {
+	ids := make([]string, 0, len(values))
+	for id := range values {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var joined error
+	for _, id := range ids {
+		value := values[id]
+		option := configOptionByID(s.configOptions(), id)
+		if option == nil {
+			joined = errors.Join(joined, fmt.Errorf("acpx: set config option %s: option unavailable", id))
+			continue
+		}
+		if configValueMatches(*option, value) {
+			continue
+		}
+		request, ok := configOptionRequest(acp.SessionId(s.backendID), *option, value)
+		if !ok {
+			joined = errors.Join(joined, fmt.Errorf("acpx: set config option %s: incompatible value", id))
+			continue
+		}
+		response, err := s.conn.SetSessionConfigOption(ctx, &request)
+		if err != nil {
+			joined = errors.Join(joined, fmt.Errorf("acpx: set config option %s: %w", id, err))
+			continue
+		}
+		s.emitAppliedSelection("config", id, response.ConfigOptions)
+	}
+	return joined
+}
+
+func configValueMatches(option acp.SessionConfigOption, value host.SessionConfigValue) bool {
+	if option.Boolean != nil && value.Kind == host.SessionConfigValueBoolean {
+		return option.Boolean.CurrentValue == value.Boolean
+	}
+	if option.Select == nil {
+		return false
+	}
+	want := strings.TrimSpace(value.ValueID)
+	if value.Kind == host.SessionConfigValueBoolean {
+		want = "off"
+		if value.Boolean {
+			want = "on"
+		}
+	}
+	return string(option.Select.CurrentValue) == want
+}
+
+func configOptionByID(options []acp.SessionConfigOption, id string) *acp.SessionConfigOption {
+	id = strings.TrimSpace(id)
+	for index := range options {
+		if options[index].Select != nil && string(options[index].Select.Id) == id || options[index].Boolean != nil && string(options[index].Boolean.Id) == id {
+			return &options[index]
+		}
+	}
+	return nil
+}
+
+func configOptionRequest(sessionID acp.SessionId, option acp.SessionConfigOption, value host.SessionConfigValue) (acp.SetSessionConfigOptionRequest, bool) {
+	if option.Boolean != nil && value.Kind == host.SessionConfigValueBoolean {
+		return acp.SetSessionConfigOptionRequest{Boolean: &acp.SetSessionConfigOptionBoolean{
+			ConfigId: option.Boolean.Id, SessionId: sessionID, Type: "boolean", Value: value.Boolean,
+		}}, true
+	}
+	if option.Select == nil {
+		return acp.SetSessionConfigOptionRequest{}, false
+	}
+	selected := strings.TrimSpace(value.ValueID)
+	if value.Kind == host.SessionConfigValueBoolean {
+		selected = "off"
+		if value.Boolean {
+			selected = "on"
+		}
+	}
+	if selected == "" {
+		return acp.SetSessionConfigOptionRequest{}, false
+	}
+	return acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+		ConfigId: option.Select.Id, SessionId: sessionID, Value: acp.SessionConfigValueId(selected),
+	}}, true
 }
 
 func containsString(values []string, value string) bool {
@@ -1843,6 +1939,10 @@ func catalogFromConfig(options []acp.SessionConfigOption, modes *acp.SessionMode
 	catalog := host.BackendCatalog{}
 	modeIDs := map[string]bool{}
 	for _, option := range options {
+		if option.Boolean != nil {
+			catalog.ConfigOptions = append(catalog.ConfigOptions, backendBooleanConfigOption(*option.Boolean))
+			continue
+		}
 		if option.Select == nil {
 			continue
 		}
@@ -1865,6 +1965,9 @@ func catalogFromConfig(options []acp.SessionConfigOption, modes *acp.SessionMode
 				catalog.Reasoning = append(catalog.Reasoning, host.BackendReasoning{ID: item.ID, Label: item.Label})
 			}
 		}
+		if !isCoreConfigOption(category, id) {
+			catalog.ConfigOptions = append(catalog.ConfigOptions, backendSelectConfigOption(*option.Select))
+		}
 	}
 	if modes != nil {
 		for _, mode := range modes.AvailableModes {
@@ -1878,18 +1981,49 @@ func catalogFromConfig(options []acp.SessionConfigOption, modes *acp.SessionMode
 	return catalog
 }
 
-func selectOptions(options acp.SessionConfigSelectOptions) []acp.SessionConfigSelectOption {
-	if options.Ungrouped != nil {
-		return append([]acp.SessionConfigSelectOption(nil), (*options.Ungrouped)...)
+func isCoreConfigOption(category, id string) bool {
+	return category == "model" || id == "model" || category == "mode" || id == "mode" || id == "permission_mode" || category == "thought_level" || id == "reasoning" || id == "reasoning_effort" || id == "effort"
+}
+
+func backendSelectConfigOption(option acp.SessionConfigOptionSelect) host.BackendConfigOption {
+	category := ""
+	if option.Category != nil {
+		category = string(*option.Category)
 	}
-	if options.Grouped == nil {
-		return nil
+	choices := make([]host.InteractionOption, 0)
+	for _, value := range selectOptions(option.Options) {
+		choices = append(choices, host.InteractionOption{ID: string(value.Value), Label: value.Name, Description: stringPointerValue(value.Description)})
 	}
-	result := make([]acp.SessionConfigSelectOption, 0)
-	for _, group := range *options.Grouped {
-		result = append(result, group.Options...)
+	return host.BackendConfigOption{
+		ID: string(option.Id), Category: category, Label: option.Name, Description: stringPointerValue(option.Description),
+		CurrentValue: host.SessionConfigValue{Kind: host.SessionConfigValueSelect, ValueID: string(option.CurrentValue)}, Options: choices,
 	}
-	return result
+}
+
+func backendBooleanConfigOption(option acp.SessionConfigOptionBoolean) host.BackendConfigOption {
+	category := ""
+	if option.Category != nil {
+		category = string(*option.Category)
+	}
+	return host.BackendConfigOption{
+		ID: string(option.Id), Category: category, Label: option.Name, Description: stringPointerValue(option.Description),
+		CurrentValue: host.SessionConfigValue{Kind: host.SessionConfigValueBoolean, Boolean: option.CurrentValue},
+	}
+}
+
+func currentConfigValues(options []acp.SessionConfigOption) map[string]host.SessionConfigValue {
+	values := map[string]host.SessionConfigValue{}
+	for _, option := range catalogFromConfig(options, nil).ConfigOptions {
+		values[option.ID] = option.CurrentValue
+	}
+	return values
+}
+
+func stringPointerValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func valueMap(value any) map[string]any {
@@ -1900,6 +2034,20 @@ func valueMap(value any) map[string]any {
 	var result map[string]any
 	if json.Unmarshal(raw, &result) != nil {
 		return nil
+	}
+	return result
+}
+
+func selectOptions(options acp.SessionConfigSelectOptions) []acp.SessionConfigSelectOption {
+	if options.Ungrouped != nil {
+		return append([]acp.SessionConfigSelectOption(nil), (*options.Ungrouped)...)
+	}
+	if options.Grouped == nil {
+		return nil
+	}
+	result := make([]acp.SessionConfigSelectOption, 0)
+	for _, group := range *options.Grouped {
+		result = append(result, group.Options...)
 	}
 	return result
 }

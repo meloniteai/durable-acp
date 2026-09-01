@@ -206,6 +206,42 @@ func TestPermissionAndCatalogHelpers(t *testing.T) {
 	if len(catalog.Models) != 1 || catalog.Models[0].ID != "model-a" {
 		t.Fatalf("catalog = %#v", catalog)
 	}
+	fastCategory := acp.SessionConfigOptionCategoryModelConfig
+	fastDescription := "1.5x speed, increased usage"
+	fast := acp.SessionConfigOption{Boolean: &acp.SessionConfigOptionBoolean{Id: "fast-mode", Name: "Fast mode", Category: &fastCategory, Description: &fastDescription, CurrentValue: true}}
+	fastCatalog := catalogFromConfig([]acp.SessionConfigOption{fast}, nil)
+	if len(fastCatalog.ConfigOptions) != 1 || fastCatalog.ConfigOptions[0].ID != "fast-mode" || !fastCatalog.ConfigOptions[0].CurrentValue.Boolean {
+		t.Fatalf("fast catalog = %#v", fastCatalog)
+	}
+	selectCategory := acp.SessionConfigOptionCategoryModelConfig
+	selectDescription := "Select speed"
+	choiceDescription := "Priority service"
+	speedChoices := acp.SessionConfigSelectOptionsUngrouped{
+		{Value: "off", Name: "Off"},
+		{Value: "on", Name: "On", Description: &choiceDescription},
+	}
+	speed := acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{
+		Id: "speed", Name: "Speed", Category: &selectCategory, Description: &selectDescription, CurrentValue: "off",
+		Options: acp.SessionConfigSelectOptions{Ungrouped: &speedChoices},
+	}}
+	speedCatalog := catalogFromConfig([]acp.SessionConfigOption{speed}, nil)
+	if len(speedCatalog.ConfigOptions) != 1 || speedCatalog.ConfigOptions[0].Description != selectDescription || speedCatalog.ConfigOptions[0].Options[1].Description != choiceDescription {
+		t.Fatalf("speed catalog = %#v", speedCatalog)
+	}
+	booleanRequest, ok := configOptionRequest("session", fast, host.SessionConfigValue{Kind: host.SessionConfigValueBoolean})
+	if !ok || booleanRequest.Boolean == nil || booleanRequest.Boolean.Value {
+		t.Fatalf("boolean request = %#v, %v", booleanRequest, ok)
+	}
+	selectRequest, ok := configOptionRequest("session", speed, host.SessionConfigValue{Kind: host.SessionConfigValueBoolean, Boolean: true})
+	if !ok || selectRequest.ValueId == nil || selectRequest.ValueId.Value != "on" || !configValueMatches(speed, host.SessionConfigValue{Kind: host.SessionConfigValueBoolean}) {
+		t.Fatalf("select request = %#v, %v", selectRequest, ok)
+	}
+	if _, ok := configOptionRequest("session", fast, host.SessionConfigValue{Kind: host.SessionConfigValueSelect, ValueID: "on"}); ok {
+		t.Fatal("boolean option accepted select value")
+	}
+	if got := configOptionByID([]acp.SessionConfigOption{speed}, "missing"); got != nil {
+		t.Fatalf("missing option = %#v", got)
+	}
 	if got := selectOptions(acp.SessionConfigSelectOptions{}); got != nil {
 		t.Fatalf("empty choices = %#v", got)
 	}
@@ -731,6 +767,14 @@ func TestAdapterCatalogConfigurationAndResume(t *testing.T) {
 }
 
 func TestAdapterAppliesChangedConfigurationBeforeTurns(t *testing.T) {
+	catalogAdapter := New(Config{
+		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
+		Environment: append(os.Environ(), "DURABLE_ACP_CONFIG_CHILD=1"),
+	})
+	catalog, catalogErr := catalogAdapter.Catalog(context.Background())
+	if catalogErr != nil || len(catalog.Models) != 2 || len(catalog.Models[0].ConfigOptions) != 0 || len(catalog.Models[1].ConfigOptions) != 1 || catalog.Models[1].ConfigOptions[0].ID != "fast-mode" {
+		t.Fatalf("model config catalog = %#v, %v", catalog, catalogErr)
+	}
 	trace := filepath.Join(t.TempDir(), "config.trace")
 	adapter := New(Config{
 		Backend: "stub", Command: os.Args[0], Args: []string{"-test.run=TestACPChild", "--"},
@@ -738,6 +782,7 @@ func TestAdapterAppliesChangedConfigurationBeforeTurns(t *testing.T) {
 	})
 	state, err := adapter.StartSession(context.Background(), "config", host.StartSessionRequest{
 		Worktree: t.TempDir(), Model: "model-b", Reasoning: "high", PermissionMode: "auto",
+		ConfigOptions: map[string]host.SessionConfigValue{"fast-mode": {Kind: host.SessionConfigValueBoolean, Boolean: true}},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -750,6 +795,7 @@ func TestAdapterAppliesChangedConfigurationBeforeTurns(t *testing.T) {
 	waitForAdapterTurn(t, adapter, "config")
 	if _, sendErr := adapter.SendTurn(context.Background(), "config", host.SendTurnRequest{
 		Prompt: "two", Model: "model-b", Reasoning: "low", PermissionMode: "plan",
+		ConfigOptions: map[string]host.SessionConfigValue{"fast-mode": {Kind: host.SessionConfigValueBoolean}},
 	}, nil); sendErr != nil {
 		t.Fatal(sendErr)
 	}
@@ -763,7 +809,7 @@ func TestAdapterAppliesChangedConfigurationBeforeTurns(t *testing.T) {
 		t.Fatal(readErr)
 	}
 	got := strings.Fields(string(raw))
-	want := []string{"config:model=model-b", "config:reasoning=high", "mode:auto", "prompt:one", "config:reasoning=low", "mode:plan", "prompt:two"}
+	want := []string{"config:model=model-b", "config:fast-mode=true", "config:reasoning=high", "mode:auto", "prompt:one", "config:fast-mode=false", "config:reasoning=low", "mode:plan", "prompt:two"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("configuration trace = %#v, want %#v", got, want)
 	}
@@ -1180,14 +1226,19 @@ func runConfigurationChild(t *testing.T) {
 	model := "model-a"
 	reasoning := "low"
 	mode := "ask"
+	fastMode := false
 	configOptions := func() []map[string]any {
 		if os.Getenv("DURABLE_ACP_CONFIG_EMPTY") == "1" {
 			return nil
 		}
-		return []map[string]any{
+		options := []map[string]any{
 			{"type": "select", "id": "model", "name": "Model", "category": "model", "currentValue": model, "options": []map[string]any{{"value": "model-a", "name": "Model A"}, {"value": "model-b", "name": "Model B"}}},
 			{"type": "select", "id": "reasoning", "name": "Reasoning", "category": "thought_level", "currentValue": reasoning, "options": []map[string]any{{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}}},
 		}
+		if model == "model-b" {
+			options = append(options, map[string]any{"type": "boolean", "id": "fast-mode", "name": "Fast mode", "description": "1.5x speed, increased usage", "category": "model_config", "currentValue": fastMode})
+		}
+		return options
 	}
 	modes := func() any {
 		if os.Getenv("DURABLE_ACP_CONFIG_EMPTY") == "1" {
@@ -1222,6 +1273,18 @@ func runConfigurationChild(t *testing.T) {
 		}
 		switch message.Method {
 		case "initialize":
+			var params struct {
+				ClientCapabilities struct {
+					Session struct {
+						ConfigOptions struct {
+							Boolean *struct{} `json:"boolean"`
+						} `json:"configOptions"`
+					} `json:"session"`
+				} `json:"clientCapabilities"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil || params.ClientCapabilities.Session.ConfigOptions.Boolean == nil {
+				t.Fatalf("boolean config capability = %#v, %v", params, err)
+			}
 			writeRPC(t, encoder, message.ID, map[string]any{"protocolVersion": 1})
 		case "session/new", "session/resume", "session/load":
 			writeRPC(t, encoder, message.ID, map[string]any{"sessionId": "provider-config", "configOptions": configOptions(), "modes": modes()})
@@ -1234,18 +1297,20 @@ func runConfigurationChild(t *testing.T) {
 			}
 			var params struct {
 				ConfigID string `json:"configId"`
-				Value    string `json:"value"`
+				Value    any    `json:"value"`
 			}
 			if err := json.Unmarshal(message.Params, &params); err != nil {
 				t.Fatal(err)
 			}
 			switch params.ConfigID {
 			case "model":
-				model = params.Value
+				model, _ = params.Value.(string)
 			case "reasoning":
-				reasoning = params.Value
+				reasoning, _ = params.Value.(string)
+			case "fast-mode":
+				fastMode, _ = params.Value.(bool)
 			}
-			trace("config:" + params.ConfigID + "=" + params.Value)
+			trace(fmt.Sprintf("config:%s=%v", params.ConfigID, params.Value))
 			writeRPC(t, encoder, message.ID, map[string]any{"configOptions": configOptions()})
 		case "session/set_mode":
 			var params struct {

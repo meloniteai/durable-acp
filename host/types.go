@@ -19,13 +19,37 @@ type BackendCatalog struct {
 	Models          []BackendModel          `json:"models,omitempty"`
 	PermissionModes []BackendPermissionMode `json:"permission_modes,omitempty"`
 	Reasoning       []BackendReasoning      `json:"reasoning,omitempty"`
+	ConfigOptions   []BackendConfigOption   `json:"config_options,omitempty"`
 	SlashCommands   []BackendSlashCommand   `json:"slash_commands,omitempty"`
 }
 
 type BackendModel struct {
-	ID        string             `json:"id"`
-	Label     string             `json:"label,omitempty"`
-	Reasoning []BackendReasoning `json:"reasoning"`
+	ID            string                `json:"id"`
+	Label         string                `json:"label,omitempty"`
+	Reasoning     []BackendReasoning    `json:"reasoning"`
+	ConfigOptions []BackendConfigOption `json:"config_options,omitempty"`
+}
+
+type SessionConfigValueKind string
+
+const (
+	SessionConfigValueSelect  SessionConfigValueKind = "select"
+	SessionConfigValueBoolean SessionConfigValueKind = "boolean"
+)
+
+type SessionConfigValue struct {
+	Kind    SessionConfigValueKind `json:"kind"`
+	ValueID string                 `json:"value_id,omitempty"`
+	Boolean bool                   `json:"boolean,omitempty"`
+}
+
+type BackendConfigOption struct {
+	ID           string              `json:"id"`
+	Category     string              `json:"category,omitempty"`
+	Label        string              `json:"label,omitempty"`
+	Description  string              `json:"description,omitempty"`
+	CurrentValue SessionConfigValue  `json:"current_value"`
+	Options      []InteractionOption `json:"options,omitempty"`
 }
 
 type BackendPermissionMode struct {
@@ -62,9 +86,10 @@ type BackendSession struct {
 }
 
 type SessionConfiguration struct {
-	Model          string `json:"model,omitempty"`
-	Reasoning      string `json:"reasoning,omitempty"`
-	PermissionMode string `json:"permission_mode,omitempty"`
+	Model          string                        `json:"model,omitempty"`
+	Reasoning      string                        `json:"reasoning,omitempty"`
+	PermissionMode string                        `json:"permission_mode,omitempty"`
+	ConfigOptions  map[string]SessionConfigValue `json:"config_options,omitempty"`
 }
 
 type EventType string
@@ -189,22 +214,24 @@ type StartSessionRequest struct {
 	Prompt    string          `json:"prompt,omitempty"`
 	Ext       json.RawMessage `json:"ext,omitempty"`
 
-	Attachments []Attachment `json:"attachments,omitempty"`
-	Model       string       `json:"model,omitempty"`
-	Reasoning   string       `json:"reasoning,omitempty"`
+	Attachments   []Attachment                  `json:"attachments,omitempty"`
+	Model         string                        `json:"model,omitempty"`
+	Reasoning     string                        `json:"reasoning,omitempty"`
+	ConfigOptions map[string]SessionConfigValue `json:"config_options,omitempty"`
 
 	PermissionMode         string `json:"permission_mode,omitempty"`
 	ResumeBackendSessionID string `json:"resume_backend_session_id,omitempty"`
 }
 
 type SendTurnRequest struct {
-	SessionID      string          `json:"session_id"`
-	Prompt         string          `json:"prompt"`
-	Ext            json.RawMessage `json:"ext,omitempty"`
-	Attachments    []Attachment    `json:"attachments,omitempty"`
-	Model          string          `json:"model,omitempty"`
-	Reasoning      string          `json:"reasoning,omitempty"`
-	PermissionMode string          `json:"permission_mode,omitempty"`
+	SessionID      string                        `json:"session_id"`
+	Prompt         string                        `json:"prompt"`
+	Ext            json.RawMessage               `json:"ext,omitempty"`
+	Attachments    []Attachment                  `json:"attachments,omitempty"`
+	Model          string                        `json:"model,omitempty"`
+	Reasoning      string                        `json:"reasoning,omitempty"`
+	PermissionMode string                        `json:"permission_mode,omitempty"`
+	ConfigOptions  map[string]SessionConfigValue `json:"config_options,omitempty"`
 }
 
 type ForkPromptRequest struct {
